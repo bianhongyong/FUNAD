@@ -368,12 +368,15 @@ class localnet(nn.Module):
     def __init__(self, len_feature, feat_select=False):
         super(localnet, self).__init__()
         
-        # org
+        # 论文中的 phi_adaptor(·):
+        # 将预训练特征映射到当前异常检测任务的可学习特征空间。
         self.adaptor = nn.Sequential(
             nn.Linear(len_feature, len_feature), # feature adoptor
             nn.LeakyReLU(.2),
         )
 
+        # 论文中的 phi_L(·):
+        # patch-level anomaly probability predictor (Sigmoid 输出 [0, 1])。
         self.discriminator = nn.Sequential(
             nn.Linear(len_feature, 1024),
             nn.LeakyReLU(.2),
@@ -383,12 +386,16 @@ class localnet(nn.Module):
             nn.Sigmoid(),
         )
         
-        # chgd
+        # 可选特征选择分支（主流程默认不使用）。
         self.feat_select = feat_select
         if feat_select:
             self.conv1x1_layer = Conv1x1(in_channels=512, out_channels=1536).cuda()
 
     def forward(self, x, synthetic_feat=None):
+        # 输入 x: [B, P, C]，常见 P=784, C=1536。
+        # 返回:
+        # - adapted_features: 适配后 patch 特征 (用于 memory bank / 距离度量)
+        # - local_score: patch 异常分数 (用于伪标签监督与推理)
         adapted_features = self.adaptor(x) 
         local_score = self.discriminator(adapted_features)
         return adapted_features, local_score.squeeze()
@@ -397,7 +404,7 @@ class globalnet(nn.Module):
     def __init__(self, len_feature):
         super(globalnet, self).__init__()
 
-
+        # 与 localnet 类似的 image-level 分支定义，当前 FUN-AD 主训练脚本未使用。
         self.adaptor = nn.Sequential(
             nn.Linear(len_feature, len_feature), # feature adoptor
             nn.LeakyReLU(.2),
