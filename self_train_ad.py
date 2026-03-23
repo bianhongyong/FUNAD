@@ -62,7 +62,7 @@ def parse_args():
         "--save_path", type=str, default="/media/honeywell/E/bhy/FUNAD/save_results"
     )
     parser.add_argument(
-        "--feature_path", type=str, default="/media/honeywell/E/bhy/FUNAD/feature/"
+        "--feature_path", type=str, default="/media/honeywell/E/bhy/FUNAD/feature/MVTec"
     )
     parser.add_argument(
         "--synthetic_path", type=str, default="/media/honeywell/E/bhy/FUNAD/synthetic"
@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument("--beta", action="store_true")
     parser.add_argument("--gaussian", action="store_false")
     parser.add_argument("--synthetic", action="store_true")
-    parser.add_argument("--hist", action="store_false")
+    parser.add_argument("--hist", action="store_true")
     parser.add_argument(
         "--dataset", type=str, default="mvtec", choices=["mvtec", "visa"]
     )

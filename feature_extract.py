@@ -5,6 +5,31 @@ from torch.utils.data import DataLoader
 import numpy as np
 import os
 
+
+def str_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.lower() in {'none', 'null', ''}:
+        return None
+    return value
+
+
+def get_subdatasets(data_path, subdataset):
+    if subdataset is not None:
+        return [subdataset]
+
+    class_names = []
+    for name in sorted(os.listdir(data_path)):
+        class_dir = os.path.join(data_path, name)
+        train_dir = os.path.join(class_dir, 'train')
+        if os.path.isdir(class_dir) and os.path.isdir(train_dir):
+            class_names.append(name)
+
+    if not class_names:
+        raise ValueError(f'No valid class folders found under data_path: {data_path}')
+
+    return class_names
+
 def set_device():
     use_cuda = torch.cuda.is_available()
     return torch.device('cuda' if use_cuda else 'cpu')
@@ -15,7 +40,7 @@ def parse_args():
     parser.add_argument('--feature_path', type=str)
     parser.add_argument('--dataset', type=str, choices=['mvtec', 'visa'], default='mvtec')
     parser.add_argument('--noise', type=str, choices=['0%', '1%', '2%', '3%', '5%', '10%', '20%'], default='10%')   
-    parser.add_argument('-d', '--subdataset', type=str, default='pill')
+    parser.add_argument('-d', '--subdataset', type=str, default=None)
     return parser.parse_args()
 
 def extract_feature(input, feature_extractor):
@@ -84,20 +109,22 @@ def extract_and_save_features(feature_extractor, loader, save_path, class_name, 
 def main():
     args = parse_args()
     device = set_device()
+    class_names = get_subdatasets(args.data_path, args.subdataset)
 
     feature_extractor = torch.hub.load('facebookresearch/dino:main', 'dino_vitb8')
     feature_extractor = feature_extractor.to(device)
 
-    train_set = dataset_extract.MyDataset(dataset_path=args.data_path, dataset=args.dataset, class_name=args.subdataset, is_train=True)
-    train_loader = DataLoader(train_set, batch_size=1, pin_memory=True)
+    for class_name in class_names:
+        train_set = dataset_extract.MyDataset(dataset_path=args.data_path, dataset=args.dataset, class_name=class_name, is_train=True)
+        train_loader = DataLoader(train_set, batch_size=1, pin_memory=True)
 
-    extract_and_save_features(feature_extractor, train_loader, args.feature_path, args.subdataset, args.noise, is_train=True)
+        extract_and_save_features(feature_extractor, train_loader, args.feature_path, class_name, args.noise, is_train=True)
 
-    if (args.dataset == 'mvtec') and (args.noise == '10%'):
-        test_set = dataset_extract.MyDataset(dataset_path=args.data_path, dataset=args.dataset, class_name=args.subdataset, is_train=False)
-        test_loader = DataLoader(test_set, batch_size=1, pin_memory=True)
+        if (args.dataset == 'mvtec') and (args.noise == '10%'):
+            test_set = dataset_extract.MyDataset(dataset_path=args.data_path, dataset=args.dataset, class_name=class_name, is_train=False)
+            test_loader = DataLoader(test_set, batch_size=1, pin_memory=True)
 
-        extract_and_save_features(feature_extractor, test_loader, args.feature_path, args.subdataset, args.noise, is_train=False)
+            extract_and_save_features(feature_extractor, test_loader, args.feature_path, class_name, args.noise, is_train=False)
 
 if __name__ == "__main__":
     main()
