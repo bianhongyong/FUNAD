@@ -36,10 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classes",
         nargs="+",
-        default=["cable","capsule"],
+        default=["cable","capsule","bottle"],
         help="Class names to visualize from test features, e.g. --classes bottle cable",
     )
-    parser.add_argument("--max_per_group", type=int, default=500, help="Max patch samples per group")
+    parser.add_argument("--max_per_group", type=int, default=100, help="Max patch samples per group")
     parser.add_argument("--perplexity", type=float, default=30.0, help="t-SNE perplexity")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for feature inference")
@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adaptor_ckpt",
         type=str,
-        default=None,
+        default="/media/honeywell/E/bhy/FUNAD/save_results/results/bottle/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_synthetic_False_localnet.pt",
         help="Path to trained localnet checkpoint (.pt) containing key 'net'",
     )
     parser.add_argument(
