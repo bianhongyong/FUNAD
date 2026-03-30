@@ -98,7 +98,7 @@ def parse_args():
     parser.add_argument("-l", "--lr", type=float, default=2e-5)
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("-b", "--batch_size", type=int, default=16)
-    parser.add_argument("-r", "--random", type=float, default=1)
+    parser.add_argument("-r", "--random", type=float, default=0.1)
     parser.add_argument("-t", "--threshold", type=float, default=0.5)
     parser.add_argument("-n", "--noise_threshold", type=float, default=0.9)
     parser.add_argument(
@@ -121,16 +121,16 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_log", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--max_bank_images", type=int, default=128)
+    # parser.add_argument("--max_bank_images", type=int, default=128)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
-    parser.add_argument(
-        "--bank_sample_ratio",
-        type=float,
-        default=0.25,
-        choices=[0.05, 0.1],
-        help="Random sampling ratio used before memory bank construction (5% or 10%).",
-    )
+    # parser.add_argument(
+    #     "--bank_sample_ratio",
+    #     type=float,
+    #     default=0.25,
+    #     choices=[0.05, 0.1],
+    #     help="Random sampling ratio used before memory bank construction (5% or 10%).",
+    # )
     parser.add_argument("--num_reference_images_per_class", type=int, default=4)
     parser.add_argument("--strict_clean_reference", action="store_true")
     parser.add_argument("--use_class_adaptive_threshold", action="store_true")
@@ -794,33 +794,56 @@ def precompute_pseudo_labels_multiclass(
 
     print("[Phase 2/3] Building memory bank from normal samples...")
     image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
-    sampled_num = max(1, int(np.ceil(dataset_size * args.bank_sample_ratio)))
-    sampled_num = min(sampled_num, dataset_size)
-    sampled_indices = np.random.choice(dataset_size, size=sampled_num, replace=False)
+    # 不再使用 args.bank_sample_ratio，直接在整个数据集上按类别归一化并筛选
+    sampled_indices = np.arange(dataset_size, dtype=np.int64)
+
+    # 1）按类别归一化 image score（在整个数据集上做 per-class min-max）
     sampled_scores = image_scores[sampled_indices]
-    if sampled_scores.max() == sampled_scores.min():
-        normalized_score = np.zeros_like(sampled_scores)
-    else:
-        normalized_score = (sampled_scores - sampled_scores.min()) / (
-            sampled_scores.max() - sampled_scores.min()
-        )
+    sampled_classes = class_stack[sampled_indices]
+    normalized_score = np.zeros_like(sampled_scores, dtype=np.float32)
+    for cls in range(num_classes):
+        cls_mask = sampled_classes == cls
+        if not np.any(cls_mask):
+            continue
+        cls_scores = sampled_scores[cls_mask]
+        cls_min = cls_scores.min()
+        cls_max = cls_scores.max()
+        if cls_max == cls_min:
+            cls_norm = np.zeros_like(cls_scores, dtype=np.float32)
+        else:
+            cls_norm = (cls_scores - cls_min) / (cls_max - cls_min)
+        normalized_score[cls_mask] = cls_norm.astype(np.float32)
+
     image_norm_scores[sampled_indices] = normalized_score.astype(np.float32)
 
-    normal_indices = np.where(normalized_score < 0.5)[0]
-    if normal_indices.shape[0] == 0:
+    # 2）在“按类别归一化”后的分数上，再按类别从低分样本中采样
+    selected_local_list = []
+    for cls in range(num_classes):
+        cls_mask = sampled_classes == cls
+        if not np.any(cls_mask):
+            continue
+        cls_indices_local = np.where(cls_mask)[0]  # 在 sampled_indices 里的位置
+        cls_norm_scores = normalized_score[cls_indices_local]
+
+        # 先选出该类别中“正常”的（低分）样本
+        cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
+        if cls_normal_local.shape[0] == 0:
+            cls_selected_local = cls_indices_local
+        elif args.random < 1:
+            cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
+            pick_local = np.random.choice(cls_normal_local, size=cls_sample_num, replace=False)
+            cls_selected_local = cls_indices_local[pick_local]
+        else:
+            cls_selected_local = cls_indices_local[cls_normal_local]
+
+        selected_local_list.append(cls_selected_local)
+
+    if len(selected_local_list) == 0:
         selected_local = np.arange(sampled_indices.shape[0])
-    elif args.random < 1:
-        sample_num = max(1, int(normal_indices.shape[0] * args.random))
-        selected_local = np.random.choice(normal_indices, size=sample_num, replace=False)
     else:
-        selected_local = normal_indices
+        selected_local = np.concatenate(selected_local_list, axis=0)
 
     selected_indices = sampled_indices[selected_local].astype(np.int64)
-    if args.max_bank_images > 0 and selected_indices.shape[0] > args.max_bank_images:
-        pick = np.random.choice(
-            selected_indices.shape[0], size=args.max_bank_images, replace=False
-        )
-        selected_indices = selected_indices[pick]
     _print_selected_score_distribution_by_class(
         selected_indices=selected_indices,
         class_stack=class_stack,
@@ -874,8 +897,10 @@ def precompute_pseudo_labels_multiclass(
     if args.beta:
         top_feat_global = None
         top_dist_global = None
-    global_min_distance = np.inf
-    global_max_distance = -np.inf
+
+    # 按类别维护距离的最小值和最大值
+    class_min_distance = np.full(num_classes, np.inf, dtype=np.float32)
+    class_max_distance = np.full(num_classes, -np.inf, dtype=np.float32)
 
     memory_bank_time = time.perf_counter() - memory_bank_start
 
@@ -910,11 +935,22 @@ def precompute_pseudo_labels_multiclass(
                 cls_distance[same_feature, 0] = cls_distance[same_feature, 1]
             cls_distance = cls_distance[:, 0]
 
-            if cls_distance.size > 0:
-                global_min_distance = min(global_min_distance, float(cls_distance.min()))
-                global_max_distance = max(global_max_distance, float(cls_distance.max()))
-
+            # 先按样本 reshape，方便做每个类别的统计
             cls_distance_map = cls_distance.reshape(-1, 784)
+
+            # 更新每个类别的全局 min / max（按图像维度聚合）
+            batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
+            row_min = cls_distance_map.min(axis=1)
+            row_max = cls_distance_map.max(axis=1)
+            for cls in np.unique(batch_class_np):
+                cls_mask = batch_class_np == cls
+                if not np.any(cls_mask):
+                    continue
+                cls_row_min = float(row_min[cls_mask].min())
+                cls_row_max = float(row_max[cls_mask].max())
+                class_min_distance[cls] = min(class_min_distance[cls], cls_row_min)
+                class_max_distance[cls] = max(class_max_distance[cls], cls_row_max)
+
             distance_map[sample_idx_np] = cls_distance_map.astype(np.float16)
 
             if args.beta:
@@ -931,15 +967,37 @@ def precompute_pseudo_labels_multiclass(
                         args.beta_number,
                     )
 
-    if (
-        not np.isfinite(global_min_distance)
-        or not np.isfinite(global_max_distance)
-        or global_max_distance == global_min_distance
-    ):
+    # 按类别归一化 distance_map
+    finite_min_mask = np.isfinite(class_min_distance)
+    finite_max_mask = np.isfinite(class_max_distance)
+    valid_cls_mask = finite_min_mask & finite_max_mask & (
+        class_max_distance > class_min_distance
+    )
+
+    if not np.any(valid_cls_mask):
         distance_map[:] = 0
     else:
         values = distance_map.astype(np.float32)
-        values = (values - global_min_distance) / (global_max_distance - global_min_distance)
+        for cls in range(num_classes):
+            cls_indices = np.where(class_stack == cls)[0]
+            if cls_indices.size == 0:
+                continue
+
+            if not (
+                np.isfinite(class_min_distance[cls])
+                and np.isfinite(class_max_distance[cls])
+                and class_max_distance[cls] > class_min_distance[cls]
+            ):
+                # 若该类统计无效，则直接置零
+                values[cls_indices] = 0.0
+                continue
+
+            cls_min = class_min_distance[cls]
+            cls_max = class_max_distance[cls]
+            cls_values = values[cls_indices]
+            cls_values = (cls_values - cls_min) / (cls_max - cls_min)
+            values[cls_indices] = cls_values
+
         distance_map = values.astype(np.float16)
 
     if args.beta:
