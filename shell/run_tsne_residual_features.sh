@@ -5,11 +5,11 @@ cd /media/honeywell/D/bhy/my_research/FUNAD
 
 # ===== User-configurable =====
 DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec"
-OUTPUT_DIR="tsne_outputs_paper"
+OUTPUT_DIR="tsne_outputs_no_cls_token"
 CLASSES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper"
 
 # Set your checkpoint here. If empty, script runs without checkpoint.
-CKPT="/media/honeywell/E/bhy/FUNAD/save_results/multi_redusial_no_cls_token/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_False_weight_0_multiclass_residual_localnet.pt"
+CKPT="/media/honeywell/E/bhy/FUNAD/save_results/multi_redusial_correst/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_False_weight_0_multiclass_residual_localnet.pt"
 REPORT_STAGE="after"  # before | after
 
 # Common options

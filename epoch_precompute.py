@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import tqdm
 from torch.utils.data import DataLoader, Subset
-
+from sampler import ApproximateGreedyCoresetSampler
 
 def precompute_pseudo_labels_feature(
     args,
@@ -455,7 +455,7 @@ def precompute_pseudo_labels_multiclass_residual(
     sampled_scores = image_scores[sampled_indices]
     sampled_classes = class_stack[sampled_indices]
     normalized_score = np.zeros_like(sampled_scores, dtype=np.float32)
-
+    #分类归一化
     for cls in range(num_classes):
         cls_mask = sampled_classes == cls
         if not np.any(cls_mask):
@@ -472,6 +472,7 @@ def precompute_pseudo_labels_multiclass_residual(
     image_norm_scores[sampled_indices] = normalized_score.astype(np.float32)
 
     selected_local_list = []
+    #下采样选取
     for cls in range(num_classes):
         cls_mask = sampled_classes == cls
         if not np.any(cls_mask):
@@ -514,7 +515,14 @@ def precompute_pseudo_labels_multiclass_residual(
         pseudo_label_time = time.perf_counter() - memory_bank_start
         return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
 
-    selected_features_buffer = []
+    # 按类别记录被选中的图像索引
+    selected_images_by_class = {}
+    for cls in range(num_classes):
+        cls_mask = class_stack[selected_indices] == cls
+        selected_images_by_class[cls] = selected_indices[cls_mask]
+
+    # Phase 2: 提取选中样本的 residual 特征，并按类别缓存
+    class_feature_buffers = {cls: [] for cls in range(num_classes)}
     with torch.no_grad():
         localnet.eval()
         feature_extractor.eval()
@@ -539,13 +547,47 @@ def precompute_pseudo_labels_multiclass_residual(
             )
             features, _ = localnet(residual_features)
             features_np = features.detach().cpu().numpy()
-            selected_features_buffer.append(features_np.reshape(-1, global_dim))
+            batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
 
-    if len(selected_features_buffer) == 0:
+            for cls in np.unique(batch_class_np).tolist():
+                cls = int(cls)
+                cls_mask = batch_class_np == cls
+                if not np.any(cls_mask):
+                    continue
+                cls_features = features_np[cls_mask].reshape(-1, global_dim)
+                class_feature_buffers[cls].append(cls_features)
+
+    # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
+    reduced_feature_list = []
+    for cls in range(num_classes):
+        if len(class_feature_buffers[cls]) == 0:
+            continue
+        normal_features_cls = np.concatenate(class_feature_buffers[cls], axis=0)
+
+        num_selected_images_cls = selected_images_by_class.get(cls, np.array([], dtype=np.int64)).shape[0]
+        if num_selected_images_cls > 0 and normal_features_cls.shape[0] > 0:
+            patches_per_image = normal_features_cls.shape[0] // num_selected_images_cls
+        else:
+            patches_per_image = normal_features_cls.shape[0]
+
+        target_images = min(2, num_selected_images_cls) if num_selected_images_cls > 0 else 1
+        target_features = patches_per_image * target_images
+
+        if 0 < target_features < normal_features_cls.shape[0]:
+            percentage = float(target_features) / float(normal_features_cls.shape[0])
+            sampler = ApproximateGreedyCoresetSampler(
+                percentage=percentage,
+                device=device,
+            )
+            normal_features_cls = sampler.run(normal_features_cls)
+
+        reduced_feature_list.append(normal_features_cls)
+
+    if len(reduced_feature_list) == 0:
         pseudo_label_time = time.perf_counter() - memory_bank_start
         return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
 
-    global_normal_features = np.concatenate(selected_features_buffer, axis=0)
+    global_normal_features = np.concatenate(reduced_feature_list, axis=0)
     memory_bank = build_faiss_index_fn(global_normal_features)
 
     if args.beta:

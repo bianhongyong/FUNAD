@@ -111,6 +111,18 @@ def parse_args() -> argparse.Namespace:
         help="Output path for center-shift difference figure (before->after)",
     )
     parser.add_argument(
+        "--class_stats_output",
+        type=str,
+        default="tsne_class_distance_distribution.png",
+        help="Output path for per-class distance statistical distribution figure",
+    )
+    parser.add_argument(
+        "--highdim_l2_output",
+        type=str,
+        default="raw_feature_l2_boxplot.png",
+        help="Output path for high-dimensional feature L2-norm boxplot",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="tsne_outputs",
@@ -615,6 +627,177 @@ def plot_distance_distribution(
     return distances
 
 
+def plot_per_class_distance_distribution(
+    distances: np.ndarray,
+    group_ids: np.ndarray,
+    group_names: np.ndarray,
+    class_names: List[str],
+    stage: str,
+    output_path: str,
+) -> None:
+    names_arr = np.asarray(group_names)
+    name_to_idx = {str(names_arr[i]): i for i in range(len(names_arr))}
+
+    labels: List[str] = []
+    normal_data: List[np.ndarray] = []
+    anomaly_data: List[np.ndarray] = []
+    for class_name in class_names:
+        idx_n = name_to_idx.get(_make_group_key(class_name, "normal", stage))
+        idx_a = name_to_idx.get(_make_group_key(class_name, "anomaly", stage))
+        d_n = (
+            distances[group_ids == idx_n]
+            if idx_n is not None
+            else np.array([], dtype=np.float64)
+        )
+        d_a = (
+            distances[group_ids == idx_a]
+            if idx_a is not None
+            else np.array([], dtype=np.float64)
+        )
+        if d_n.size == 0 and d_a.size == 0:
+            continue
+        labels.append(class_name)
+        normal_data.append(d_n)
+        anomaly_data.append(d_a)
+
+    if len(labels) == 0:
+        print(
+            f"[warn] no per-class data available for stage={stage}, skip plot: {output_path}"
+        )
+        return
+
+    x = np.arange(len(labels), dtype=np.float64)
+    offset = 0.18
+    normal_pos = x - offset
+    anomaly_pos = x + offset
+
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.9), 6))
+    bp_n = ax.boxplot(
+        normal_data,
+        positions=normal_pos,
+        widths=0.30,
+        patch_artist=True,
+        showfliers=False,
+        manage_ticks=False,
+    )
+    bp_a = ax.boxplot(
+        anomaly_data,
+        positions=anomaly_pos,
+        widths=0.30,
+        patch_artist=True,
+        showfliers=False,
+        manage_ticks=False,
+    )
+
+    for box in bp_n["boxes"]:
+        box.set(facecolor="#1f77b4", alpha=0.45, edgecolor="#1f77b4")
+    for box in bp_a["boxes"]:
+        box.set(facecolor="#d62728", alpha=0.45, edgecolor="#d62728")
+    for key in ("whiskers", "caps", "medians"):
+        for line in bp_n[key]:
+            line.set(color="#1f77b4", linewidth=1.1)
+        for line in bp_a[key]:
+            line.set(color="#d62728", linewidth=1.1)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel("Distance to origin (0, 0)")
+    ax.set_title(f"Per-class distance distribution in t-SNE space ({stage})")
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.legend(
+        [bp_n["boxes"][0], bp_a["boxes"][0]], ["normal", "anomaly"], loc="upper right"
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_highdim_l2_per_class_boxplot(
+    features: np.ndarray,
+    group_ids: np.ndarray,
+    group_names: np.ndarray,
+    class_names: List[str],
+    stage: str,
+    output_path: str,
+) -> None:
+    l2_norms = np.linalg.norm(features, axis=1)
+    names_arr = np.asarray(group_names)
+    name_to_idx = {str(names_arr[i]): i for i in range(len(names_arr))}
+
+    labels: List[str] = []
+    normal_data: List[np.ndarray] = []
+    anomaly_data: List[np.ndarray] = []
+    for class_name in class_names:
+        idx_n = name_to_idx.get(_make_group_key(class_name, "normal", stage))
+        idx_a = name_to_idx.get(_make_group_key(class_name, "anomaly", stage))
+        d_n = (
+            l2_norms[group_ids == idx_n]
+            if idx_n is not None
+            else np.array([], dtype=np.float64)
+        )
+        d_a = (
+            l2_norms[group_ids == idx_a]
+            if idx_a is not None
+            else np.array([], dtype=np.float64)
+        )
+        if d_n.size == 0 and d_a.size == 0:
+            continue
+        labels.append(class_name)
+        normal_data.append(d_n)
+        anomaly_data.append(d_a)
+
+    if len(labels) == 0:
+        print(
+            f"[warn] no per-class data for high-dimensional L2 boxplot: {output_path}"
+        )
+        return
+
+    x = np.arange(len(labels), dtype=np.float64)
+    offset = 0.18
+    normal_pos = x - offset
+    anomaly_pos = x + offset
+
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.9), 6))
+    bp_n = ax.boxplot(
+        normal_data,
+        positions=normal_pos,
+        widths=0.30,
+        patch_artist=True,
+        showfliers=False,
+        manage_ticks=False,
+    )
+    bp_a = ax.boxplot(
+        anomaly_data,
+        positions=anomaly_pos,
+        widths=0.30,
+        patch_artist=True,
+        showfliers=False,
+        manage_ticks=False,
+    )
+
+    for box in bp_n["boxes"]:
+        box.set(facecolor="#1f77b4", alpha=0.45, edgecolor="#1f77b4")
+    for box in bp_a["boxes"]:
+        box.set(facecolor="#d62728", alpha=0.45, edgecolor="#d62728")
+    for key in ("whiskers", "caps", "medians"):
+        for line in bp_n[key]:
+            line.set(color="#1f77b4", linewidth=1.1)
+        for line in bp_a[key]:
+            line.set(color="#d62728", linewidth=1.1)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel("L2 norm in original feature space")
+    ax.set_title(f"Per-class high-dimensional residual-feature L2 norm ({stage})")
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.legend(
+        [bp_n["boxes"][0], bp_a["boxes"][0]], ["normal", "anomaly"], loc="upper right"
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
 def summarize_distance_means(
     distances: np.ndarray, binary_labels: np.ndarray
 ) -> Tuple[float, float]:
@@ -804,11 +987,14 @@ def main() -> None:
     binary_labels, status_labels = build_binary_labels(summary_group_ids, group_names)
     binary_labels_all, status_labels_all = build_binary_labels(all_group_ids, group_names)
     distance_saved_paths: List[str] = []
+    class_stats_saved_paths: List[str] = []
+    highdim_l2_saved_paths: List[str] = []
     stage_distance_means: Dict[str, Tuple[float, float]] = {}
     if adapter is not None:
         for stage in ("before", "after"):
             st_group_idx = _group_indices_for_stage(group_names, stage)
             st_mask = np.isin(all_group_ids, st_group_idx)
+            st_features = all_features[st_mask]
             st_embedding = embedding[st_mask]
             st_group_ids = all_group_ids[st_mask]
             st_binary, _ = build_binary_labels(st_group_ids, group_names)
@@ -820,6 +1006,32 @@ def main() -> None:
             n_m, a_m = summarize_distance_means(distances_st, st_binary)
             stage_distance_means[stage] = (n_m, a_m)
             distance_saved_paths.append(dist_path)
+            class_stats_path = os.path.join(
+                args.output_dir,
+                _append_suffix_to_stem(args.class_stats_output, ref_suffix + f"_{stage}"),
+            )
+            plot_per_class_distance_distribution(
+                distances=distances_st,
+                group_ids=st_group_ids,
+                group_names=group_names,
+                class_names=class_names,
+                stage=stage,
+                output_path=class_stats_path,
+            )
+            class_stats_saved_paths.append(class_stats_path)
+            highdim_l2_path = os.path.join(
+                args.output_dir,
+                _append_suffix_to_stem(args.highdim_l2_output, ref_suffix + f"_{stage}"),
+            )
+            plot_highdim_l2_per_class_boxplot(
+                features=st_features,
+                group_ids=st_group_ids,
+                group_names=group_names,
+                class_names=class_names,
+                stage=stage,
+                output_path=highdim_l2_path,
+            )
+            highdim_l2_saved_paths.append(highdim_l2_path)
         distances = np.linalg.norm(summary_embedding, axis=1)
         normal_mean_distance, anomaly_mean_distance = summarize_distance_means(
             distances, binary_labels
@@ -832,6 +1044,31 @@ def main() -> None:
             summary_embedding, binary_labels, distance_output_path
         )
         distance_saved_paths = [distance_output_path]
+        class_stats_output_path = os.path.join(
+            args.output_dir, _append_suffix_to_stem(args.class_stats_output, ref_suffix)
+        )
+        plot_per_class_distance_distribution(
+            distances=distances,
+            group_ids=summary_group_ids,
+            group_names=group_names,
+            class_names=class_names,
+            stage=args.report_stage,
+            output_path=class_stats_output_path,
+        )
+        class_stats_saved_paths = [class_stats_output_path]
+        summary_features = all_features[summary_mask]
+        highdim_l2_output_path = os.path.join(
+            args.output_dir, _append_suffix_to_stem(args.highdim_l2_output, ref_suffix)
+        )
+        plot_highdim_l2_per_class_boxplot(
+            features=summary_features,
+            group_ids=summary_group_ids,
+            group_names=group_names,
+            class_names=class_names,
+            stage=args.report_stage,
+            output_path=highdim_l2_output_path,
+        )
+        highdim_l2_saved_paths = [highdim_l2_output_path]
         normal_mean_distance, anomaly_mean_distance = summarize_distance_means(
             distances, binary_labels
         )
@@ -880,6 +1117,10 @@ def main() -> None:
         print(f"Saved t-SNE figure to: {path}")
     for path in distance_saved_paths:
         print(f"Saved distance distribution figure to: {path}")
+    for path in class_stats_saved_paths:
+        print(f"Saved per-class distribution figure to: {path}")
+    for path in highdim_l2_saved_paths:
+        print(f"Saved high-dimensional L2 boxplot to: {path}")
     if adapter is not None:
         nb, ab = stage_distance_means["before"]
         na, aa = stage_distance_means["after"]

@@ -590,6 +590,11 @@ def main():
             eval_rows = []
             mean_img_list = []
             mean_pixel_list = []
+            mean_ap_sp_list = []
+            mean_f1_sp_list = []
+            mean_ap_px_list = []
+            mean_f1_px_list = []
+            mean_aupro_px_list = []
             for class_name in class_names:
                 test_loader = build_test_loader(args, class_name)
                 (
@@ -606,6 +611,11 @@ def main():
                 )
                 mean_img_list.append(auroc)
                 mean_pixel_list.append(pixel_auroc)
+                mean_ap_sp_list.append(ap_sp)
+                mean_f1_sp_list.append(f1_sp)
+                mean_ap_px_list.append(ap_px)
+                mean_f1_px_list.append(f1_px)
+                mean_aupro_px_list.append(aupro_px)
                 print(
                     (
                         f"epoch {epoch + 1} | {class_name} | auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, "
@@ -617,9 +627,19 @@ def main():
 
             epoch_mean_img = float(np.mean(mean_img_list))
             epoch_mean_pixel = float(np.mean(mean_pixel_list))
+            epoch_mean_ap_sp = float(np.mean(mean_ap_sp_list))
+            epoch_mean_f1_sp = float(np.mean(mean_f1_sp_list))
+            epoch_mean_ap_px = float(np.mean(mean_ap_px_list))
+            epoch_mean_f1_px = float(np.mean(mean_f1_px_list))
+            epoch_mean_aupro_px = float(np.mean(mean_aupro_px_list))
             epoch_mean = (epoch_mean_img + epoch_mean_pixel) / 2
             print(f"epoch {epoch + 1} | multiclass img mean: {epoch_mean_img:.5f}")
             print(f"epoch {epoch + 1} | multiclass pixel mean: {epoch_mean_pixel:.5f}")
+            print(f"epoch {epoch + 1} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f}")
+            print(f"epoch {epoch + 1} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f}")
+            print(f"epoch {epoch + 1} | multiclass ap_px mean: {epoch_mean_ap_px:.5f}")
+            print(f"epoch {epoch + 1} | multiclass f1_px mean: {epoch_mean_f1_px:.5f}")
+            print(f"epoch {epoch + 1} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}")
 
             if epoch_mean > best_mean:
                 best_mean = epoch_mean
@@ -629,7 +649,7 @@ def main():
             if args.save_log:
                 with open(os.path.join(saved_dir, "log.txt"), "a") as file:
                     file.write(
-                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f}\n"
+                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
                     )
 
     if len(best_result_by_class) == 0:

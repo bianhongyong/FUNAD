@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def compute_balanced_bce_loss(localnet_criterion, pred, target):
@@ -131,3 +132,64 @@ def build_adaptive_threshold_map(distance, class_idx_np, default_threshold, quan
         threshold_map[cls_mask] = cls_thr
 
     return threshold_map
+def calculate_log_barrier_bi_occ_loss(features, mask, target=None):
+    """
+    Calculate Abnormal Invariant OCC loss.
+    Args:
+        features: shape (N, dim)
+        mask: 0 for normal, 1 for abnormal, shape (N, 1)
+    """
+    A = features.norm(dim=1)
+    A = torch.sqrt(A + 1) - 1
+    
+    Aa = A[mask == 1]
+    if torch.sum(mask == 1) != 0:  # second stage, and exist anomalies
+        r_max = min(0.9 * Aa.min().item(), 0.4)  # get the minimum abnormal radii as r_max
+        r_min = r_max * 0.99  
+    else:  # first stage, or no anomalies in second stage
+        r_max = 0.4
+        r_min = 0.99 * 0.4
+    
+    loss, loss_n, loss_a = 0, 0, 0
+    if torch.sum(mask == 0) != 0:
+        An = A[mask == 0]
+        An_larger = An[An > r_max]  # larger than r_max
+        An_lower = An[An < r_min]  # lower than r_min
+        if An_larger.shape[0] != 0:
+            weights = torch.exp(An_larger - r_max).detach()
+            loss_larger = torch.mean(-F.logsigmoid(-(An_larger - r_max)) * weights)
+        else:
+            loss_larger = 0
+        if An_lower.shape[0] != 0:
+            weights = torch.exp(r_min - An_lower).detach()
+            loss_lower = torch.mean(-F.logsigmoid(-(r_min - An_lower)) * weights)
+        else:
+            loss_lower = 0
+        
+        # another implementation
+        # loss_larger = torch.mean(log_sigmoid(-(An - r_max)))  # cooresponding to r_max, pull into r_max
+        # loss_lower = torch.mean(log_sigmoid(-(r_min - An)))  # cooresponding to r_min, pull into r_min
+        
+        loss_n = loss_larger + loss_lower
+        loss += loss_n
+
+    # for anomalies, we keep the mapped features as the original features
+    if torch.sum(mask == 1) != 0 and target is not None:
+        ano_features = features[mask == 1]
+        target_features = target[mask == 1]
+        loss_mse = F.mse_loss(ano_features, target_features)
+        loss_cos = torch.mean(1 - F.cosine_similarity(ano_features, target_features))
+        loss_inv = loss_mse + loss_cos  # anomaly invariant loss
+        
+        boundary = r_max + 0.1
+        # using log barrier loss to push ano features out the boundary
+        Aa_lower = Aa[Aa < boundary]  # lower than r_min
+        if Aa_lower.shape[0] != 0:
+            weights = torch.exp(boundary - Aa_lower).detach()
+            loss_lower = torch.mean(-F.logsigmoid(-(boundary - Aa_lower)) * weights)
+        else:
+            loss_lower = 0
+        loss_a = loss_inv + loss_lower
+        loss += loss_a
+
+    return loss, loss_n.item() if torch.is_tensor(loss_n) else 0, loss_a.item() if torch.is_tensor(loss_a) else 0
