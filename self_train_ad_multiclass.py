@@ -16,12 +16,21 @@ import torch.optim as optim
 import tqdm
 from scipy.ndimage import gaussian_filter
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 import AnomalyCLIP_lib
 import dataset_extract
+from epoch_precompute import precompute_pseudo_labels_multiclass
+import evaluate as eval_utils
+from loss import (
+    build_adaptive_threshold_map,
+    compute_balanced_bce_loss,
+    compute_oto_loss_multiclass,
+)
 import model
 from multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
+from print import print_epoch_losses, print_epoch_times
+import utils as common_utils
 
 warnings.filterwarnings("ignore")
 
@@ -38,14 +47,7 @@ _FAISS_GPU_TEMP_MEM_MB = 256
 
 
 def str2bool(value):
-    if isinstance(value, bool):
-        return value
-    lowered = value.lower()
-    if lowered in {"true", "1", "yes", "y", "t"}:
-        return True
-    if lowered in {"false", "0", "no", "n", "f"}:
-        return False
-    raise argparse.ArgumentTypeError("Boolean value expected, e.g. true/false")
+    return common_utils.str2bool(value)
 
 
 def parse_args():
@@ -125,24 +127,11 @@ def parse_args():
 
 
 def fix_seed(number):
-    np.random.seed(number)
-    random.seed(number)
-    torch.manual_seed(number)
-    torch.cuda.manual_seed(number)
-    torch.cuda.manual_seed_all(number)
-    cudnn.benchmark = False
-    cudnn.deterministic = True
+    common_utils.fix_seed(number)
 
 
 def find_matching(id_array):
-    matching = [[], []]
-    for i in range(id_array.shape[0]):
-        if i in matching[1]:
-            continue
-        if i == id_array[id_array[i]]:
-            matching[0].append(i)
-            matching[1].append(id_array[i])
-    return matching
+    return common_utils.find_matching(id_array)
 
 
 def _convert_imagenet_norm_to_clip_norm(input_tensor):
@@ -212,24 +201,12 @@ def infer_feature_dim(feature_extractor, train_loader, args):
 
 
 def compute_distance(feature):
-    faiss.omp_set_num_threads(4)
-    embedding = np.ascontiguousarray(feature.astype(np.float32))
-    dim = int(embedding.shape[-1])
-
-    if use_cuda and (not _FAISS_USE_CPU_INDEX):
-        try:
-            resources = _get_faiss_gpu_resources()
-            index = faiss.GpuIndexFlatL2(resources, dim, faiss.GpuIndexFlatConfig())
-        except RuntimeError:
-            index = faiss.IndexFlatL2(dim)
-    else:
-        index = faiss.IndexFlatL2(dim)
-
-    index.add(embedding)
-    distance, id_array = index.search(embedding, k=2)
-    distance = distance.T[-1]
-    id_array = id_array.T[-1]
-    return np.expand_dims(distance, axis=-1), id_array
+    return common_utils.compute_distance(
+        feature,
+        use_cuda=use_cuda,
+        use_cpu_index=_FAISS_USE_CPU_INDEX,
+        gpu_temp_mem_mb=_FAISS_GPU_TEMP_MEM_MB,
+    )
 
 
 def build_test_loader(args, class_name):
@@ -250,343 +227,41 @@ def build_test_loader(args, class_name):
 
 
 def get_oto_loss(args):
-    if args.oto_loss == "mae":
-        return nn.L1Loss().to(device)
-    if args.oto_loss == "mse":
-        return nn.MSELoss().to(device)
-    return nn.KLDivLoss(reduction="batchmean").to(device)
+    return common_utils.get_oto_loss(args.oto_loss, device)
 
 
 def evaluate_epoch(localnet, feature_extractor, test_loader, args):
-    seg_map = []
-    img_map = []
-    label_gt = []
-    mask_gt = []
-
-    for images, y, mask in test_loader:
-        with torch.no_grad():
-            localnet.eval()
-            feature_extractor.eval()
-            images = images.to(device)
-            y = y.detach().numpy()
-            mask = mask.detach().numpy()
-
-            features = extract_feature_batch(images, feature_extractor, args)
-            _, score = localnet(features)
-            score = score.detach().cpu().numpy()
-
-            img_score = aggregate_image_scores(
-                score,
-                topk_ratio=args.img_score_topk_ratio,
-            )
-            img_map.append(img_score)
-
-            score = score.reshape(-1, 28, 28)
-            for i in range(score.shape[0]):
-                _map = cv2.resize(score[i], (224, 224))
-                _map = gaussian_filter(_map, sigma=4)
-                seg_map.append(_map)
-                label_gt.append(y[i])
-                mask_gt.append(mask[i])
-
-    img_map = np.concatenate(img_map, axis=0)
-    label_gt = np.array(label_gt)
-    seg_map = np.stack(seg_map, axis=0)
-    mask_gt = np.stack(mask_gt, axis=0)
-
-    auroc = roc_auc_score(label_gt, img_map)
-    pixel_auroc = roc_auc_score(mask_gt.ravel(), seg_map.ravel())
-    return auroc, pixel_auroc
+    return eval_utils.evaluate_multiclass_epoch(
+        localnet=localnet,
+        feature_extractor=feature_extractor,
+        test_loader=test_loader,
+        args=args,
+        device=device,
+        extract_feature_batch_fn=extract_feature_batch,
+    )
 
 
 def _build_faiss_index(feature_np):
-    faiss.omp_set_num_threads(4)
-    dim = int(feature_np.shape[-1])
-    feat = np.ascontiguousarray(feature_np.astype(np.float32))
-
-    if use_cuda and (not _FAISS_USE_CPU_INDEX):
-        try:
-            resources = _get_faiss_gpu_resources()
-            index = faiss.GpuIndexFlatL2(
-                resources,
-                dim,
-                faiss.GpuIndexFlatConfig(),
-            )
-        except RuntimeError:
-            index = faiss.IndexFlatL2(dim)
-    else:
-        index = faiss.IndexFlatL2(dim)
-
-    index.add(feat)
-    return index
+    return common_utils.build_faiss_index(
+        feature_np,
+        use_cuda=use_cuda,
+        use_cpu_index=_FAISS_USE_CPU_INDEX,
+        gpu_temp_mem_mb=_FAISS_GPU_TEMP_MEM_MB,
+    )
 
 
 def aggregate_image_scores(score_2d, topk_ratio):
-    if score_2d.ndim != 2:
-        raise ValueError(f"Expected 2D score array, got shape={score_2d.shape}")
-
-    patch_count = int(score_2d.shape[1])
-    safe_ratio = float(np.clip(topk_ratio, 0.0, 1.0))
-    k = max(1, int(np.ceil(patch_count * safe_ratio)))
-    k = min(k, patch_count)
-
-    # Fast top-k selection without full sort.
-    topk = np.partition(score_2d, patch_count - k, axis=1)[:, -k:]
-    return topk.mean(axis=1)
+    return common_utils.aggregate_image_scores(score_2d, topk_ratio)
 
 
 def _get_faiss_gpu_resources(temp_mem_mb=None):
-    global _FAISS_GPU_RESOURCES
     if temp_mem_mb is None:
         temp_mem_mb = _FAISS_GPU_TEMP_MEM_MB
-    if _FAISS_GPU_RESOURCES is None:
-        _FAISS_GPU_RESOURCES = faiss.StandardGpuResources()
-        if temp_mem_mb is not None and temp_mem_mb > 0:
-            _FAISS_GPU_RESOURCES.setTempMemory(int(temp_mem_mb) * 1024 * 1024)
-    return _FAISS_GPU_RESOURCES
+    return common_utils._get_faiss_gpu_resources(temp_mem_mb)
 
 
 def _update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k):
-    if cand_feat is None or cand_feat.shape[0] == 0 or k <= 0:
-        return top_feat, top_dist
-
-    if top_feat is None or top_dist is None or top_feat.shape[0] == 0:
-        if cand_feat.shape[0] <= k:
-            return cand_feat, cand_dist
-        pick = np.argpartition(cand_dist, -k)[-k:]
-        return cand_feat[pick], cand_dist[pick]
-
-    merged_feat = np.concatenate([top_feat, cand_feat], axis=0)
-    merged_dist = np.concatenate([top_dist, cand_dist], axis=0)
-    if merged_feat.shape[0] <= k:
-        return merged_feat, merged_dist
-
-    pick = np.argpartition(merged_dist, -k)[-k:]
-    return merged_feat[pick], merged_dist[pick]
-
-
-def precompute_pseudo_labels_multiclass(args, localnet, feature_extractor, mini_loader, num_classes):
-    memory_bank_start = time.perf_counter()
-
-    dataset_size = len(mini_loader.dataset)
-    image_scores = np.zeros(dataset_size, dtype=np.float32)
-    class_stack = np.zeros(dataset_size, dtype=np.int64)
-    global_dim = None
-
-    with torch.no_grad():
-        localnet.eval()
-        feature_extractor.eval()
-        for images, mini_class_idx, mini_sample_idx in mini_loader:
-            images = images.to(device)
-            image_features = extract_feature_batch(images, feature_extractor, args)
-
-            features, score = localnet(image_features)
-            if features.shape[0] > args.batch_size:
-                features = features.unsqueeze(0)
-
-            if global_dim is None:
-                global_dim = int(features.shape[-1])
-
-            score = score.detach().cpu().numpy()
-            score = aggregate_image_scores(
-                score,
-                topk_ratio=args.img_score_topk_ratio,
-            )
-
-            if score.shape == ():
-                score = np.array([score], dtype=np.float32)
-
-            sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
-            class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
-
-            image_scores[sample_idx_np] = score.astype(np.float32)
-            class_stack[sample_idx_np] = class_np
-
-    if global_dim is None:
-        raise RuntimeError("未能从 mini_loader 获取到特征维度。")
-
-    image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
-    selected_images_by_class = {}
-
-    for class_idx in range(num_classes):
-        cls_idx = np.where(class_stack == class_idx)[0]
-        if cls_idx.shape[0] == 0:
-            selected_images_by_class[class_idx] = np.array([], dtype=np.int64)
-            continue
-
-        sampled_num = max(1, int(np.ceil(cls_idx.shape[0] * args.bank_sample_ratio)))
-        sampled_num = min(sampled_num, cls_idx.shape[0])
-        sampled_cls_idx = np.random.choice(cls_idx, size=sampled_num, replace=False)
-
-        sampled_scores = image_scores[sampled_cls_idx]
-        if sampled_scores.max() == sampled_scores.min():
-            normalized_score = np.zeros_like(sampled_scores)
-        else:
-            normalized_score = (sampled_scores - sampled_scores.min()) / (
-                sampled_scores.max() - sampled_scores.min()
-            )
-
-        image_norm_scores[sampled_cls_idx] = normalized_score.astype(np.float32)
-
-        normal_indices = np.where(normalized_score < 0.5)[0]
-        if normal_indices.shape[0] == 0:
-            selected_local = np.arange(sampled_cls_idx.shape[0])
-        elif args.random < 1:
-            sample_num = max(1, int(normal_indices.shape[0] * args.random))
-            selected_local = np.random.choice(
-                normal_indices, size=sample_num, replace=False
-            )
-        else:
-            selected_local = normal_indices
-
-        selected_global = sampled_cls_idx[selected_local]
-        if args.max_bank_images > 0 and selected_global.shape[0] > args.max_bank_images:
-            pick = np.random.choice(
-                selected_global.shape[0], size=args.max_bank_images, replace=False
-            )
-            selected_global = selected_global[pick]
-        selected_images_by_class[class_idx] = selected_global.astype(np.int64)
-
-    class_feature_buffers = {class_idx: [] for class_idx in range(num_classes)}
-    selected_indices = [
-        selected_images_by_class[class_idx]
-        for class_idx in range(num_classes)
-        if selected_images_by_class[class_idx].shape[0] > 0
-    ]
-
-    if len(selected_indices) > 0:
-        selected_indices = np.concatenate(selected_indices).astype(np.int64)
-        selected_dataset = Subset(mini_loader.dataset, selected_indices.tolist())
-        selected_loader = DataLoader(
-            selected_dataset,
-            batch_size=mini_loader.batch_size,
-            pin_memory=mini_loader.pin_memory,
-            shuffle=False,
-            num_workers=mini_loader.num_workers,
-            drop_last=False,
-        )
-
-        with torch.no_grad():
-            localnet.eval()
-            feature_extractor.eval()
-            for images, mini_class_idx, _ in selected_loader:
-                images = images.to(device)
-                image_features = extract_feature_batch(images, feature_extractor, args)
-                features, _ = localnet(image_features)
-
-                features_np = features.detach().cpu().numpy()
-                class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
-
-                for class_idx in np.unique(class_np).tolist():
-                    class_idx = int(class_idx)
-                    class_mask = class_np == class_idx
-                    if not np.any(class_mask):
-                        continue
-                    cls_features = features_np[class_mask].reshape(-1, global_dim)
-                    class_feature_buffers[class_idx].append(cls_features)
-
-    distance_map = np.zeros((dataset_size, 784), dtype=np.float16)
-    memory_bank = {}
-    confident_feature_bank = {}
-
-    for class_idx in range(num_classes):
-        if len(class_feature_buffers[class_idx]) == 0:
-            continue
-
-        normal_features = np.concatenate(class_feature_buffers[class_idx], axis=0)
-        memory_bank[class_idx] = _build_faiss_index(normal_features)
-
-    if args.beta:
-        top_feat_by_class = {class_idx: None for class_idx in range(num_classes)}
-        top_dist_by_class = {class_idx: None for class_idx in range(num_classes)}
-
-    class_min_distance = {class_idx: np.inf for class_idx in range(num_classes)}
-    class_max_distance = {class_idx: -np.inf for class_idx in range(num_classes)}
-
-    memory_bank_time = time.perf_counter() - memory_bank_start
-
-    pseudo_start = time.perf_counter()
-    with torch.no_grad():
-        localnet.eval()
-        feature_extractor.eval()
-        for images, mini_class_idx, mini_sample_idx in mini_loader:
-            images = images.to(device)
-            image_features = extract_feature_batch(images, feature_extractor, args)
-            features, _ = localnet(image_features)
-            features_np = features.detach().cpu().numpy()
-            sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
-            class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
-
-            for class_idx in np.unique(class_np).tolist():
-                class_idx = int(class_idx)
-                if class_idx not in memory_bank:
-                    continue
-
-                class_mask = class_np == class_idx
-                if not np.any(class_mask):
-                    continue
-
-                cls_features = features_np[class_mask].reshape(-1, global_dim)
-                cls_distance, _ = memory_bank[class_idx].search(
-                    np.ascontiguousarray(cls_features), k=args.k_number
-                )
-
-                cls_distance[cls_distance < 1e-2] = 0
-                if args.k_number == 2:
-                    same_feature = cls_distance[:, 0] == 0
-                    cls_distance[same_feature, 0] = cls_distance[same_feature, 1]
-                cls_distance = cls_distance[:, 0]
-
-                if cls_distance.size > 0:
-                    class_min_distance[class_idx] = min(
-                        class_min_distance[class_idx], float(cls_distance.min())
-                    )
-                    class_max_distance[class_idx] = max(
-                        class_max_distance[class_idx], float(cls_distance.max())
-                    )
-
-                cls_distance_map = cls_distance.reshape(-1, 784)
-                cls_sample_ids = sample_idx_np[class_mask]
-                distance_map[cls_sample_ids] = cls_distance_map.astype(np.float16)
-
-                if args.beta:
-                    high_sample_mask = image_norm_scores[cls_sample_ids] > 0.5
-                    if np.any(high_sample_mask):
-                        high_patch_mask = np.repeat(high_sample_mask, 784)
-                        cand_feat = cls_features[high_patch_mask]
-                        cand_dist = cls_distance[high_patch_mask]
-                        top_feat_by_class[class_idx], top_dist_by_class[class_idx] = _update_topk_features(
-                            top_feat_by_class[class_idx],
-                            top_dist_by_class[class_idx],
-                            cand_feat,
-                            cand_dist,
-                            args.beta_number,
-                        )
-
-    for class_idx in range(num_classes):
-        cls_idx = np.where(class_stack == class_idx)[0]
-        if cls_idx.shape[0] == 0:
-            continue
-
-        min_val = class_min_distance[class_idx]
-        max_val = class_max_distance[class_idx]
-        if not np.isfinite(min_val) or not np.isfinite(max_val) or max_val == min_val:
-            distance_map[cls_idx] = 0
-        else:
-            cls_values = distance_map[cls_idx].astype(np.float32)
-            cls_values = (cls_values - min_val) / (max_val - min_val)
-            distance_map[cls_idx] = cls_values.astype(np.float16)
-
-        if args.beta:
-            top_feat = top_feat_by_class.get(class_idx, None)
-            if top_feat is None or top_feat.shape[0] == 0:
-                confident_feature_bank[class_idx] = torch.zeros((0, global_dim), dtype=torch.float32)
-            else:
-                confident_feature_bank[class_idx] = torch.as_tensor(top_feat, dtype=torch.float32)
-
-    pseudo_label_time = time.perf_counter() - pseudo_start
-
-    return distance_map, confident_feature_bank, global_dim, memory_bank_time, pseudo_label_time
+    return common_utils.update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k)
 
 
 def _sample_beta_anomaly(confident_feature_bank, class_idx_batch, dim):
@@ -625,60 +300,6 @@ def _sample_beta_anomaly(confident_feature_bank, class_idx_batch, dim):
     return syn_anomaly, syn_class
 
 
-def build_adaptive_threshold_map(distance, class_idx_np, default_threshold, quantile):
-    threshold_map = np.full_like(distance, fill_value=default_threshold, dtype=np.float32)
-    safe_q = min(max(float(quantile), 0.0), 1.0)
-
-    for cls in np.unique(class_idx_np).tolist():
-        cls_mask = class_idx_np == int(cls)
-        if not np.any(cls_mask):
-            continue
-        cls_values = distance[cls_mask].reshape(-1)
-        if cls_values.size == 0:
-            continue
-        cls_thr = float(np.quantile(cls_values, safe_q))
-        threshold_map[cls_mask] = cls_thr
-
-    return threshold_map
-
-
-def _compute_oto_loss_multiclass(args, batch_feature, local_pred, class_idx, l_loss):
-    if args.oto_loss == "kl":
-        transform_fn = lambda a, b: 0.5 * (
-            l_loss(a.log(), (a + b) / 2) + l_loss(b.log(), (a + b) / 2)
-        )
-    else:
-        transform_fn = lambda a, b: 0.5 * (
-            l_loss(a, (a + b) / 2) + l_loss(b, (a + b) / 2)
-        )
-
-    unique_cls = torch.unique(class_idx)
-    loss_list = []
-
-    for cls in unique_cls:
-        cls_mask = class_idx == cls
-        if cls_mask.sum().item() < 2:
-            continue
-
-        cls_feature = batch_feature[cls_mask]
-        cls_score = local_pred[cls_mask]
-
-        feature_np = cls_feature.detach().cpu().numpy().reshape(-1, cls_feature.shape[-1])
-        _, id_array = compute_distance(feature_np)
-        matched = find_matching(id_array)
-        if len(matched[0]) == 0:
-            continue
-
-        target = cls_score.reshape(-1)[matched[0]]
-        input_score = cls_score.reshape(-1)[matched[1]]
-        loss_list.append(transform_fn(input_score, target))
-
-    if len(loss_list) == 0:
-        return torch.tensor(0.0, device=local_pred.device)
-
-    return torch.stack(loss_list).mean()
-
-
 def train_one_epoch(
     args,
     epoch,
@@ -709,7 +330,16 @@ def train_one_epoch(
 
     if threshold <= 1:
         distance_map, confident_feature_bank, global_dim, mb_time, pl_time = precompute_pseudo_labels_multiclass(
-            args, localnet, feature_extractor, mini_loader, num_classes
+            args=args,
+            localnet=localnet,
+            feature_extractor=feature_extractor,
+            mini_loader=mini_loader,
+            num_classes=num_classes,
+            device=device,
+            extract_feature_batch_fn=extract_feature_batch,
+            aggregate_image_scores_fn=aggregate_image_scores,
+            build_faiss_index_fn=_build_faiss_index,
+            update_topk_features_fn=_update_topk_features,
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
@@ -809,30 +439,24 @@ def train_one_epoch(
             pred_for_loss = gaussian_pred
 
         if args.balancing:
-            pos_mask = local_label == 1
-            neg_mask = local_label == 0
-
-            if pos_mask.any().item():
-                _a_loss = localnet_criterion(pred_for_loss[pos_mask], local_label[pos_mask])
-            else:
-                _a_loss = torch.tensor(0.0, device=local_label.device)
-
-            if neg_mask.any().item():
-                _n_loss = localnet_criterion(pred_for_loss[neg_mask], local_label[neg_mask])
-            else:
-                _n_loss = torch.tensor(0.0, device=local_label.device)
-            _loss = _a_loss + _n_loss
+            _loss = compute_balanced_bce_loss(
+                localnet_criterion=localnet_criterion,
+                pred=pred_for_loss,
+                target=local_label,
+            )
         else:
             _loss = localnet_criterion(pred_for_loss, local_label)
 
         if (iteration >= args.iter) and args.kl:
             kl_start = time.perf_counter()
-            _l_loss = _compute_oto_loss_multiclass(
+            _l_loss = compute_oto_loss_multiclass(
                 args=args,
                 batch_feature=batch_feature,
                 local_pred=local_pred,
                 class_idx=class_idx_for_oto,
                 l_loss=l_loss,
+                compute_distance_fn=compute_distance,
+                find_matching_fn=find_matching,
             )
             kl_loss_time += time.perf_counter() - kl_start
         else:
@@ -959,14 +583,8 @@ def main():
             num_classes=len(class_names),
         )
 
-        print(
-            "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f"
-            % (epoch + 1, local_loss_value, bce_loss_value, oto_loss_value)
-        )
-        print(
-            "epoch %d | memory bank: %.4fs, pseudo label: %.4fs, kl: %.4fs"
-            % (epoch + 1, memory_bank_time, pseudo_label_time, kl_loss_time)
-        )
+        print_epoch_losses(epoch, local_loss_value, bce_loss_value, oto_loss_value)
+        print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
 
         if epoch % args.eval_interval == 0:
             eval_rows = []
@@ -974,12 +592,26 @@ def main():
             mean_pixel_list = []
             for class_name in class_names:
                 test_loader = build_test_loader(args, class_name)
-                auroc, pixel_auroc = evaluate_epoch(localnet, feature_extractor, test_loader, args)
-                eval_rows.append([class_name, auroc, pixel_auroc])
+                (
+                    auroc,
+                    ap_sp,
+                    f1_sp,
+                    pixel_auroc,
+                    ap_px,
+                    f1_px,
+                    aupro_px,
+                ) = evaluate_epoch(localnet, feature_extractor, test_loader, args)
+                eval_rows.append(
+                    [class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px]
+                )
                 mean_img_list.append(auroc)
                 mean_pixel_list.append(pixel_auroc)
                 print(
-                    f"epoch {epoch + 1} | {class_name} | auroc: {auroc:.5f}, pixel auroc: {pixel_auroc:.5f}"
+                    (
+                        f"epoch {epoch + 1} | {class_name} | auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, "
+                        f"f1_sp: {f1_sp:.5f}, pixel auroc: {pixel_auroc:.5f}, ap_px: {ap_px:.5f}, "
+                        f"f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}"
+                    )
                 )
                 del test_loader
 
@@ -991,7 +623,7 @@ def main():
 
             if epoch_mean > best_mean:
                 best_mean = epoch_mean
-                best_result_by_class = {row[0]: (row[1], row[2]) for row in eval_rows}
+                best_result_by_class = {row[0]: tuple(row[1:]) for row in eval_rows}
                 torch.save({"net": localnet.state_dict()}, os.path.join(saved_dir, run_name + "_localnet.pt"))
 
             if args.save_log:
@@ -1005,11 +637,29 @@ def main():
 
     results = []
     for class_name in class_names:
-        auroc, pixel_auroc = best_result_by_class[class_name]
-        results.append([class_name, auroc, pixel_auroc])
-        print(f"best | {class_name} | img_auroc: {auroc:.5f} | pixel_auroc: {pixel_auroc:.5f}")
+        auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px = best_result_by_class[class_name]
+        results.append([class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px])
+        print(
+            (
+                f"best | {class_name} | img_auroc: {auroc:.5f} | ap_sp: {ap_sp:.5f} "
+                f"| f1_sp: {f1_sp:.5f} | pixel_auroc: {pixel_auroc:.5f} "
+                f"| ap_px: {ap_px:.5f} | f1_px: {f1_px:.5f} | aupro_px: {aupro_px:.5f}"
+            )
+        )
 
-    df = pd.DataFrame(results, columns=["class", "auroc", "pixel_auroc"])
+    df = pd.DataFrame(
+        results,
+        columns=[
+            "class",
+            "auroc_sp",
+            "ap_sp",
+            "f1_sp",
+            "auroc_px",
+            "ap_px",
+            "f1_px",
+            "aupro_px",
+        ],
+    )
     result_path = os.path.join(
         saved_dir,
         datetime.datetime.now().strftime("%Y%m%d-%H%M%S"),

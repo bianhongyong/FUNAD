@@ -3,7 +3,6 @@ import argparse
 import numpy as np
 import random
 import torch.backends.cudnn as cudnn
-import faiss
 import os
 import wandb
 import sys
@@ -35,6 +34,11 @@ import timm
 import torch.nn.functional as F
 import time
 import warnings
+from epoch_precompute import precompute_pseudo_labels_feature
+import evaluate as eval_utils
+from loss import compute_balanced_bce_loss, compute_oto_loss_single
+from print import print_epoch_losses, print_epoch_times
+import utils as common_utils
 
 warnings.filterwarnings("ignore")
 
@@ -150,50 +154,15 @@ def parse_args():
 
 
 def find_matching(id):
-    # Mutual closest pair matching (论文 4.2):
-    # 如果 i 的最近邻是 j，且 j 的最近邻也是 i，则记为一对互近邻。
-    matching = [[], []]
-    for i in range(id.shape[0]):
-        if i in matching[1]:
-            continue
-        if i == id[id[i]]:
-            input = i
-            target = id[i]
-
-            matching[0].append(input)
-            matching[1].append(target)
-
-    return matching
+    return common_utils.find_matching(id)
 
 
 def compute_distance(feature):
-    # 在当前 batch 内做 FAISS 最近邻检索，用于 mutual smoothness 配对。
-    # k=2 是为了跳过自身匹配（第一个近邻通常是自己）。
-    faiss.omp_set_num_threads(4)
-    index = faiss.GpuIndexFlatL2(
-        faiss.StandardGpuResources(), feature.shape[-1], faiss.GpuIndexFlatConfig()
-    )
-    index.add(feature)
-
-    embedding = np.ascontiguousarray(feature)
-    distance, id = index.search(embedding, k=2)
-
-    distance = distance.T
-    distance = distance[-1]
-
-    id = id.T[-1]
-    distance = np.expand_dims(distance, axis=-1)
-    return distance, id
+    return common_utils.compute_distance(feature, use_cuda=use_cuda)
 
 
 def fix_seed(number):
-    np.random.seed(number)
-    random.seed(number)
-    torch.manual_seed(number)
-    torch.cuda.manual_seed(number)
-    torch.cuda.manual_seed_all(number)
-    cudnn.benchmark = False
-    cudnn.deterministic = True
+    common_utils.fix_seed(number)
 
 
 def extract_feature(input, feature_extractor, concat):
@@ -460,201 +429,15 @@ def build_test_loader(args, class_name):
 
 
 def get_oto_loss(args):
-    if args.oto_loss == "mae":
-        return nn.L1Loss().to(device)
-    if args.oto_loss == "mse":
-        return nn.MSELoss().to(device)
-    return nn.KLDivLoss(reduction="batchmean").to(device)
+    return common_utils.get_oto_loss(args.oto_loss, device)
 
 
 def evaluate_epoch(localnet, test_loader):
-    seg_map = []
-    img_map = []
-    label_gt = []
-    mask_gt = []
-
-    for x, y, mask in test_loader:
-        with torch.no_grad():
-            localnet.eval()
-            x = x.to(device)
-            y = y.detach().numpy()
-            mask = mask.detach().numpy()
-            _, score = localnet(x)
-            score = score.detach().cpu().numpy()
-
-            img_score = score.max(axis=1)
-            img_map.append(img_score)
-
-            score = score.reshape(-1, 28, 28)
-            for i in range(score.shape[0]):
-                _map = cv2.resize(score[i], (224, 224))
-                _map = gaussian_filter(_map, sigma=4)
-                seg_map.append(_map)
-                label_gt.append(y[i])
-                mask_gt.append(mask[i])
-
-    img_map = np.concatenate(img_map, axis=0)
-    label_gt = np.array(label_gt)
-    seg_map = np.stack(seg_map, axis=0)
-    mask_gt = np.stack(mask_gt, axis=0)
-
-    auroc = roc_auc_score(label_gt, img_map)
-    pixel_auroc = roc_auc_score(mask_gt.ravel(), seg_map.ravel())
-    return auroc, pixel_auroc
+    return eval_utils.evaluate_feature_epoch(localnet, test_loader, device)
 
 
 def _update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k):
-    if cand_feat is None or cand_feat.shape[0] == 0 or k <= 0:
-        return top_feat, top_dist
-
-    if top_feat is None or top_dist is None or top_feat.shape[0] == 0:
-        if cand_feat.shape[0] <= k:
-            return cand_feat, cand_dist
-        pick = np.argpartition(cand_dist, -k)[-k:]
-        return cand_feat[pick], cand_dist[pick]
-
-    merged_feat = np.concatenate([top_feat, cand_feat], axis=0)
-    merged_dist = np.concatenate([top_dist, cand_dist], axis=0)
-    if merged_feat.shape[0] <= k:
-        return merged_feat, merged_dist
-
-    pick = np.argpartition(merged_dist, -k)[-k:]
-    return merged_feat[pick], merged_dist[pick]
-
-
-def precompute_pseudo_labels(args, localnet, mini_loader):
-    memory_bank_start = time.perf_counter()
-
-    dataset_size = len(mini_loader.dataset)
-    score_stack = np.zeros(dataset_size, dtype=np.float32)
-    dim = None
-
-    with torch.no_grad():
-        localnet.eval()
-        for mini_x, sample_idx in mini_loader:
-            features, score = localnet(mini_x.to(device))
-            if features.shape[0] > args.batch_size:
-                features = features.unsqueeze(0)
-
-            if dim is None:
-                dim = int(features.shape[-1])
-
-            score = score.detach().cpu().numpy()
-            score = score.max(axis=-1)
-
-            if score.shape == ():
-                score = np.array([score], dtype=np.float32)
-
-            sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64)
-            score_stack[sample_idx_np] = score.astype(np.float32)
-
-    if dim is None:
-        raise RuntimeError("未能从 mini_loader 中获取特征维度。")
-
-    score_min = score_stack.min()
-    score_max = score_stack.max()
-    if score_max == score_min:
-        normalized_score = np.zeros_like(score_stack)
-    else:
-        normalized_score = (score_stack - score_min) / (score_max - score_min)
-
-    normal_indices = np.where(normalized_score < 0.5)[0]
-    if args.random < 1:
-        sample_num = int(normal_indices.shape[0] * args.random)
-        sampled = []
-        for _ in range(sample_num):
-            selected = np.random.randint(normal_indices.shape[0])
-            while normal_indices[selected] in sampled:
-                selected = np.random.randint(normal_indices.shape[0])
-            sampled.append(normal_indices[selected])
-        selected_normal_indices = sampled
-    else:
-        selected_normal_indices = normal_indices
-
-    selected_normal_indices = np.asarray(selected_normal_indices, dtype=np.int64)
-    selected_index_set = set(selected_normal_indices.tolist())
-
-    normal_features = []
-    with torch.no_grad():
-        localnet.eval()
-        for mini_x, sample_idx in mini_loader:
-            features, _ = localnet(mini_x.to(device))
-            features = features.detach().cpu().numpy()
-            sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64)
-
-            keep_mask = np.array([idx in selected_index_set for idx in sample_idx_np])
-            if np.any(keep_mask):
-                normal_features.append(features[keep_mask].reshape(-1, dim))
-
-    if len(normal_features) == 0:
-        raise RuntimeError("构建 memory bank 时未选中任何 normal 特征，请检查 threshold/random。")
-
-    normal_features = np.concatenate(normal_features, axis=0)
-
-    faiss.omp_set_num_threads(4)
-    index = faiss.GpuIndexFlatL2(
-        faiss.StandardGpuResources(),
-        dim,
-        faiss.GpuIndexFlatConfig(),
-    )
-    index.add(normal_features)
-    memory_bank_time = time.perf_counter() - memory_bank_start
-
-    pseudo_start = time.perf_counter()
-    distance_map = np.zeros((dataset_size, 784), dtype=np.float32)
-    global_min = np.inf
-    global_max = -np.inf
-
-    top_feat = None
-    top_dist = None
-
-    with torch.no_grad():
-        localnet.eval()
-        for mini_x, sample_idx in mini_loader:
-            features, _ = localnet(mini_x.to(device))
-            features = features.detach().cpu().numpy()
-            sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64)
-
-            batch_features = features.reshape(-1, dim)
-            distance, _ = index.search(np.ascontiguousarray(batch_features), k=args.k_number)
-
-            distance[distance < 1e-2] = 0
-            if args.k_number == 2:
-                same_feature = distance[:, 0] == 0
-                distance[same_feature, 0] = distance[same_feature, 1]
-
-            distance = distance[:, 0]
-            if distance.size > 0:
-                global_min = min(global_min, float(distance.min()))
-                global_max = max(global_max, float(distance.max()))
-
-            distance_map[sample_idx_np] = distance.reshape(-1, 784)
-
-            if args.beta:
-                high_sample_mask = normalized_score[sample_idx_np] > 0.5
-                if np.any(high_sample_mask):
-                    high_patch_mask = np.repeat(high_sample_mask, 784)
-                    cand_feat = batch_features[high_patch_mask]
-                    cand_dist = distance[high_patch_mask]
-                    top_feat, top_dist = _update_topk_features(
-                        top_feat, top_dist, cand_feat, cand_dist, args.beta_number
-                    )
-
-    if not np.isfinite(global_min) or not np.isfinite(global_max) or global_max == global_min:
-        distance_map = np.zeros_like(distance_map)
-    else:
-        distance_map = (distance_map - global_min) / (global_max - global_min)
-
-    pseudo_label_time = time.perf_counter() - pseudo_start
-
-    confident_features = None
-    if args.beta:
-        if top_feat is None or top_feat.shape[0] == 0:
-            confident_features = torch.zeros((0, dim), dtype=torch.float32)
-        else:
-            confident_features = torch.as_tensor(top_feat, dtype=torch.float32)
-
-    return distance_map, confident_features, dim, memory_bank_time, pseudo_label_time
+    return common_utils.update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k)
 
 
 def train_one_epoch(
@@ -693,7 +476,13 @@ def train_one_epoch(
 
     if threshold <= 1:
         distance_map, confident_features, dim, mb_time, pl_time = (
-            precompute_pseudo_labels(args, localnet, mini_loader)
+            precompute_pseudo_labels_feature(
+                args=args,
+                localnet=localnet,
+                mini_loader=mini_loader,
+                device=device,
+                update_topk_features_fn=_update_topk_features,
+            )
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
@@ -855,80 +644,65 @@ def train_one_epoch(
             _copy = _copy.to(device)
             _, gaussian_pred = localnet(_copy)
             if args.balancing:
-                pos_mask = local_label == 1
-                neg_mask = local_label == 0
-
-                if pos_mask.any().item():
-                    _a_loss = localnet_criterion(
-                        gaussian_pred[pos_mask], local_label[pos_mask]
-                    )
-                else:
-                    _a_loss = torch.tensor(0.0, device=local_label.device)
-
-                if neg_mask.any().item():
-                    _n_loss = localnet_criterion(
-                        gaussian_pred[neg_mask], local_label[neg_mask]
-                    )
-                else:
-                    _n_loss = torch.tensor(0.0, device=local_label.device)
-                _loss = _a_loss + _n_loss
+                _loss = compute_balanced_bce_loss(
+                    localnet_criterion=localnet_criterion,
+                    pred=gaussian_pred,
+                    target=local_label,
+                )
             else:
                 _loss = localnet_criterion(gaussian_pred, local_label)
         else:
             if args.balancing:
-                pos_mask = local_label == 1
-                neg_mask = local_label == 0
-
-                if pos_mask.any().item():
-                    _a_loss = localnet_criterion(
-                        local_pred[pos_mask], local_label[pos_mask]
-                    )
-                else:
-                    _a_loss = torch.tensor(0.0, device=local_label.device)
-
-                if neg_mask.any().item():
-                    _n_loss = localnet_criterion(
-                        local_pred[neg_mask], local_label[neg_mask]
-                    )
-                else:
-                    _n_loss = torch.tensor(0.0, device=local_label.device)
-                _loss = _a_loss + _n_loss
+                _loss = compute_balanced_bce_loss(
+                    localnet_criterion=localnet_criterion,
+                    pred=local_pred,
+                    target=local_label,
+                )
             else:
                 _loss = localnet_criterion(local_pred, local_label)
 
         if (iteration >= args.iter) and args.kl:
             kl_start = time.perf_counter()
-            feature_np = (
-                batch_feature.detach()
-                .cpu()
-                .numpy()
-                .reshape(-1, batch_feature.shape[-1])
-            )
-            _, id = compute_distance(feature_np)
-            matched_id = find_matching(id)
             if args.synthetic:
                 real = args.batch_size * 784
             else:
                 real = args.batch_size
-            target = local_pred[:real].reshape(-1)[matched_id[0]]
-            input = local_pred[:real].reshape(-1)[matched_id[1]]
+
+            _l_loss = compute_oto_loss_single(
+                args=args,
+                batch_feature=batch_feature,
+                local_pred=local_pred,
+                real_count=real,
+                l_loss=l_loss,
+                compute_distance_fn=compute_distance,
+                find_matching_fn=find_matching,
+            )
 
             if args.perlin:
+                feature_np = (
+                    batch_feature.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1, batch_feature.shape[-1])
+                )
+                _, id = compute_distance(feature_np)
+                matched_id = find_matching(id)
+                target = local_pred[:real].reshape(-1)[matched_id[0]]
+                input = local_pred[:real].reshape(-1)[matched_id[1]]
                 for idx, shuf_idx in enumerate(shuffled_indices_batch):
                     if shuf_idx in perlin_indices:
                         target[idx] = target[idx].detach()
                         input[idx] = input[idx].detach()
-
-            if args.oto_loss == "kl":
-                _l_loss = 0.5 * (
-                    l_loss(input.log(), (input + target) / 2)
-                    + l_loss(target.log(), (input + target) / 2)
-                )
-            else:
-                _l_loss = 0.5 * (
-                    l_loss(input, (input + target) / 2)
-                    + l_loss(target, (input + target) / 2)
-                )
+                if args.oto_loss == "kl":
+                    _l_loss = 0.5 * (
+                        l_loss(input.log(), (input + target) / 2)
+                        + l_loss(target.log(), (input + target) / 2)
+                    )
+                else:
+                    _l_loss = 0.5 * (
+                        l_loss(input, (input + target) / 2)
+                        + l_loss(target, (input + target) / 2)
+                    )
             kl_loss_time += time.perf_counter() - kl_start
         else:
             _l_loss = 0
@@ -1055,22 +829,28 @@ def main():
                 perlin_length=perlin_length,
                 iteration=iteration,
             )
-            print(
-                "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f"
-                % (epoch + 1, local_loss_value, bce_loss_value, oto_loss_value)
-            )
-            print(
-                "epoch %d | memory bank: %.4fs, pseudo label: %.4fs, kl: %.4fs"
-                % (epoch + 1, memory_bank_time, pseudo_label_time, kl_loss_time)
-            )
+            print_epoch_losses(epoch, local_loss_value, bce_loss_value, oto_loss_value)
+            print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
 
             if (epoch) % args.eval_interval == 0:
-                auroc, pixel_auroc = evaluate_epoch(localnet, test_loader)
+                (
+                    auroc,
+                    ap_sp,
+                    f1_sp,
+                    pixel_auroc,
+                    ap_px,
+                    f1_px,
+                    aupro_px,
+                ) = evaluate_epoch(localnet, test_loader)
                 num_epoch = epoch + 1
 
                 print(
                     "epoch %d |" % num_epoch,
-                    f"auroc: {auroc:.5f}, pxiel auroc: {pixel_auroc:.5f}",
+                    (
+                        f"auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, f1_sp: {f1_sp:.5f}, "
+                        f"pixel auroc: {pixel_auroc:.5f}, ap_px: {ap_px:.5f}, "
+                        f"f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}"
+                    ),
                 )
 
                 if args.wandb:
@@ -1080,7 +860,12 @@ def main():
                             "one-to-one loss": oto_loss_value,
                             "bce loss": bce_loss_value,
                             "image AUC": auroc,
+                            "image AP": ap_sp,
+                            "image F1-max": f1_sp,
                             "pixel AUC": pixel_auroc,
+                            "pixel AP": ap_px,
+                            "pixel F1-max": f1_px,
+                            "pixel AUPRO": aupro_px,
                         }
                     )
 
@@ -1089,12 +874,22 @@ def main():
                 if epoch == 0:
                     best = mean
                     fix_auroc = auroc
+                    fix_ap_sp = ap_sp
+                    fix_f1_sp = f1_sp
                     fix_pauroc = pixel_auroc
+                    fix_ap_px = ap_px
+                    fix_f1_px = f1_px
+                    fix_aupro_px = aupro_px
                 else:
                     if mean > best:
                         best = mean
                         fix_auroc = auroc
+                        fix_ap_sp = ap_sp
+                        fix_f1_sp = f1_sp
                         fix_pauroc = pixel_auroc
+                        fix_ap_px = ap_px
+                        fix_f1_px = f1_px
+                        fix_aupro_px = aupro_px
                         print(f"class: {class_name}, data_noise: {args.noise}")
                         print("curr_best_auc: ", fix_auroc)
                         print("curr_best_pauc: ", fix_pauroc)
@@ -1127,16 +922,48 @@ def main():
 
                     with open(file_path, "a") as file:
                         file.write(
-                            f"epoch {num_epoch} | auroc: {auroc:.5f}, pixel auroc: {pixel_auroc:.5f}\n"
+                            (
+                                f"epoch {num_epoch} | auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, "
+                                f"f1_sp: {f1_sp:.5f}, pixel auroc: {pixel_auroc:.5f}, "
+                                f"ap_px: {ap_px:.5f}, f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}\n"
+                            )
                         )
                 ##
 
     print("class:", class_name)
     print("fix_img_auroc:", fix_auroc)
+    print("fix_img_ap:", fix_ap_sp)
+    print("fix_img_f1:", fix_f1_sp)
     print("fix_pauroc:", fix_pauroc)
+    print("fix_px_ap:", fix_ap_px)
+    print("fix_px_f1:", fix_f1_px)
+    print("fix_px_aupro:", fix_aupro_px)
 
-    results.append([class_name, fix_auroc, fix_pauroc])
-    df = pd.DataFrame(results, columns=["class", "auroc", "pixel_auroc"])
+    results.append(
+        [
+            class_name,
+            fix_auroc,
+            fix_ap_sp,
+            fix_f1_sp,
+            fix_pauroc,
+            fix_ap_px,
+            fix_f1_px,
+            fix_aupro_px,
+        ]
+    )
+    df = pd.DataFrame(
+        results,
+        columns=[
+            "class",
+            "auroc_sp",
+            "ap_sp",
+            "f1_sp",
+            "auroc_px",
+            "ap_px",
+            "f1_px",
+            "aupro_px",
+        ],
+    )
     result_path = os.path.join(args.save_path, "results", args.subdataset)
     os.makedirs(result_path, exist_ok=True)
     result_path = os.path.join(
