@@ -1,5 +1,5 @@
 import torch
-import model
+from src.model import model
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -22,5 +22,5 @@ if __name__ == "__main__":
     print(f"DINO 参数量: {dino_params:,} ({params_to_mb(dino_params):.2f} MB)")
     print(f"localnet 参数量: {localnet_params:,} ({params_to_mb(localnet_params):.2f} MB)")
     print(f"总参数量: {total_params:,} ({params_to_mb(total_params):.2f} MB)")
-    for name, param in model.named_parameters():
+    for name, param in local_net.named_parameters():
         print(name, param.dtype)

@@ -5,7 +5,8 @@ import torch.nn.functional as F
 import numpy as np
 import random
 
-from model_utils import (
+from src.model import model_utils
+from src.model.model_utils import (
         normalization,
         Downsample,
         zero_module,

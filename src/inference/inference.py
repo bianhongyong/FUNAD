@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from scipy.ndimage import gaussian_filter
 from sklearn.metrics import roc_auc_score
 import os
-import model
+from src.model import model
 import tqdm
 import cv2
 from skimage import measure
@@ -143,7 +143,9 @@ def main():
                 score = score.reshape(-1, 28, 28)
 
                 for i in range(score.shape[0]):
-                    _map = cv2.resize(score[i], (224, 224))
+                    mi = mask[i]
+                    dsize = (int(mi.shape[-1]), int(mi.shape[-2]))
+                    _map = cv2.resize(score[i], dsize)
                     _map = gaussian_filter(_map, sigma=4)
                     seg_map.append(_map)
 

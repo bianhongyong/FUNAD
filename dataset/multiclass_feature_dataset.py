@@ -2,6 +2,7 @@ import os
 import random
 
 import torch
+import numpy as np
 from PIL import Image
 from PIL import ImageFile
 from torch.utils.data import Dataset
@@ -11,21 +12,21 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 MVTEC_CLASS_NAMES = [
-    "bottle",
-    "cable",
+     "bottle",
+     "cable",
     "capsule",
-    "carpet",
-    "grid",
-    "hazelnut",
-    "leather",
-    "metal_nut",
-    "pill",
-    "screw",
-    "tile",
-    "toothbrush",
-    "transistor",
-    "wood",
-    "zipper",
+     "carpet",
+     "grid",
+     "hazelnut",
+     "leather",
+     "metal_nut",
+     "pill",
+     "screw",
+     "tile",
+     "toothbrush",
+     "transistor",
+     "wood",
+     "zipper",
 ]
 
 VISA_CLASS_NAMES = [
@@ -57,6 +58,7 @@ class MultiClassFeatureDataset(Dataset):
         dataset_name: str,
         image_size: int = 256,
         crop_size: int = 224,
+        patch_mask_size: int = 28,
         seed: int = 0,
         shuffle: bool = True,
     ):
@@ -77,6 +79,9 @@ class MultiClassFeatureDataset(Dataset):
                 ),
             ]
         )
+        self.patch_mask_size = int(patch_mask_size)
+        if self.patch_mask_size <= 0:
+            raise ValueError("patch_mask_size 必须为正整数。")
 
         self.samples = []
 
@@ -96,29 +101,68 @@ class MultiClassFeatureDataset(Dataset):
             self.classwise_global_indices[class_idx].append(idx)
 
     def _load_train_image_paths(self, class_name: str):
-        train_dir = os.path.join(self.data_path, class_name, "train")
+        train_dir = os.path.join(self.data_path, class_name, "train", "good")
         if not os.path.isdir(train_dir):
             return []
 
         image_paths = []
-        for defect_type in sorted(os.listdir(train_dir)):
-            defect_dir = os.path.join(train_dir, defect_type)
-            if not os.path.isdir(defect_dir):
+        for filename in sorted(os.listdir(train_dir)):
+            file_path = os.path.join(train_dir, filename)
+            if not os.path.isfile(file_path):
                 continue
-
-            for filename in sorted(os.listdir(defect_dir)):
-                lower = filename.lower()
-                if lower.endswith(".png") or lower.endswith(".jpg") or lower.endswith(".jpeg"):
-                    image_paths.append(os.path.join(defect_dir, filename))
+            lower = filename.lower()
+            if lower.endswith(".png") or lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                image_paths.append(file_path)
 
         return image_paths
 
     def __len__(self):
         return len(self.samples)
 
+    def _resolve_train_mask_path(self, image_path: str):
+        class_dir = os.path.dirname(os.path.dirname(os.path.dirname(image_path)))
+        defect_type = os.path.basename(os.path.dirname(image_path))
+        filename = os.path.basename(image_path)
+        stem, _ = os.path.splitext(filename)
+
+        # In train/good, only noisy* images require masks.
+        if defect_type.lower() == "good" and (not filename.lower().startswith("noisy")):
+            return None
+
+        mask_root = os.path.join(class_dir, "train","mask")
+        candidates = [
+            os.path.join(mask_root, f"{stem}_mask.png"),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        raise FileNotFoundError(
+            f"Mask not found for training image: {image_path}. "
+            f"Expected under: {os.path.join(mask_root)}"
+        )
+
+    def _load_patch_mask(self, image_path: str):
+        mask = np.zeros(
+            (self.patch_mask_size, self.patch_mask_size),
+            dtype=np.float32,
+        )
+        mask_path = self._resolve_train_mask_path(image_path)
+        if mask_path is None:
+            return torch.from_numpy(mask.reshape(-1))
+
+        mask_img = Image.open(mask_path).convert("L")
+        mask_img = mask_img.resize(
+            (self.patch_mask_size, self.patch_mask_size),
+            Image.NEAREST,
+        )
+        mask_np = np.array(mask_img, dtype=np.uint8)
+        mask = (mask_np > 0).astype(np.float32)
+        return torch.from_numpy(mask.reshape(-1))
+
     def __getitem__(self, idx):
         image_path, class_idx = self.samples[idx]
         image = Image.open(image_path).convert("RGB")
         image = self.transform_x(image)
+        patch_mask = self._load_patch_mask(image_path)
         class_idx = torch.tensor(class_idx, dtype=torch.long)
-        return image, class_idx, idx
+        return image, class_idx, idx, patch_mask

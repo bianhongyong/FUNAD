@@ -9,8 +9,8 @@ from matplotlib.colors import to_rgb
 from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 
-import dataset_extract
-import model
+from dataset import dataset_extract
+from src.model import model
 
 
 def str2bool(value):

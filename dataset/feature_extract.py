@@ -1,4 +1,4 @@
-import dataset_extract
+from dataset import dataset_extract
 import AnomalyCLIP_lib
 import torch
 import argparse

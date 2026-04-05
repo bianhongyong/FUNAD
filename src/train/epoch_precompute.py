@@ -1,11 +1,164 @@
+import os
 import time
 
 import faiss
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tqdm
 from torch.utils.data import DataLoader, Subset
-from sampler import ApproximateGreedyCoresetSampler
+from utils.memory_bank_stats import print_greedy_memory_bank_anomaly_stats
+from utils.sampler import ApproximateGreedyCoresetSampler
+
+
+def _as_1d_float32(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x)
+    if x.shape == ():
+        x = np.array([x], dtype=np.float32)
+    return x.astype(np.float32).reshape(-1)
+
+
+def _minmax_normalize(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    vmin = float(values.min())
+    vmax = float(values.max())
+    if vmax == vmin:
+        return np.zeros_like(values, dtype=np.float32)
+    return (values - vmin) / (vmax - vmin)
+
+
+def _postprocess_faiss_distances(distance: np.ndarray, k_number: int) -> np.ndarray:
+    """
+    distance: shape (N, k). Distances below 1e-4 are treated as 0 (self / duplicate).
+    Returns shape (N,): per row, mean of neighbors whose distance is > 0.
+    If all k neighbors are 0, returns 0 for that row.
+    k_number is unused but kept for call-site compatibility with FAISS k search.
+    """
+    _ = k_number
+    distance = np.asarray(distance, dtype=np.float32)
+    distance[distance < 1e-4] = 0
+    mask = distance > 0
+    sums = (distance * mask).sum(axis=1)
+    counts = mask.sum(axis=1)
+    return np.where(counts > 0, sums / counts.astype(np.float32), 0.0).astype(np.float32)
+
+def _plot_distance_distribution_normal_vs_anomaly(
+    args, distance_values, gt_patch_masks, epoch=None
+):
+    values = np.asarray(distance_values, dtype=np.float32).reshape(-1)
+    labels = np.asarray(gt_patch_masks, dtype=np.uint8).reshape(-1) > 0
+    if values.size == 0 or labels.size != values.size:
+        return
+
+    normal_values = values[~labels]
+    anomaly_values = values[labels]
+    if normal_values.size == 0 and anomaly_values.size == 0:
+        return
+
+    # Keep plotting lightweight even for large datasets.
+    max_points = 200000
+    if normal_values.size > max_points:
+        normal_values = np.random.choice(normal_values, size=max_points, replace=False)
+    if anomaly_values.size > max_points:
+        anomaly_values = np.random.choice(anomaly_values, size=max_points, replace=False)
+
+    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    os.makedirs(save_dir, exist_ok=True)
+    if epoch is None:
+        filename = "distance_distribution_normal_vs_anomaly.png"
+    else:
+        filename = f"distance_distribution_normal_vs_anomaly_epoch_{int(epoch) + 1:03d}.png"
+    save_path = os.path.join(save_dir, filename)
+
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0.0, 1.0, 101)
+    if normal_values.size > 0:
+        plt.hist(
+            normal_values,
+            bins=bins,
+            density=True,
+            alpha=0.55,
+            color="tab:blue",
+            label=f"normal ({normal_values.size})",
+        )
+    if anomaly_values.size > 0:
+        plt.hist(
+            anomaly_values,
+            bins=bins,
+            density=True,
+            alpha=0.55,
+            color="tab:red",
+            label=f"anomaly ({anomaly_values.size})",
+        )
+
+    plt.xlabel("Normalized distance")
+    plt.ylabel("Density")
+    plt.title("Distance Distribution: Normal vs Anomaly Patches")
+    plt.xlim(0.0, 1.0)
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"[PseudoLabel-Plot] saved: {save_path}")
+
+
+def _plot_image_norm_score_distribution_normal_vs_anomaly(
+    args, image_norm_scores, gt_patch_masks, epoch=None
+):
+    scores = np.asarray(image_norm_scores, dtype=np.float32).reshape(-1)
+    patch_masks = np.asarray(gt_patch_masks, dtype=np.uint8)
+    if scores.size == 0 or patch_masks.ndim != 2 or patch_masks.shape[0] != scores.size:
+        return
+
+    # Image is anomaly if any patch is anomaly.
+    image_is_anomaly = patch_masks.reshape(patch_masks.shape[0], -1).sum(axis=1) > 0
+    normal_scores = scores[~image_is_anomaly]
+    anomaly_scores = scores[image_is_anomaly]
+    if normal_scores.size == 0 and anomaly_scores.size == 0:
+        return
+
+    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    os.makedirs(save_dir, exist_ok=True)
+    if epoch is None:
+        filename = "image_norm_scores_distribution_normal_vs_anomaly.png"
+    else:
+        filename = (
+            f"image_norm_scores_distribution_normal_vs_anomaly_epoch_{int(epoch) + 1:03d}.png"
+        )
+    save_path = os.path.join(save_dir, filename)
+
+    plt.figure(figsize=(10, 6))
+    bins = np.linspace(0.0, 1.0, 51)
+    if normal_scores.size > 0:
+        plt.hist(
+            normal_scores,
+            bins=bins,
+            density=True,
+            alpha=0.55,
+            color="tab:blue",
+            label=f"normal ({normal_scores.size})",
+        )
+    if anomaly_scores.size > 0:
+        plt.hist(
+            anomaly_scores,
+            bins=bins,
+            density=True,
+            alpha=0.55,
+            color="tab:red",
+            label=f"anomaly ({anomaly_scores.size})",
+        )
+
+    plt.xlabel("Image normalized score")
+    plt.ylabel("Density")
+    plt.title("Image Norm Score Distribution: Normal vs Anomaly Images")
+    plt.xlim(0.0, 1.0)
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"[PseudoLabel-Plot] saved: {save_path}")
 
 def precompute_pseudo_labels_feature(
     args,
@@ -31,10 +184,7 @@ def precompute_pseudo_labels_feature(
                 dim = int(features.shape[-1])
 
             score = score.detach().cpu().numpy()
-            score = score.max(axis=-1)
-
-            if score.shape == ():
-                score = np.array([score], dtype=np.float32)
+            score = _as_1d_float32(score.max(axis=-1))
 
             sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64)
             score_stack[sample_idx_np] = score.astype(np.float32)
@@ -42,28 +192,18 @@ def precompute_pseudo_labels_feature(
     if dim is None:
         raise RuntimeError("未能从 mini_loader 中获取特征维度。")
 
-    score_min = score_stack.min()
-    score_max = score_stack.max()
-    if score_max == score_min:
-        normalized_score = np.zeros_like(score_stack)
-    else:
-        normalized_score = (score_stack - score_min) / (score_max - score_min)
+    normalized_score = _minmax_normalize(score_stack)
 
     normal_indices = np.where(normalized_score < 0.5)[0]
     if args.random < 1:
         sample_num = int(normal_indices.shape[0] * args.random)
-        sampled = []
-        for _ in range(sample_num):
-            selected = np.random.randint(normal_indices.shape[0])
-            while normal_indices[selected] in sampled:
-                selected = np.random.randint(normal_indices.shape[0])
-            sampled.append(normal_indices[selected])
-        selected_normal_indices = sampled
+        selected_normal_indices = np.random.choice(
+            normal_indices, size=sample_num, replace=False
+        )
     else:
         selected_normal_indices = normal_indices
 
     selected_normal_indices = np.asarray(selected_normal_indices, dtype=np.int64)
-    selected_index_set = set(selected_normal_indices.tolist())
 
     normal_features = []
     with torch.no_grad():
@@ -73,7 +213,7 @@ def precompute_pseudo_labels_feature(
             features = features.detach().cpu().numpy()
             sample_idx_np = sample_idx.detach().cpu().numpy().astype(np.int64)
 
-            keep_mask = np.array([idx in selected_index_set for idx in sample_idx_np])
+            keep_mask = np.isin(sample_idx_np, selected_normal_indices)
             if np.any(keep_mask):
                 normal_features.append(features[keep_mask].reshape(-1, dim))
 
@@ -107,13 +247,7 @@ def precompute_pseudo_labels_feature(
 
             batch_features = features.reshape(-1, dim)
             distance, _ = index.search(np.ascontiguousarray(batch_features), k=args.k_number)
-
-            distance[distance < 1e-2] = 0
-            if args.k_number == 2:
-                same_feature = distance[:, 0] == 0
-                distance[same_feature, 0] = distance[same_feature, 1]
-
-            distance = distance[:, 0]
+            distance = _postprocess_faiss_distances(distance, args.k_number)
             if distance.size > 0:
                 global_min = min(global_min, float(distance.min()))
                 global_max = max(global_max, float(distance.max()))
@@ -168,7 +302,8 @@ def precompute_pseudo_labels_multiclass(
     with torch.no_grad():
         localnet.eval()
         feature_extractor.eval()
-        for images, mini_class_idx, mini_sample_idx in mini_loader:
+        for batch in mini_loader:
+            images, mini_class_idx, mini_sample_idx = batch[0], batch[1], batch[2]
             images = images.to(device)
             image_features = extract_feature_batch_fn(images, feature_extractor, args)
 
@@ -180,10 +315,9 @@ def precompute_pseudo_labels_multiclass(
                 global_dim = int(features.shape[-1])
 
             score = score.detach().cpu().numpy()
-            score = aggregate_image_scores_fn(score, topk_ratio=args.img_score_topk_ratio)
-
-            if score.shape == ():
-                score = np.array([score], dtype=np.float32)
+            score = _as_1d_float32(
+                aggregate_image_scores_fn(score, topk_ratio=args.img_score_topk_ratio)
+            )
 
             sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
             class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
@@ -207,12 +341,7 @@ def precompute_pseudo_labels_multiclass(
         sampled_cls_idx = np.random.choice(cls_idx, size=sampled_num, replace=False)
 
         sampled_scores = image_scores[sampled_cls_idx]
-        if sampled_scores.max() == sampled_scores.min():
-            normalized_score = np.zeros_like(sampled_scores)
-        else:
-            normalized_score = (sampled_scores - sampled_scores.min()) / (
-                sampled_scores.max() - sampled_scores.min()
-            )
+        normalized_score = _minmax_normalize(sampled_scores)
         image_norm_scores[sampled_cls_idx] = normalized_score.astype(np.float32)
 
         normal_indices = np.where(normalized_score < 0.5)[0]
@@ -256,7 +385,8 @@ def precompute_pseudo_labels_multiclass(
         with torch.no_grad():
             localnet.eval()
             feature_extractor.eval()
-            for images, mini_class_idx, _ in selected_loader:
+            for batch in selected_loader:
+                images, mini_class_idx = batch[0], batch[1]
                 images = images.to(device)
                 image_features = extract_feature_batch_fn(images, feature_extractor, args)
                 features, _ = localnet(image_features)
@@ -293,7 +423,8 @@ def precompute_pseudo_labels_multiclass(
     with torch.no_grad():
         localnet.eval()
         feature_extractor.eval()
-        for images, mini_class_idx, mini_sample_idx in mini_loader:
+        for batch in mini_loader:
+            images, mini_class_idx, mini_sample_idx = batch[0], batch[1], batch[2]
             images = images.to(device)
             image_features = extract_feature_batch_fn(images, feature_extractor, args)
             features, _ = localnet(image_features)
@@ -313,12 +444,7 @@ def precompute_pseudo_labels_multiclass(
                 cls_distance, _ = memory_bank[class_idx].search(
                     np.ascontiguousarray(cls_features), k=args.k_number
                 )
-
-                cls_distance[cls_distance < 1e-2] = 0
-                if args.k_number == 2:
-                    same_feature = cls_distance[:, 0] == 0
-                    cls_distance[same_feature, 0] = cls_distance[same_feature, 1]
-                cls_distance = cls_distance[:, 0]
+                cls_distance = _postprocess_faiss_distances(cls_distance, args.k_number)
 
                 if cls_distance.size > 0:
                     class_min_distance[class_idx] = min(
@@ -394,12 +520,14 @@ def precompute_pseudo_labels_multiclass_residual(
     print_selected_score_distribution_fn,
     print_selected_clean_ratio_fn,
     print_confusion_matrix_fn,
+    epoch=None,
 ):
     memory_bank_start = time.perf_counter()
 
     dataset_size = len(mini_loader.dataset)
     image_scores = np.zeros(dataset_size, dtype=np.float32)
     class_stack = np.zeros(dataset_size, dtype=np.int64)
+    gt_patch_masks = np.zeros((dataset_size, 784), dtype=np.uint8)
     global_dim = None
 
     print("[Phase 1/3] Computing image scores...")
@@ -407,7 +535,11 @@ def precompute_pseudo_labels_multiclass_residual(
         localnet.eval()
         feature_extractor.eval()
         for batch in tqdm.tqdm(mini_loader, desc="Phase 1"):
-            images, mini_class_idx, mini_sample_idx = batch
+            if len(batch) == 4:
+                images, mini_class_idx, mini_sample_idx, mini_patch_mask = batch
+            else:
+                images, mini_class_idx, mini_sample_idx = batch
+                mini_patch_mask = None
             images = images.to(device)
             image_features = extract_feature_batch_fn(images, feature_extractor, args)
             residual_features = compute_residual_feature_batch_fn(
@@ -425,80 +557,66 @@ def precompute_pseudo_labels_multiclass_residual(
                 global_dim = int(features.shape[-1])
 
             score_np = score.detach().cpu().numpy()
-            score_np = aggregate_image_scores_fn(
-                score_np,
-                topk_ratio=args.img_score_topk_ratio,
+            score_np = _as_1d_float32(
+                aggregate_image_scores_fn(
+                    score_np,
+                    topk_ratio=args.img_score_topk_ratio,
+                )
             )
-            if score_np.shape == ():
-                score_np = np.array([score_np], dtype=np.float32)
 
             sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
             class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
             image_scores[sample_idx_np] = score_np.astype(np.float32)
             class_stack[sample_idx_np] = class_np
-
-    if global_dim is None:
-        raise RuntimeError("未能从 mini_loader 获取到特征维度。")
-
-    print_confusion_matrix_fn(
-        dataset_size=dataset_size,
-        image_scores=image_scores,
-        class_stack=class_stack,
-        dataset=mini_loader.dataset,
-        num_classes=num_classes,
-        threshold=0.5,
-    )
-
-    print("[Phase 2/3] Building memory bank from normal samples...")
+            if mini_patch_mask is not None:
+                mask_np = mini_patch_mask.detach().cpu().numpy()
+                gt_patch_masks[sample_idx_np] = (mask_np > 0).astype(np.uint8)
     image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
-    sampled_indices = np.arange(dataset_size, dtype=np.int64)
-    sampled_scores = image_scores[sampled_indices]
-    sampled_classes = class_stack[sampled_indices]
-    normalized_score = np.zeros_like(sampled_scores, dtype=np.float32)
+    normalized_score = np.zeros_like(image_scores, dtype=np.float32)
     #分类归一化
     for cls in range(num_classes):
-        cls_mask = sampled_classes == cls
+        cls_mask = class_stack == cls
         if not np.any(cls_mask):
             continue
-        cls_scores = sampled_scores[cls_mask]
-        cls_min = cls_scores.min()
-        cls_max = cls_scores.max()
-        if cls_max == cls_min:
-            cls_norm = np.zeros_like(cls_scores, dtype=np.float32)
-        else:
-            cls_norm = (cls_scores - cls_min) / (cls_max - cls_min)
+        cls_scores = image_scores[cls_mask]
+        cls_norm = _minmax_normalize(cls_scores)
         normalized_score[cls_mask] = cls_norm.astype(np.float32)
 
-    image_norm_scores[sampled_indices] = normalized_score.astype(np.float32)
-
+    image_norm_scores[:] = normalized_score.astype(np.float32)
+    _plot_image_norm_score_distribution_normal_vs_anomaly(
+        args=args,
+        image_norm_scores=image_norm_scores,
+        gt_patch_masks=gt_patch_masks,
+        epoch=epoch,
+    )
+    
     selected_local_list = []
+    print("[Phase 2/3] Building memory bank from normal samples...")
     #下采样选取
     for cls in range(num_classes):
-        cls_mask = sampled_classes == cls
+        cls_mask = class_stack == cls
         if not np.any(cls_mask):
             continue
-        cls_indices_local = np.where(cls_mask)[0]
-        cls_norm_scores = normalized_score[cls_indices_local]
+        cls_indices = np.where(cls_mask)[0].astype(np.int64)
+        cls_norm_scores = normalized_score[cls_indices]
 
         cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
         if cls_normal_local.shape[0] == 0:
-            cls_selected_local = cls_indices_local
+            cls_selected = cls_indices
         elif args.random < 1:
             cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
             pick_local = np.random.choice(
                 cls_normal_local, size=cls_sample_num, replace=False
             )
-            cls_selected_local = cls_indices_local[pick_local]
+            cls_selected = cls_indices[pick_local]
         else:
-            cls_selected_local = cls_indices_local[cls_normal_local]
-        selected_local_list.append(cls_selected_local)
+            cls_selected = cls_indices[cls_normal_local]
+        selected_local_list.append(cls_selected)
 
     if len(selected_local_list) == 0:
-        selected_local = np.arange(sampled_indices.shape[0])
+        selected_indices = np.arange(dataset_size, dtype=np.int64)
     else:
-        selected_local = np.concatenate(selected_local_list, axis=0)
-
-    selected_indices = sampled_indices[selected_local].astype(np.int64)
+        selected_indices = np.concatenate(selected_local_list, axis=0).astype(np.int64)
     print_selected_score_distribution_fn(
         selected_indices=selected_indices,
         class_stack=class_stack,
@@ -536,7 +654,10 @@ def precompute_pseudo_labels_multiclass_residual(
             drop_last=False,
         )
         for batch in tqdm.tqdm(selected_loader, desc="Phase 2"):
-            images, mini_class_idx, _mini_sample_idx = batch
+            if len(batch) == 4:
+                images, mini_class_idx, _mini_sample_idx, _mini_patch_mask = batch
+            else:
+                images, mini_class_idx, _mini_sample_idx = batch
             images = images.to(device)
             image_features = extract_feature_batch_fn(images, feature_extractor, args)
             residual_features = compute_residual_feature_batch_fn(
@@ -558,7 +679,8 @@ def precompute_pseudo_labels_multiclass_residual(
                 class_feature_buffers[cls].append(cls_features)
 
     # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
-    reduced_feature_list = []
+    reduced_features_by_class = {}
+    coreset_indices_by_class = {}
     for cls in range(num_classes):
         if len(class_feature_buffers[cls]) == 0:
             continue
@@ -579,16 +701,36 @@ def precompute_pseudo_labels_multiclass_residual(
                 percentage=percentage,
                 device=device,
             )
-            normal_features_cls = sampler.run(normal_features_cls)
+            normal_features_cls, core_idx = sampler.run(
+                normal_features_cls, return_indices=True
+            )
+        else:
+            core_idx = np.arange(normal_features_cls.shape[0], dtype=np.int64)
 
-        reduced_feature_list.append(normal_features_cls)
+        reduced_features_by_class[cls] = normal_features_cls
+        coreset_indices_by_class[cls] = core_idx
 
-    if len(reduced_feature_list) == 0:
+    if len(reduced_features_by_class) > 0:
+        print_greedy_memory_bank_anomaly_stats(
+            num_classes=num_classes,
+            selected_images_by_class=selected_images_by_class,
+            gt_patch_masks=gt_patch_masks,
+            reduced_features_by_class=reduced_features_by_class,
+            coreset_indices_by_class=coreset_indices_by_class,
+            class_names=getattr(args, "class_names", None),
+            epoch=epoch,
+        )
+
+    if len(reduced_features_by_class) == 0:
         pseudo_label_time = time.perf_counter() - memory_bank_start
         return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
-
-    global_normal_features = np.concatenate(reduced_feature_list, axis=0)
-    memory_bank = build_faiss_index_fn(global_normal_features)
+    
+    # 按类别构建多个索引：memory_bank_by_class[cls]
+    memory_bank_by_class = {}
+    for cls, feats in reduced_features_by_class.items():
+        if feats is None or feats.shape[0] == 0:
+            continue
+        memory_bank_by_class[int(cls)] = build_faiss_index_fn(feats)
 
     if args.beta:
         top_feat_global = None
@@ -604,7 +746,10 @@ def precompute_pseudo_labels_multiclass_residual(
         localnet.eval()
         feature_extractor.eval()
         for batch in tqdm.tqdm(mini_loader, desc="Phase 3"):
-            images, mini_class_idx, mini_sample_idx = batch
+            if len(batch) == 4:
+                images, mini_class_idx, mini_sample_idx, _mini_patch_mask = batch
+            else:
+                images, mini_class_idx, mini_sample_idx = batch
             images = images.to(device)
             sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
 
@@ -617,19 +762,30 @@ def precompute_pseudo_labels_multiclass_residual(
             )
             features, _ = localnet(residual_features)
             features_np = features.detach().cpu().numpy()
-            features_2d = features_np.reshape(-1, global_dim)
-
-            cls_distance, _ = memory_bank.search(
-                np.ascontiguousarray(features_2d), k=args.k_number
-            )
-            cls_distance[cls_distance < 1e-2] = 0
-            if args.k_number == 2:
-                same_feature = cls_distance[:, 0] == 0
-                cls_distance[same_feature, 0] = cls_distance[same_feature, 1]
-            cls_distance = cls_distance[:, 0]
-
-            cls_distance_map = cls_distance.reshape(-1, 784)
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
+            batch_size = int(batch_class_np.shape[0])
+
+            # 将距离按 batch 原顺序拼回：shape = (B, 784)
+            cls_distance_map = np.zeros((batch_size, 784), dtype=np.float32)
+
+            for cls in np.unique(batch_class_np).tolist():
+                cls = int(cls)
+                if cls not in memory_bank_by_class:
+                    continue
+                cls_mask = batch_class_np == cls
+                if not np.any(cls_mask):
+                    continue
+
+                cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
+                cls_distance, _ = memory_bank_by_class[cls].search(
+                    np.ascontiguousarray(cls_features_2d), k=args.k_number
+                )
+                cls_distance = _postprocess_faiss_distances(cls_distance, args.k_number)
+
+                cls_distance_map[cls_mask] = cls_distance.reshape(-1, 784).astype(
+                    np.float32
+                )
+
             row_min = cls_distance_map.min(axis=1)
             row_max = cls_distance_map.max(axis=1)
             for cls in np.unique(batch_class_np):
@@ -647,8 +803,9 @@ def precompute_pseudo_labels_multiclass_residual(
                 high_sample_mask = image_norm_scores[sample_idx_np] > 0.5
                 if np.any(high_sample_mask):
                     high_patch_mask = np.repeat(high_sample_mask, 784)
+                    features_2d = features_np.reshape(-1, global_dim)
                     cand_feat = features_2d[high_patch_mask]
-                    cand_dist = cls_distance[high_patch_mask]
+                    cand_dist = cls_distance_map.reshape(-1)[high_patch_mask]
                     top_feat_global, top_dist_global = update_topk_features_fn(
                         top_feat_global,
                         top_dist_global,
@@ -691,6 +848,42 @@ def precompute_pseudo_labels_multiclass_residual(
             confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
         else:
             confident_feature_bank = torch.as_tensor(top_feat_global, dtype=torch.float32)
+
+    # 统计伪标签分配准确率（基于真实 patch mask）
+    values = distance_map.astype(np.float32)
+    gt_mask_bool = gt_patch_masks.astype(bool)
+
+    pred_normal = values < float(args.threshold)
+    pred_anomaly = values > float(args.noise_threshold)
+
+    pred_normal_count = int(pred_normal.sum())
+    pred_anomaly_count = int(pred_anomaly.sum())
+    pred_normal_correct = int(np.logical_and(pred_normal, ~gt_mask_bool).sum())
+    pred_anomaly_correct = int(np.logical_and(pred_anomaly, gt_mask_bool).sum())
+
+    normal_precision = (
+        float(pred_normal_correct) / float(pred_normal_count)
+        if pred_normal_count > 0
+        else 0.0
+    )
+    anomaly_precision = (
+        float(pred_anomaly_correct) / float(pred_anomaly_count)
+        if pred_anomaly_count > 0
+        else 0.0
+    )
+    print(
+        "[PseudoLabel-Stats] "
+        f"distance<threshold normal-precision: {normal_precision:.4f} "
+        f"({pred_normal_correct}/{pred_normal_count}) | "
+        f"distance>noise_threshold anomaly-precision: {anomaly_precision:.4f} "
+        f"({pred_anomaly_correct}/{pred_anomaly_count})"
+    )
+    _plot_distance_distribution_normal_vs_anomaly(
+        args=args,
+        distance_values=values,
+        gt_patch_masks=gt_patch_masks,
+        epoch=epoch,
+    )
 
     pseudo_label_time = time.perf_counter() - pseudo_start
     return distance_map, confident_feature_bank, global_dim, memory_bank_time, pseudo_label_time

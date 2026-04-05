@@ -10,6 +10,7 @@ import faiss
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
@@ -19,18 +20,18 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
 import AnomalyCLIP_lib
-import dataset_extract
-from epoch_precompute import precompute_pseudo_labels_multiclass
-import evaluate as eval_utils
-from loss import (
+from dataset import dataset_extract, multiclass_feature_dataset
+from src.train.epoch_precompute import precompute_pseudo_labels_multiclass
+from utils import evaluate as eval_utils
+from utils.loss import (
     build_adaptive_threshold_map,
     compute_balanced_bce_loss,
     compute_oto_loss_multiclass,
 )
-import model
-from multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
-from print import print_epoch_losses, print_epoch_times
-import utils as common_utils
+from src.model import model
+from dataset.multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
+from utils.print import print_epoch_losses, print_epoch_times
+import utils.train_utils as common_utils
 
 warnings.filterwarnings("ignore")
 
@@ -95,6 +96,8 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_log", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--crop_size", type=int, default=224)
     parser.add_argument("--max_bank_images", type=int, default=128)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
@@ -193,11 +196,28 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
 
 
 def infer_feature_dim(feature_extractor, train_loader, args):
-    for images, _, _ in train_loader:
+    for batch in train_loader:
+        images = batch[0]
         images = images.to(device)
         features = extract_feature_batch(images, feature_extractor, args)
         return int(features.shape[-1])
     raise RuntimeError("训练集为空，无法推断特征维度。")
+
+
+def infer_patch_mask_size(train_dataset, feature_extractor, args):
+    if len(train_dataset.samples) == 0:
+        raise RuntimeError("训练集为空，无法推断 patch_mask_size。")
+    image_path, _ = train_dataset.samples[0]
+    image = Image.open(image_path).convert("RGB")
+    image = train_dataset.transform_x(image).unsqueeze(0).to(device)
+    features = extract_feature_batch(image, feature_extractor, args)
+    num_patches = int(features.shape[1])
+    patch_mask_size = int(np.sqrt(num_patches))
+    if patch_mask_size * patch_mask_size != num_patches:
+        raise RuntimeError(
+            f"无法从 patch 数 {num_patches} 推断方形 patch 网格，请检查模型与输入尺寸。"
+        )
+    return patch_mask_size
 
 
 def compute_distance(feature):
@@ -215,6 +235,8 @@ def build_test_loader(args, class_name):
         dataset=args.dataset,
         class_name=class_name,
         is_train=False,
+        resize=args.image_size,
+        cropsize=args.crop_size,
     )
     return DataLoader(
         test_set,
@@ -344,9 +366,8 @@ def train_one_epoch(
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
 
-    for images, class_idx, sample_idx in tqdm.tqdm(
-        local_loader, f"| run | train | {epoch + 1} |"
-    ):
+    for batch_data in tqdm.tqdm(local_loader, f"| run | train | {epoch + 1} |"):
+        images, class_idx, sample_idx = batch_data[0], batch_data[1], batch_data[2]
         class_idx = class_idx.to(device)
         class_idx_np = class_idx.detach().cpu().numpy().astype(np.int64)
         sample_idx = sample_idx.detach().cpu().numpy()
@@ -508,6 +529,8 @@ def main():
     train_dataset = MultiClassFeatureDataset(
         data_path=args.data_path,
         dataset_name=args.dataset,
+        image_size=args.image_size,
+        crop_size=args.crop_size,
         seed=args.seed,
         shuffle=True,
     )
@@ -530,6 +553,9 @@ def main():
     )
 
     feature_extractor = build_feature_extractor(args)
+    inferred_patch_mask_size = infer_patch_mask_size(train_dataset, feature_extractor, args)
+    train_dataset.patch_mask_size = inferred_patch_mask_size
+    print(f"inferred patch_mask_size from feature extractor: {inferred_patch_mask_size}")
     feature_dim = infer_feature_dim(feature_extractor, mini_loader, args)
 
     localnet = model.localnet(len_feature=feature_dim).to(device)

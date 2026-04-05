@@ -1,6 +1,14 @@
 import argparse
 import os
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Repo root (parent of plot/) so `dataset` / `src` resolve when cwd is plot/.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_root_str = str(_REPO_ROOT)
+if _root_str not in sys.path:
+    sys.path.insert(0, _root_str)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,9 +18,9 @@ from matplotlib.colors import to_rgb
 from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader, Subset
 
-import dataset_extract
-import model
-from multiclass_feature_dataset import get_all_class_names
+from dataset import dataset_extract
+from src.model import model
+from dataset.multiclass_feature_dataset import get_all_class_names
 
 VALID_STAGES = {"before", "after"}
 
@@ -43,26 +51,26 @@ def parse_args() -> argparse.Namespace:
         "--classes",
         nargs="+",
         default=[
-            "bottle",
-            "cable",
+            #"bottle",
+            # "cable",
             "capsule",
-            "carpet",
-            "grid",
-            "hazelnut",
-            "leather",
-            "metal_nut",
-            "pill",
-            "screw",
-            "tile",
-            "toothbrush",
-            "transistor",
-            "wood",
-            "zipper",
+            # "carpet",
+            # "grid",
+            # "hazelnut",
+            # "leather",
+            # "metal_nut",
+            # "pill",
+            # "screw",
+            # "tile",
+            # "toothbrush",
+            # "transistor",
+            # "wood",
+            # "zipper",
         ],
         help="Class names to visualize",
     )
     parser.add_argument(
-        "--max_per_group", type=int, default=50, help="Max patch samples per group"
+        "--max_per_group", type=int, default=500, help="Max patch samples per group"
     )
     parser.add_argument(
         "--perplexity", type=float, default=30.0, help="t-SNE perplexity"
@@ -150,20 +158,135 @@ def parse_args() -> argparse.Namespace:
             "this chooses the stage for npz primary stats and the per-class distance table."
         ),
     )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="dinov3",
+        choices=["dinov3", "dinov2"],
+        help="Vision backbone: DINOv3 (torch.hub) or legacy dino_vitb8 (DINOv2).",
+    )
+    parser.add_argument(
+        "--dinov3_hub_dir",
+        type=str,
+        default=None,
+        help=(
+            "Local facebookresearch/dinov3 hub directory (contains hubconf.py). "
+            "If omitted and ~/.cache/torch/hub/facebookresearch_dinov3_main exists, "
+            "uses it automatically (source=local)."
+        ),
+    )
+    parser.add_argument(
+        "--dinov3_model",
+        type=str,
+        default="dinov3_vitb16",
+        help="torch.hub entry for DINOv3, e.g. dinov3_vitb16, dinov3_vits16.",
+    )
+    parser.add_argument(
+        "--dinov3_weights",
+        type=str,
+        default=None,
+        help="Optional local path or file:// URL for pretrained weights (DINOv3 hub API).",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=512,
+        help="Resize shorter side to this size before center crop (passed to MyDataset as resize).",
+    )
+    parser.add_argument(
+        "--crop_size",
+        type=int,
+        default=448,
+        help="Center crop square edge length (passed to MyDataset as cropsize).",
+    )
     return parser.parse_args()
 
 
+def _resolve_dinov3_hub_dir(explicit: Optional[str]) -> Optional[str]:
+    if explicit and os.path.isdir(explicit):
+        return explicit
+    default_dir = os.path.expanduser(
+        "~/.cache/torch/hub/facebookresearch_dinov3_main"
+    )
+    hubconf = os.path.join(default_dir, "hubconf.py")
+    if os.path.isfile(hubconf):
+        return default_dir
+    return None
+
+
+def _load_backbone(
+    device: torch.device,
+    backbone: str,
+    dinov3_hub_dir: Optional[str] = None,
+    dinov3_model: str = "dinov3_vitb16",
+    dinov3_weights: Optional[str] = None,
+) -> torch.nn.Module:
+    if backbone == "dinov2":
+        model = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
+        model = model.to(device)
+        model.eval()
+        return model
+
+    # DINOv3 hub may `import utils`, conflicting with this repo's utils package.
+    local_utils_module = sys.modules.get("utils")
+    should_restore_utils = (
+        local_utils_module is not None
+        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
+            os.path.join("FUNAD", "utils.py")
+        )
+    )
+    if should_restore_utils:
+        del sys.modules["utils"]
+
+    load_kw = {"pretrained": True}
+    if dinov3_weights:
+        load_kw["weights"] = dinov3_weights
+
+    try:
+        hub_dir = _resolve_dinov3_hub_dir(dinov3_hub_dir)
+        if hub_dir:
+            print(f"[DINOv3] loading from local hub: {hub_dir}")
+            model = torch.hub.load(
+                hub_dir,
+                dinov3_model,
+                source="local",
+                **load_kw,
+            )
+        else:
+            print("[DINOv3] loading from GitHub: facebookresearch/dinov3")
+            model = torch.hub.load(
+                "facebookresearch/dinov3",
+                dinov3_model,
+                **load_kw,
+            )
+    finally:
+        if should_restore_utils:
+            sys.modules["utils"] = local_utils_module
+
+    model = model.to(device)
+    model.eval()
+    return model
+
+
 def _extract_dino_features(
-    images: torch.Tensor, dino: torch.nn.Module, use_cls_token: bool
+    images: torch.Tensor,
+    dino: torch.nn.Module,
+    use_cls_token: bool,
+    backbone: str = "dinov2",
 ) -> torch.Tensor:
     with torch.no_grad():
         dino.eval()
-        feature = dino.get_intermediate_layers(images)[0]
-        patch_tokens = feature[:, 1:, :]
+        if backbone == "dinov3":
+            patch_tokens, cls_tok = dino.get_intermediate_layers(
+                images, return_class_token=True
+            )[0]
+        else:
+            feature = dino.get_intermediate_layers(images)[0]
+            cls_tok = feature[:, 0, :]
+            patch_tokens = feature[:, 1:, :]
         if use_cls_token:
-            cls_tokens = feature[:, 0, :]
             cls_tokens = torch.repeat_interleave(
-                cls_tokens.unsqueeze(1), patch_tokens.shape[1], dim=1
+                cls_tok.unsqueeze(1), patch_tokens.shape[1], dim=1
             )
             patch_tokens = torch.cat([cls_tokens, patch_tokens], dim=-1)
     return patch_tokens
@@ -186,12 +309,17 @@ def build_reference_memory(
     dino: torch.nn.Module,
     use_cls_token: bool,
     device: torch.device,
+    backbone: str = "dinov2",
+    resize: int = 256,
+    cropsize: int = 224,
 ) -> np.ndarray:
     train_set = dataset_extract.MyDataset(
         dataset_path=data_path,
         dataset="mvtec",
         class_name=class_name,
         is_train=True,
+        resize=resize,
+        cropsize=cropsize,
     )
 
     rng = np.random.default_rng(42)
@@ -207,7 +335,9 @@ def build_reference_memory(
     )
     for image in tqdm.tqdm(train_loader, desc=f"构建{class_name}参考记忆"):
         image = image.to(device)
-        features = _extract_dino_features(image, dino, use_cls_token=use_cls_token)
+        features = _extract_dino_features(
+            image, dino, use_cls_token=use_cls_token, backbone=backbone
+        )
         if features.shape[0] > 1:
             # Build a compact reference memory by averaging features within each batch.
             features = features.mean(dim=0, keepdim=True)
@@ -243,7 +373,9 @@ def load_adapter_from_checkpoint(
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
     if isinstance(checkpoint, dict) and checkpoint_key in checkpoint:
         state_dict = checkpoint[checkpoint_key]
     elif isinstance(checkpoint, dict):
@@ -268,7 +400,9 @@ def load_reference_memory_by_class_from_checkpoint(
 ) -> Dict[int, np.ndarray]:
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(
+        checkpoint_path, map_location=device, weights_only=False
+    )
     raw = checkpoint.get("reference_memory_by_class")
     if raw is None:
         return {}
@@ -324,14 +458,25 @@ def build_groups(
     device: torch.device = torch.device("cpu"),
     checkpoint_reference_memory_by_class: Dict[int, np.ndarray] = None,
     class_to_idx: Dict[str, int] = None,
+    backbone: str = "dinov3",
+    dinov3_hub_dir: Optional[str] = None,
+    dinov3_model: str = "dinov3_vitb16",
+    dinov3_weights: Optional[str] = None,
+    resize: int = 256,
+    cropsize: int = 224,
 ) -> Dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     groups: Dict[str, np.ndarray] = {}
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    dino = torch.hub.load("facebookresearch/dino:main", "dino_vitb8").to(device)
-    dino.eval()
+    dino = _load_backbone(
+        device,
+        backbone=backbone,
+        dinov3_hub_dir=dinov3_hub_dir,
+        dinov3_model=dinov3_model,
+        dinov3_weights=dinov3_weights,
+    )
 
     for class_name in tqdm.tqdm(class_names, desc="处理类别"):
         class_idx = class_to_idx.get(class_name) if class_to_idx is not None else None
@@ -350,6 +495,9 @@ def build_groups(
                 dino=dino,
                 use_cls_token=use_cls_token,
                 device=device,
+                backbone=backbone,
+                resize=resize,
+                cropsize=cropsize,
             )
 
         test_set = dataset_extract.MyDataset(
@@ -357,6 +505,8 @@ def build_groups(
             dataset="mvtec",
             class_name=class_name,
             is_train=False,
+            resize=resize,
+            cropsize=cropsize,
         )
         test_loader = DataLoader(
             test_set,
@@ -373,7 +523,7 @@ def build_groups(
         for images, _, masks in tqdm.tqdm(test_loader, desc=f"提取{class_name}特征"):
             images = images.to(device)
             enc_features = _extract_dino_features(
-                images, dino, use_cls_token=use_cls_token
+                images, dino, use_cls_token=use_cls_token, backbone=backbone
             )
 
             feat_np = (
@@ -443,7 +593,7 @@ def run_tsne(features: np.ndarray, perplexity: float, seed: int) -> np.ndarray:
     tsne = TSNE(
         n_components=2,
         perplexity=valid_perplexity,
-        init="pca",
+        init="random",
         learning_rate="auto",
         random_state=seed,
     )
@@ -868,7 +1018,7 @@ def main() -> None:
     checkpoint_reference_memory_by_class = None
     class_to_idx = None
     if args.checkpoint is not None:
-        # Infer feature dimension from current setting.
+        # Infer feature dimension from current setting (ViT-B patch 768; concat CLS -> 1536).
         dummy_dim = 1536 if args.use_cls_token else 768
         adapter = load_adapter_from_checkpoint(
             checkpoint_path=args.checkpoint,
@@ -904,6 +1054,12 @@ def main() -> None:
         device=device,
         checkpoint_reference_memory_by_class=checkpoint_reference_memory_by_class,
         class_to_idx=class_to_idx,
+        backbone=args.backbone,
+        dinov3_hub_dir=args.dinov3_hub_dir,
+        dinov3_model=args.dinov3_model,
+        dinov3_weights=args.dinov3_weights,
+        resize=args.image_size,
+        cropsize=args.crop_size,
     )
 
     group_names = np.array(list(groups.keys()))

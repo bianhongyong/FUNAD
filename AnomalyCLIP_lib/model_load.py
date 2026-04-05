@@ -3,7 +3,7 @@ import os
 import urllib
 import warnings
 from typing import Union, List
-from pkg_resources import packaging
+from packaging import version
 
 import torch
 from PIL import Image
@@ -16,7 +16,7 @@ from .build_model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from torchvision.transforms import InterpolationMode
 
-if packaging.version.parse(torch.__version__) < packaging.version.parse("1.7.1"):
+if version.parse(torch.__version__) < version.parse("1.7.1"):
     warnings.warn("PyTorch version 1.7.1 or higher is recommended")
 
 

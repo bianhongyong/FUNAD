@@ -10,7 +10,16 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from utils import aggregate_image_scores
+from utils.train_utils import aggregate_image_scores
+
+
+def _cv2_resize_dsize_from_mask(mask_i):
+    """(W, H) for cv2.resize so seg matches GT mask spatial size."""
+    mi = np.asarray(mask_i)
+    if mi.ndim < 2:
+        raise ValueError(f"mask must be at least 2D, got shape {mi.shape}")
+    h, w = int(mi.shape[-2]), int(mi.shape[-1])
+    return (w, h)
 
 
 def f1_score_max(y_true, y_score):
@@ -134,7 +143,7 @@ def evaluate_multiclass_epoch(
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
             score = score.reshape(-1, 28, 28)
             for i in range(score.shape[0]):
-                _map = cv2.resize(score[i], (224, 224))
+                _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)
                 seg_map.append(_map)
                 label_gt.append(y[i])
@@ -184,7 +193,7 @@ def evaluate_residual_multiclass_epoch(
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
             score = score.reshape(-1, 28, 28)
             for i in range(score.shape[0]):
-                _map = cv2.resize(score[i], (224, 224))
+                _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)
                 seg_map.append(_map)
                 label_gt.append(y[i])
@@ -209,7 +218,7 @@ def evaluate_feature_epoch(localnet, test_loader, device):
             img_map.append(score.max(axis=1))
             score = score.reshape(-1, 28, 28)
             for i in range(score.shape[0]):
-                _map = cv2.resize(score[i], (224, 224))
+                _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)
                 seg_map.append(_map)
                 label_gt.append(y[i])

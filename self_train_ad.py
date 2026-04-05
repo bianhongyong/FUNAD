@@ -6,8 +6,8 @@ import torch.backends.cudnn as cudnn
 import os
 import wandb
 import sys
-import model
-import dataset
+from src.model import model
+from dataset import dataset
 from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
 import torch.nn as nn
@@ -16,13 +16,13 @@ from scipy.ndimage import gaussian_filter
 from sklearn.metrics import roc_auc_score, auc, precision_recall_curve
 import pandas as pd
 import datetime
-import inference
+from src.inference import inference
 import tqdm
 import matplotlib
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 import pdb
-import dataload
+from dataset import dataload
 import math
 
 # from info_nce import InfoNCE, info_nce
@@ -34,11 +34,11 @@ import timm
 import torch.nn.functional as F
 import time
 import warnings
-from epoch_precompute import precompute_pseudo_labels_feature
-import evaluate as eval_utils
-from loss import compute_balanced_bce_loss, compute_oto_loss_single
-from print import print_epoch_losses, print_epoch_times
-import utils as common_utils
+from src.train.epoch_precompute import precompute_pseudo_labels_feature
+from utils import evaluate as eval_utils
+from utils.loss import compute_balanced_bce_loss, compute_oto_loss_single
+from utils.print import print_epoch_losses, print_epoch_times
+import utils.train_utils as common_utils
 
 warnings.filterwarnings("ignore")
 

@@ -131,8 +131,8 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_log", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--crop_size", type=int, default=224)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--crop_size", type=int, default=448)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
     parser.add_argument("--num_reference_images_per_class", type=int, default=4)
@@ -208,7 +208,14 @@ def build_feature_extractor(args):
     if should_restore_utils:
         del sys.modules["utils"]
     try:
-        feature_extractor = torch.hub.load("facebookresearch/dinov3", "dinov3_vitb16")
+        repo_dir = "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"
+        feature_extractor = torch.hub.load(
+            repo_dir,
+            "dinov3_vitb16",
+            source="local",
+            pretrained=True,
+
+)
     finally:
         if should_restore_utils:
             sys.modules["utils"] = local_utils_module
@@ -230,9 +237,12 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             x_norm = image_features
             x_prenorm = patch_projections[-1]
         else:
-            feature = feature_extractor.get_intermediate_layers(input_tensor)[0]
-            x_norm = feature[:, 0, :]
-            x_prenorm = feature[:, 1:, :]
+            # DINOv3: 默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
+            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
+                input_tensor, return_class_token=True
+            )[0]
+            x_norm = cls_tok
+            x_prenorm = patch_tokens
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)

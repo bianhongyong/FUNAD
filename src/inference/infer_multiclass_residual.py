@@ -18,10 +18,11 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader
 
 import AnomalyCLIP_lib
-import dataset_extract
-import model
-import utils as common_utils
-from multiclass_feature_dataset import get_all_class_names
+from dataset import dataset_extract
+from src.model import model
+import utils.train_utils as common_utils
+from utils.evaluate import _cv2_resize_dsize_from_mask
+from dataset.multiclass_feature_dataset import get_all_class_names
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -85,8 +86,26 @@ def parse_args():
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
 
-    parser.add_argument("--use_cls_token", type=str2bool, default=True)
+    parser.add_argument("--use_cls_token", type=str2bool, default=False)
     parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
+    parser.add_argument(
+        "--dinov3_hub",
+        type=str,
+        default=None,
+        help="本地 dinov3 torch hub 目录（默认: <torch.hub 目录>/facebookresearch_dinov3_main）。",
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=512,
+        help="与 DINOv3 训练一致：Resize 边长。",
+    )
+    parser.add_argument(
+        "--crop_size",
+        type=int,
+        default=448,
+        help="与 DINOv3 训练一致：CenterCrop 边长。",
+    )
     parser.add_argument("--clip_model_name", type=str, default="ViT-L/14@336px")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24])
     parser.add_argument("--dpam_layer", type=int, default=24)
@@ -132,23 +151,29 @@ def build_feature_extractor(args, device):
         feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
         return feature_extractor
 
-    # torch.hub 加载 DINO 时会在 hub 代码中执行 `import utils`。
-    # 当前工程也有同名 `utils.py`，会导致命名冲突并报 trunc_normal_ ImportError。
-    # 这里临时移除本地 `utils` 模块与工作目录路径，确保优先导入 DINO 仓库内的 utils。
-    project_utils_module = sys.modules.pop("utils", None)
-    removed_sys_paths = []
-    for i in range(len(sys.path) - 1, -1, -1):
-        p = sys.path[i]
-        if p in ("", os.getcwd(), os.path.dirname(__file__)):
-            removed_sys_paths.append((i, p))
-            sys.path.pop(i)
+    # DINOv3 hub 会 `import utils`，与工程内 `utils` 包冲突；与 self_train_ad_multiclass_residual_dinov3 一致地临时解除。
+    local_utils_module = sys.modules.get("utils")
+    should_restore_utils = (
+        local_utils_module is not None
+        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
+            os.path.join("FUNAD", "utils.py")
+        )
+    )
+    if should_restore_utils:
+        del sys.modules["utils"]
     try:
-        feature_extractor = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
+        repo_dir = args.dinov3_hub or os.path.join(
+            torch.hub.get_dir(), "facebookresearch_dinov3_main"
+        )
+        feature_extractor = torch.hub.load(
+            repo_dir,
+            "dinov3_vitb16",
+            source="local",
+            pretrained=True,
+        )
     finally:
-        for i, p in sorted(removed_sys_paths, key=lambda x: x[0]):
-            sys.path.insert(i, p)
-        if project_utils_module is not None:
-            sys.modules["utils"] = project_utils_module
+        if should_restore_utils:
+            sys.modules["utils"] = local_utils_module
 
     feature_extractor = feature_extractor.to(device)
     feature_extractor.eval()
@@ -168,9 +193,12 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             x_norm = image_features
             x_prenorm = patch_projections[-1]
         else:
-            feature = feature_extractor.get_intermediate_layers(input_tensor)[0]
-            x_norm = feature[:, 0, :]
-            x_prenorm = feature[:, 1:, :]
+            # DINOv3：默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
+            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
+                input_tensor, return_class_token=True
+            )[0]
+            x_norm = cls_tok
+            x_prenorm = patch_tokens
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
@@ -183,6 +211,7 @@ def compute_residual_feature_batch(
     class_idx_batch,
     reference_memory_by_class: Dict[int, np.ndarray],
     reference_index_by_class,
+    num_patches: int,
 ):
     feat_np = features.detach().cpu().numpy().astype(np.float32, copy=False)
     class_np = class_idx_batch.detach().cpu().numpy().astype(np.int64)
@@ -199,7 +228,7 @@ def compute_residual_feature_batch(
             np.ascontiguousarray(cls_feat), k=1
         )
         nearest_feat = reference_memory_by_class[cls][nearest_id.reshape(-1)]
-        cls_residual = (cls_feat - nearest_feat).reshape(-1, 784, dim)
+        cls_residual = (cls_feat - nearest_feat).reshape(-1, num_patches, dim)
         feat_np[cls_mask] = cls_residual
 
     return torch.as_tensor(feat_np, dtype=features.dtype, device=features.device)
@@ -256,21 +285,25 @@ def make_triplet_panel(
     return np.concatenate([orig_bgr, mask_bgr, heatmap_bgr], axis=1)
 
 
-def find_feature_dim(args, feature_extractor, device, class_names: List[str]) -> int:
+def find_feature_dim_and_patches(
+    args, feature_extractor, device, class_names: List[str]
+) -> Tuple[int, int]:
     for class_name in class_names:
         test_set = dataset_extract.MyDataset(
             dataset_path=args.data_path,
             dataset=args.dataset,
             class_name=class_name,
             is_train=False,
+            resize=args.image_size,
+            cropsize=args.crop_size,
         )
         if len(test_set) == 0:
             continue
         x, _, _ = test_set[0]
         x = x.unsqueeze(0).to(device)
         feat = extract_feature_batch(x, feature_extractor, args)
-        return int(feat.shape[-1])
-    raise RuntimeError("测试集为空，无法推断特征维度。")
+        return int(feat.shape[-1]), int(feat.shape[1])
+    raise RuntimeError("测试集为空，无法推断特征维度与 patch 数。")
 
 
 def build_reference_index(
@@ -427,14 +460,26 @@ def main():
     class_to_idx = {name: idx for idx, name in enumerate(all_class_names)}
 
     print("Loading checkpoint:", args.checkpoint_path)
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(
+            args.checkpoint_path, map_location=device, weights_only=False
+        )
+    except TypeError:
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if "net" not in checkpoint:
         raise KeyError("checkpoint 缺少 'net' 键。")
     if "reference_memory_by_class" not in checkpoint:
         raise KeyError("checkpoint 缺少 'reference_memory_by_class' 键。")
 
     feature_extractor = build_feature_extractor(args, device)
-    feature_dim = find_feature_dim(args, feature_extractor, device, target_class_names)
+    feature_dim, num_patches = find_feature_dim_and_patches(
+        args, feature_extractor, device, target_class_names
+    )
+    patch_side = int(np.sqrt(num_patches))
+    if patch_side * patch_side != num_patches:
+        raise RuntimeError(
+            f"patch 数 {num_patches} 不是完全平方数，无法形成热力图网格。"
+        )
 
     localnet = model.localnet(len_feature=feature_dim).to(device)
     localnet.load_state_dict(checkpoint["net"], strict=True)
@@ -460,6 +505,8 @@ def main():
             dataset=args.dataset,
             class_name=class_name,
             is_train=False,
+            resize=args.image_size,
+            cropsize=args.crop_size,
         )
         test_loader = DataLoader(
             test_set,
@@ -492,16 +539,21 @@ def main():
                     class_idx_batch,
                     reference_memory_by_class,
                     reference_index_by_class,
+                    num_patches=num_patches,
                 )
                 _, score = localnet(residual_features)
-                score_np = score.detach().cpu().numpy().reshape(-1, 28, 28)
+                score_np = score.detach().cpu().numpy().reshape(-1, patch_side, patch_side)
                 score_flat = score.detach().cpu().numpy().reshape(score_np.shape[0], -1)
                 image_np = images.detach().cpu().numpy()
                 y_np = y.detach().cpu().numpy().astype(np.int64)
                 mask_np = mask.detach().cpu().numpy().astype(np.uint8)
 
                 for i in range(score_np.shape[0]):
-                    one_score = cv2.resize(score_np[i], (224, 224), interpolation=cv2.INTER_LINEAR)
+                    one_score = cv2.resize(
+                        score_np[i],
+                        _cv2_resize_dsize_from_mask(mask_np[i]),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
                     one_score = gaussian_filter(one_score, sigma=args.gaussian_sigma)
                     class_seg_maps.append(one_score)
                     class_mask_gt.append(mask_np[i])

@@ -1,5 +1,5 @@
 import abc
-from typing import Union
+from typing import Tuple, Union
 
 import numpy as np
 import torch
@@ -60,22 +60,35 @@ class GreedyCoresetSampler(BaseSampler):
         return mapper(features)
 
     def run(
-        self, features: Union[torch.Tensor, np.ndarray]
-    ) -> Union[torch.Tensor, np.ndarray]:
+        self,
+        features: Union[torch.Tensor, np.ndarray],
+        return_indices: bool = False,
+    ) -> Union[
+        Union[torch.Tensor, np.ndarray],
+        Tuple[Union[torch.Tensor, np.ndarray], np.ndarray],
+    ]:
         """Subsamples features using Greedy Coreset.
 
         Args:
             features: [N x D]
+            return_indices: If True, also return row indices into the input `features`.
         """
         if self.percentage == 1:
+            n = int(len(features))
+            idx = np.arange(n, dtype=np.int64)
+            if return_indices:
+                return features, idx
             return features
         self._store_type(features)
         if isinstance(features, np.ndarray):
             features = torch.from_numpy(features)
         reduced_features = self._reduce_features(features)
         sample_indices = self._compute_greedy_coreset_indices(reduced_features)
-        features = features[sample_indices]
-        return self._restore_type(features)
+        out = features[sample_indices]
+        out = self._restore_type(out)
+        if return_indices:
+            return out, sample_indices
+        return out
 
     @staticmethod
     def _compute_batchwise_differences(

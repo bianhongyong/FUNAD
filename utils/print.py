@@ -68,6 +68,7 @@ def print_selected_clean_ratio(selected_indices: np.ndarray, dataset):
     selected_total = 0
     samples = dataset.samples
     max_index = len(samples) - 1
+    noisy_per_class = {}
 
     for idx in selected_indices.tolist():
         idx_int = int(idx)
@@ -77,6 +78,8 @@ def print_selected_clean_ratio(selected_indices: np.ndarray, dataset):
         filename = os.path.basename(path).lower()
         if "noisy" in filename:
             selected_noisy += 1
+            cls_int = int(_class_idx)
+            noisy_per_class[cls_int] = noisy_per_class.get(cls_int, 0) + 1
         selected_total += 1
 
     if selected_total == 0:
@@ -97,6 +100,16 @@ def print_selected_clean_ratio(selected_indices: np.ndarray, dataset):
             noisy_ratio * 100.0,
         )
     )
+
+    if noisy_per_class:
+        # Sort by class index for stable, readable output.
+        parts = []
+        for cls_int in sorted(noisy_per_class.keys()):
+            parts.append(f"class={cls_int}: {noisy_per_class[cls_int]}")
+        print(
+            "[Phase 2/3] selected noisy image breakdown by class | "
+            + " | ".join(parts)
+        )
 
 
 def print_full_dataset_confusion_matrix_by_raw_score(
