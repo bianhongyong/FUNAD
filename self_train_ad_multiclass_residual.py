@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import random
+from re import A
 import sys
 import time
 import warnings
@@ -110,12 +111,12 @@ def parse_args():
     parser.add_argument("-b", "--batch_size", type=int, default=16)
     parser.add_argument("-r", "--random", type=float, default=0.15)
     parser.add_argument("-t", "--threshold", type=float, default=0.5)
-    parser.add_argument("-n", "--noise_threshold", type=float, default=0.9)
+    parser.add_argument("-n", "--noise_threshold", type=float, default=0.995)
     parser.add_argument(
         "--noise",
         type=str,
         default="10%",
-        choices=["0%", "1%", "2%", "3%", "5%", "10%", "20%"],
+        choices=["0%", "1%", "2%", "3%", "5%","15%", "10%", "20%"],
     )
     parser.add_argument("--std", type=float, default=None)
     parser.add_argument("--k_number", type=int, default=2)
@@ -131,8 +132,8 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_log", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--crop_size", type=int, default=224)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--crop_size", type=int, default=448)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
     parser.add_argument("--num_reference_images_per_class", type=int, default=4)
@@ -142,6 +143,35 @@ def parse_args():
     parser.add_argument("--use_origin_regularizer", action="store_true")
     parser.add_argument("--origin_normal_weight", type=float, default=0.001)
     parser.add_argument("--origin_anomaly_weight", type=float, default=0.001)
+    parser.add_argument(
+        "--gate_aux_weight",
+        type=float,
+        default=0.05,
+        help="Weight for FMoE gate auxiliary loss from discriminator.",
+    )
+    parser.add_argument(
+        "--use_moe_discriminator",
+        action="store_true",
+        help="Whether to use MoE discriminator for localnet."
+    )
+    parser.add_argument(
+        "--moe_num_expert",
+        type=int,
+        default=4,
+        help="Number of experts used when MoE discriminator is enabled.",
+    )
+    parser.add_argument(
+        "--moe_top_k",
+        type=int,
+        default=2,
+        help="Top-k experts per token when MoE discriminator is enabled.",
+    )
+    parser.add_argument(
+        "--moe_use_cls_token",
+        type=str2bool,
+        default="False",
+        help="Whether MoE discriminator gate uses cls_token as routing input.",
+    )
     parser.add_argument(
         "--img_score_topk_ratio",
         type=float,
@@ -156,6 +186,32 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=9)
     parser.add_argument("--n_ctx", type=int, default=12)
     parser.add_argument("--t_n_ctx", type=int, default=4)
+    parser.add_argument(
+        "--pseudo_label_scoring",
+        type=str,
+        choices=["nn", "mahalanobis", "blend"],
+        default="nn",
+        help="Patch vs. memory-bank score: k-NN, Mahalanobis, or per-class min-max normalized blend of both.",
+    )
+    parser.add_argument(
+        "--pseudo_label_blend_nn_weight",
+        type=float,
+        default=0.5,
+        help="blend mode: weight for k-NN branch (Mahalanobis weight defaults complement; both renormalized to sum to 1).",
+    )
+    parser.add_argument(
+        "--pseudo_label_blend_maha_weight",
+        type=float,
+        default=0.5,
+        help="blend mode: weight for Mahalanobis branch.",
+    )
+    parser.add_argument(
+        "--pseudo_label_mahalanobis_dim",
+        type=int,
+        default=128,
+        help="Mahalanobis mode: project patch features to this dim (bias-free Linear) before "
+        "Gaussian fit and scoring when feature dim is larger; set 0 to disable projection.",
+    )
 
     return parser.parse_args()
 
@@ -208,7 +264,14 @@ def build_feature_extractor(args):
     if should_restore_utils:
         del sys.modules["utils"]
     try:
-        feature_extractor = torch.hub.load("facebookresearch/dinov3", "dinov3_vitb16")
+        repo_dir = "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"
+        feature_extractor = torch.hub.load(
+            repo_dir,
+            "dinov3_vitb16",
+            source="local",
+            pretrained=True,
+
+)
     finally:
         if should_restore_utils:
             sys.modules["utils"] = local_utils_module
@@ -217,9 +280,10 @@ def build_feature_extractor(args):
     return feature_extractor
 
 
-def extract_feature_batch(input_tensor, feature_extractor, args):
+def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
     with torch.no_grad():
         feature_extractor.eval()
+        cls_token = None
         if args.feature_model == "clip":
             clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
             image_features, _, _, patch_projections = feature_extractor.encode_image(
@@ -229,22 +293,28 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             )
             x_norm = image_features
             x_prenorm = patch_projections[-1]
+            cls_token = x_norm
         else:
-            feature = feature_extractor.get_intermediate_layers(input_tensor)[0]
-            x_norm = feature[:, 0, :]
-            x_prenorm = feature[:, 1:, :]
+            # DINOv3: 默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
+            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
+                input_tensor, return_class_token=True
+            )[0]
+            x_norm = cls_tok
+            x_prenorm = patch_tokens
+            cls_token = cls_tok
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
         x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
-
+    if return_cls_token:
+        return x_prenorm, cls_token
     return x_prenorm
 
 
 def infer_feature_dim(feature_extractor, train_loader, args):
     for batch in train_loader:
         images = batch[0]
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         features = extract_feature_batch(images, feature_extractor, args)
         return int(features.shape[-1])
     raise RuntimeError("训练集为空，无法推断特征维度。")
@@ -255,7 +325,7 @@ def infer_patch_mask_size(train_dataset, feature_extractor, args):
         raise RuntimeError("训练集为空，无法推断 patch_mask_size。")
     image_path, _ = train_dataset.samples[0]
     image = Image.open(image_path).convert("RGB")
-    image = train_dataset.transform_x(image).unsqueeze(0).to(device)
+    image = train_dataset.transform_x(image).unsqueeze(0).to(device, non_blocking=True)
     features = extract_feature_batch(image, feature_extractor, args)
     num_patches = int(features.shape[1])
     patch_mask_size = int(np.sqrt(num_patches))
@@ -305,13 +375,13 @@ def build_reference_memory_bank(
         raise RuntimeError("没有参考图可用于构建残差记忆库。")
 
     reference_subset = Subset(train_dataset, all_indices)
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=2)
     reference_loader = DataLoader(
         reference_subset,
         batch_size=max(1, min(args.batch_size, 16)),
-        pin_memory=False,
         shuffle=False,
-        num_workers=args.num_workers,
         drop_last=False,
+        **loader_kwargs,
     )
 
     memory_by_class = {class_idx: [] for class_idx in reference_indices_by_class.keys()}
@@ -319,7 +389,7 @@ def build_reference_memory_bank(
         feature_extractor.eval()
         for batch in reference_loader:
             images, class_idx = batch[0], batch[1]
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
             base_features = extract_feature_batch(images, feature_extractor, args)
             feat_np = base_features.detach().cpu().numpy()
             class_np = class_idx.detach().cpu().numpy().astype(np.int64)
@@ -346,29 +416,49 @@ def build_reference_memory_bank(
     return memory_np_by_class, index_by_class
 
 
+def move_reference_memory_to_gpu(reference_memory_by_class):
+    reference_memory_gpu_by_class = {}
+    for class_idx, memory_np in reference_memory_by_class.items():
+        if memory_np is None or memory_np.shape[0] == 0:
+            continue
+        # Keep reference memory in fp32 for stable nearest-neighbor matching.
+        reference_memory_gpu_by_class[int(class_idx)] = torch.as_tensor(
+            memory_np, dtype=torch.float32, device=device
+        )
+    return reference_memory_gpu_by_class
+
+
 def compute_residual_feature_batch(
     features, class_idx_batch, reference_memory_by_class, reference_index_by_class
 ):
-    feat_np = features.detach().cpu().numpy().astype(np.float32, copy=False)
-    class_np = class_idx_batch.detach().cpu().numpy().astype(np.int64)
+    del reference_index_by_class  # Kept for API compatibility.
     dim = int(features.shape[-1])
+    num_patches = int(features.shape[1])
+    residual_features = features
+    unique_class_idx = torch.unique(class_idx_batch)
 
-    for cls in np.unique(class_np).tolist():
-        cls = int(cls)
-        cls_mask = class_np == cls
-        cls_feat = feat_np[cls_mask].reshape(-1, dim)
-
-        if cls not in reference_index_by_class:
+    for cls_tensor in unique_class_idx:
+        cls = int(cls_tensor.item())
+        reference_memory = reference_memory_by_class.get(cls, None)
+        if reference_memory is None:
             continue
 
-        _, nearest_id = reference_index_by_class[cls].search(
-            np.ascontiguousarray(cls_feat), k=1
-        )
-        nearest_feat = reference_memory_by_class[cls][nearest_id.reshape(-1)]
-        cls_residual = (cls_feat - nearest_feat).reshape(-1, 784, dim)
-        feat_np[cls_mask] = cls_residual
+        cls_mask = class_idx_batch == cls_tensor
+        if not bool(cls_mask.any().item()):
+            continue
 
-    return torch.as_tensor(feat_np, dtype=features.dtype, device=features.device)
+        cls_feat = features[cls_mask].reshape(-1, dim)
+        distance = torch.cdist(
+            cls_feat.to(dtype=torch.float32),
+            reference_memory,
+            p=2.0,
+        )
+        nearest_id = torch.argmin(distance, dim=1)
+        nearest_feat = reference_memory.index_select(0, nearest_id).to(dtype=features.dtype)
+        cls_residual = (cls_feat - nearest_feat).reshape(-1, num_patches, dim)
+        residual_features[cls_mask] = cls_residual
+
+    return residual_features
 
 
 def remove_reference_samples_from_dataset(train_dataset, reference_indices_by_class):
@@ -399,6 +489,17 @@ def compute_distance(feature):
     )
 
 
+def build_loader_kwargs(num_workers, pin_memory=True, prefetch_factor=4):
+    kwargs = {
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+    }
+    if int(num_workers) > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    return kwargs
+
+
 def build_test_loader(args, class_name):
     test_set = dataset_extract.MyDataset(
         dataset_path=args.data_path,
@@ -408,13 +509,13 @@ def build_test_loader(args, class_name):
         resize=args.image_size,
         cropsize=args.crop_size,
     )
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
     return DataLoader(
         test_set,
         batch_size=16,
-        pin_memory=False,
         shuffle=False,
-        num_workers=args.num_workers,
         drop_last=False,
+        **loader_kwargs,
     )
 
 
@@ -517,6 +618,7 @@ def train_one_epoch(
     oto_loss = 0
     bce_loss = 0
     origin_loss = 0
+    gate_aux_loss = 0
     memory_bank_time = 0.0
     pseudo_label_time = 0.0
     kl_loss_time = 0.0
@@ -548,13 +650,14 @@ def train_one_epoch(
             print_selected_clean_ratio_fn=print_selected_clean_ratio,
             print_confusion_matrix_fn=print_full_dataset_confusion_matrix_by_raw_score,
             epoch=epoch,
+            pseudo_label_scorer=None,
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
 
     for batch_data in tqdm.tqdm(local_loader, f"| run | train | {epoch + 1} |"):
         images, class_idx, sample_idx = batch_data[0], batch_data[1], batch_data[2]
-        class_idx = class_idx.to(device)
+        class_idx = class_idx.to(device, non_blocking=True)
         class_idx_np = class_idx.detach().cpu().numpy().astype(np.int64)
         sample_idx = sample_idx.detach().cpu().numpy()
         batch = images.shape[0]
@@ -562,8 +665,10 @@ def train_one_epoch(
         if batch != args.batch_size:
             continue
 
-        images = images.to(device)
-        x = extract_feature_batch(images, feature_extractor, args)
+        images = images.to(device, non_blocking=True)
+        x, cls_token = extract_feature_batch(
+            images, feature_extractor, args, return_cls_token=True
+        )
         x = compute_residual_feature_batch(
             x,
             class_idx,
@@ -622,8 +727,8 @@ def train_one_epoch(
                 if (args.threshold <= 1) and args.gaussian:
                     _copy = torch.cat([_copy, syn_anomaly], dim=0)
                 else:
-                    x = torch.cat([x, syn_anomaly.to(device)], dim=0)
-                    class_idx_for_oto = torch.cat([class_idx_for_oto, syn_class.to(device)], dim=0)
+                    x = torch.cat([x, syn_anomaly.to(device, non_blocking=True)], dim=0)
+                    class_idx_for_oto = torch.cat([class_idx_for_oto, syn_class.to(device, non_blocking=True)], dim=0)
             else:
                 local_label = local_label[:-1]
         else:
@@ -640,17 +745,23 @@ def train_one_epoch(
         if args.alternative and onetoone_optimizer is not None:
             onetoone_optimizer.zero_grad()
 
-        x = x.to(device)
-        local_label = local_label.to(device)
+        x = x.to(device, non_blocking=True)
+        local_label = local_label.to(device, non_blocking=True)
 
-        batch_feature, local_pred = localnet(x)
+        gate_cls_token = cls_token if cls_token.shape[0] == x.shape[0] else None
+        batch_feature, local_pred = localnet(x, cls_token=gate_cls_token)
         origin_input_feature = x
         origin_output_feature = batch_feature
 
         pred_for_loss = local_pred
         if (threshold <= 1) and args.gaussian:
-            _copy = _copy.to(device)
-            gaussian_feature, gaussian_pred = localnet(_copy)
+            _copy = _copy.to(device, non_blocking=True)
+            gaussian_cls_token = (
+                cls_token if cls_token.shape[0] == _copy.shape[0] else None
+            )
+            gaussian_feature, gaussian_pred = localnet(
+                _copy, cls_token=gaussian_cls_token
+            )
             pred_for_loss = gaussian_pred
             
         if args.balancing:
@@ -716,8 +827,23 @@ def train_one_epoch(
         else:
             _origin_loss = torch.tensor(0.0, device=local_pred.device)
 
+        if args.use_moe_discriminator:
+            discriminator = getattr(localnet, "discriminator", None)
+            if discriminator is not None and hasattr(discriminator, "get_loss"):
+                _gate_aux_loss = discriminator.get_loss(
+                    clear=True, reduction="mean", default=None
+                )
+                if _gate_aux_loss is None:
+                    _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+            else:
+                _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+        else:
+            _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+
         _local_loss = _loss if args.alternative else (_loss + args.weight * _l_loss)
         _local_loss = _local_loss + _origin_loss
+        if args.use_moe_discriminator:
+            _local_loss = _local_loss + args.gate_aux_weight * _gate_aux_loss
 
         _local_loss.backward()
         localnet_optimizer.step()
@@ -730,6 +856,7 @@ def train_one_epoch(
         bce_loss += _loss / total_batch
         oto_loss += _l_loss / total_batch
         origin_loss += _origin_loss / total_batch
+        gate_aux_loss += _gate_aux_loss / total_batch
         iteration += 1
 
     local_loss_value = (
@@ -739,6 +866,9 @@ def train_one_epoch(
     oto_loss_value = oto_loss.item() if torch.is_tensor(oto_loss) else float(oto_loss)
     origin_loss_value = (
         origin_loss.item() if torch.is_tensor(origin_loss) else float(origin_loss)
+    )
+    gate_aux_loss_value = (
+        gate_aux_loss.item() if torch.is_tensor(gate_aux_loss) else float(gate_aux_loss)
     )
     pseudo_normal_acc = (
         float(pseudo_normal_correct) / float(pseudo_normal_total)
@@ -756,6 +886,7 @@ def train_one_epoch(
         bce_loss_value,
         oto_loss_value,
         origin_loss_value,
+        gate_aux_loss_value,
         iteration,
         memory_bank_time,
         pseudo_label_time,
@@ -808,32 +939,38 @@ def main():
     inferred_patch_mask_size = infer_patch_mask_size(train_dataset, feature_extractor, args)
     train_dataset.patch_mask_size = inferred_patch_mask_size
     print(f"inferred patch_mask_size from feature extractor: {inferred_patch_mask_size}")
-    reference_memory_by_class, reference_index_by_class = build_reference_memory_bank(
+    reference_memory_by_class_cpu, reference_index_by_class = build_reference_memory_bank(
         train_dataset, reference_indices_by_class, feature_extractor, args
     )
+    reference_memory_by_class = move_reference_memory_to_gpu(reference_memory_by_class_cpu)
     remove_reference_samples_from_dataset(train_dataset, reference_indices_by_class)
     print(f"train samples after removing references: {len(train_dataset)}")
 
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
     local_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        pin_memory=False,
         shuffle=True,
         drop_last=False,
-        num_workers=args.num_workers,
+        **loader_kwargs,
     )
     mini_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        pin_memory=False,
         shuffle=False,
-        num_workers=args.num_workers,
         drop_last=False,
+        **loader_kwargs,
     )
 
     feature_dim = infer_feature_dim(feature_extractor, mini_loader, args)
 
-    localnet = model.localnet(len_feature=feature_dim).to(device)
+    localnet = model.localnet(
+        len_feature=feature_dim,
+        use_moe_discriminator=args.use_moe_discriminator,
+        moe_num_expert=args.moe_num_expert,
+        moe_top_k=args.moe_top_k,
+        moe_use_cls_token=args.moe_use_cls_token,
+    ).to(device)
     localnet_optimizer = optim.RMSprop(localnet.parameters(), lr=args.lr, momentum=0.2)
     onetoone_optimizer = optim.Adam(localnet.parameters(), lr=args.lr) if args.alternative else None
     localnet_criterion = nn.BCELoss().to(device)
@@ -863,6 +1000,7 @@ def main():
             bce_loss_value,
             oto_loss_value,
             origin_loss_value,
+            gate_aux_loss_value,
             iteration,
             memory_bank_time,
             pseudo_label_time,
@@ -896,6 +1034,7 @@ def main():
             bce_loss_value,
             oto_loss_value,
             origin_loss=origin_loss_value,
+            gate_aux_loss=gate_aux_loss_value,
         )
         print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
         print(
@@ -907,7 +1046,7 @@ def main():
             f"({pseudo_anomaly_correct}/{pseudo_anomaly_total})"
         )
 
-        if epoch % args.eval_interval == 0:
+        if (epoch + 1) % args.eval_interval == 0:
             eval_rows = []
             mean_img_list = []
             mean_pixel_list = []
@@ -976,7 +1115,7 @@ def main():
                 torch.save(
                     {
                         "net": localnet.state_dict(),
-                        "reference_memory_by_class": reference_memory_by_class,
+                        "reference_memory_by_class": reference_memory_by_class_cpu,
                         "reference_indices_by_class": reference_indices_by_class,
                     },
                     os.path.join(saved_dir, run_name + "_localnet.pt"),
@@ -985,7 +1124,7 @@ def main():
             if args.save_log:
                 with open(os.path.join(saved_dir, "log.txt"), "a") as file:
                     file.write(
-                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
+                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | gate aux loss: {gate_aux_loss_value:.6f} | gate aux weight: {args.gate_aux_weight:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
                     )
 
     if len(best_result_by_class) == 0:

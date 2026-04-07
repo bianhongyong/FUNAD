@@ -14,7 +14,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 MVTEC_CLASS_NAMES = [
      "bottle",
      "cable",
-    "capsule",
+     "capsule",
      "carpet",
      "grid",
      "hazelnut",

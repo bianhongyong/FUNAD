@@ -2,6 +2,8 @@ import argparse
 import datetime
 import os
 import random
+from re import A
+import sys
 import time
 import warnings
 
@@ -30,7 +32,10 @@ from utils.loss import (
 )
 from src.model import model
 from dataset.multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
-from utils.print import print_epoch_losses, print_epoch_times
+from utils.print import (
+    print_epoch_losses,
+    print_epoch_times,
+)
 import utils.train_utils as common_utils
 
 warnings.filterwarnings("ignore")
@@ -45,10 +50,37 @@ device = torch.device("cuda" if use_cuda else "cpu")
 _FAISS_GPU_RESOURCES = None
 _FAISS_USE_CPU_INDEX = False
 _FAISS_GPU_TEMP_MEM_MB = 256
+_LOG_STREAM_HOLDER = []
 
 
 def str2bool(value):
     return common_utils.str2bool(value)
+
+
+class _TeeStream:
+    """Mirror writes to terminal and log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def _enable_print_logging(log_path: str):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log_f = open(log_path, "a", encoding="utf-8")
+    _LOG_STREAM_HOLDER.append(log_f)
+    sys.stdout = _TeeStream(sys.__stdout__, log_f)
+    sys.stderr = _TeeStream(sys.__stderr__, log_f)
+    print(f"[log] mirrored stdout/stderr to: {log_path}")
 
 
 def parse_args():
@@ -59,9 +91,9 @@ def parse_args():
         default="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10",
     )
     parser.add_argument(
-        "--save_path", type=str, default="/media/honeywell/E/bhy/FUNAD/save_results/muti_class"
+        "--save_path", type=str, default="/media/honeywell/E/bhy/test"
     )
-    parser.add_argument("--kl", action="store_false")
+    parser.add_argument("--kl", action="store_true")
     parser.add_argument("--beta", action="store_true")
     parser.add_argument("--gaussian", action="store_false")
     parser.add_argument("--synthetic", action="store_true")
@@ -72,21 +104,21 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("-l", "--lr", type=float, default=2e-5)
     parser.add_argument("--epoch", type=int, default=200)
-    parser.add_argument("-b", "--batch_size", type=int, default=64)
-    parser.add_argument("-r", "--random", type=float, default=0.5)
+    parser.add_argument("-b", "--batch_size", type=int, default=16)
+    parser.add_argument("-r", "--random", type=float, default=0.15)
     parser.add_argument("-t", "--threshold", type=float, default=0.5)
-    parser.add_argument("-n", "--noise_threshold", type=float, default=0.9)
+    parser.add_argument("-n", "--noise_threshold", type=float, default=0.995)
     parser.add_argument(
         "--noise",
         type=str,
         default="10%",
-        choices=["0%", "1%", "2%", "3%", "5%", "10%", "20%"],
+        choices=["0%", "1%", "2%", "3%", "5%","15%", "10%", "20%"],
     )
     parser.add_argument("--std", type=float, default=None)
     parser.add_argument("--k_number", type=int, default=2)
     parser.add_argument("--llambda", type=float, default=1)
-    parser.add_argument("--weight", type=float, default=2.5)
-    parser.add_argument("--iter", type=int, default=1000)
+    parser.add_argument("--weight", type=float, default=0)
+    parser.add_argument("--iter", type=int, default=0)
     parser.add_argument("--beta_number", type=int, default=15)
     parser.add_argument("--alternative", action="store_true")
     parser.add_argument("--balancing", action="store_false")
@@ -96,28 +128,48 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--save_log", action="store_true")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--image_size", type=int, default=256)
-    parser.add_argument("--crop_size", type=int, default=224)
-    parser.add_argument("--max_bank_images", type=int, default=128)
+    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--crop_size", type=int, default=448)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
-    parser.add_argument(
-        "--bank_sample_ratio",
-        type=float,
-        default=0.1,
-        choices=[0.05, 0.1],
-        help="Random sampling ratio used before memory bank construction (5% or 10%).",
-    )
     parser.add_argument("--use_class_adaptive_threshold", action="store_true")
     parser.add_argument("--adaptive_threshold_quantile", type=float, default=0.7)
+    parser.add_argument(
+        "--gate_aux_weight",
+        type=float,
+        default=0.05,
+        help="Weight for FMoE gate auxiliary loss from discriminator.",
+    )
+    parser.add_argument(
+        "--use_moe_discriminator",
+        action="store_true",
+        help="Whether to use MoE discriminator for localnet."
+    )
+    parser.add_argument(
+        "--moe_num_expert",
+        type=int,
+        default=4,
+        help="Number of experts used when MoE discriminator is enabled.",
+    )
+    parser.add_argument(
+        "--moe_top_k",
+        type=int,
+        default=2,
+        help="Top-k experts per token when MoE discriminator is enabled.",
+    )
+    parser.add_argument(
+        "--moe_use_cls_token",
+        type=str2bool,
+        default="False",
+        help="Whether MoE discriminator gate uses cls_token as routing input.",
+    )
     parser.add_argument(
         "--img_score_topk_ratio",
         type=float,
         default=0.01,
         help="Image-level score uses mean of top-k patch scores, k=ceil(num_patches*ratio).",
     )
-
-    parser.add_argument("--use_cls_token", type=str2bool, default=True)
+    parser.add_argument("--use_cls_token", type=str2bool, default="False")
     parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
     parser.add_argument("--clip_model_name", type=str, default="ViT-L/14@336px")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24])
@@ -125,6 +177,32 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=9)
     parser.add_argument("--n_ctx", type=int, default=12)
     parser.add_argument("--t_n_ctx", type=int, default=4)
+    parser.add_argument(
+        "--pseudo_label_scoring",
+        type=str,
+        choices=["nn", "mahalanobis", "blend"],
+        default="nn",
+        help="Patch vs. memory-bank score: k-NN, Mahalanobis, or per-class min-max normalized blend of both.",
+    )
+    parser.add_argument(
+        "--pseudo_label_blend_nn_weight",
+        type=float,
+        default=0.5,
+        help="blend mode: weight for k-NN branch (Mahalanobis weight defaults complement; both renormalized to sum to 1).",
+    )
+    parser.add_argument(
+        "--pseudo_label_blend_maha_weight",
+        type=float,
+        default=0.5,
+        help="blend mode: weight for Mahalanobis branch.",
+    )
+    parser.add_argument(
+        "--pseudo_label_mahalanobis_dim",
+        type=int,
+        default=128,
+        help="Mahalanobis mode: project patch features to this dim (bias-free Linear) before "
+        "Gaussian fit and scoring when feature dim is larger; set 0 to disable projection.",
+    )
 
     return parser.parse_args()
 
@@ -165,15 +243,38 @@ def build_feature_extractor(args):
         feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
         return feature_extractor
 
-    feature_extractor = torch.hub.load("facebookresearch/dino:main", "dino_vitb8")
+    # DINO imports `trunc_normal_` via `from utils import ...`.
+    # This project also has `utils.py`, so temporarily unshadow it.
+    local_utils_module = sys.modules.get("utils")
+    should_restore_utils = (
+        local_utils_module is not None
+        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
+            os.path.join("FUNAD", "utils.py")
+        )
+    )
+    if should_restore_utils:
+        del sys.modules["utils"]
+    try:
+        repo_dir = "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"
+        feature_extractor = torch.hub.load(
+            repo_dir,
+            "dinov3_vitb16",
+            source="local",
+            pretrained=True,
+
+)
+    finally:
+        if should_restore_utils:
+            sys.modules["utils"] = local_utils_module
     feature_extractor = feature_extractor.to(device)
     feature_extractor.eval()
     return feature_extractor
 
 
-def extract_feature_batch(input_tensor, feature_extractor, args):
+def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
     with torch.no_grad():
         feature_extractor.eval()
+        cls_token = None
         if args.feature_model == "clip":
             clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
             image_features, _, _, patch_projections = feature_extractor.encode_image(
@@ -183,22 +284,28 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             )
             x_norm = image_features
             x_prenorm = patch_projections[-1]
+            cls_token = x_norm
         else:
-            feature = feature_extractor.get_intermediate_layers(input_tensor)[0]
-            x_norm = feature[:, 0, :]
-            x_prenorm = feature[:, 1:, :]
+            # DINOv3: 默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
+            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
+                input_tensor, return_class_token=True
+            )[0]
+            x_norm = cls_tok
+            x_prenorm = patch_tokens
+            cls_token = cls_tok
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
         x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
-
+    if return_cls_token:
+        return x_prenorm, cls_token
     return x_prenorm
 
 
 def infer_feature_dim(feature_extractor, train_loader, args):
     for batch in train_loader:
         images = batch[0]
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         features = extract_feature_batch(images, feature_extractor, args)
         return int(features.shape[-1])
     raise RuntimeError("训练集为空，无法推断特征维度。")
@@ -209,7 +316,7 @@ def infer_patch_mask_size(train_dataset, feature_extractor, args):
         raise RuntimeError("训练集为空，无法推断 patch_mask_size。")
     image_path, _ = train_dataset.samples[0]
     image = Image.open(image_path).convert("RGB")
-    image = train_dataset.transform_x(image).unsqueeze(0).to(device)
+    image = train_dataset.transform_x(image).unsqueeze(0).to(device, non_blocking=True)
     features = extract_feature_batch(image, feature_extractor, args)
     num_patches = int(features.shape[1])
     patch_mask_size = int(np.sqrt(num_patches))
@@ -229,6 +336,17 @@ def compute_distance(feature):
     )
 
 
+def build_loader_kwargs(num_workers, pin_memory=True, prefetch_factor=4):
+    kwargs = {
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+    }
+    if int(num_workers) > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    return kwargs
+
+
 def build_test_loader(args, class_name):
     test_set = dataset_extract.MyDataset(
         dataset_path=args.data_path,
@@ -238,13 +356,13 @@ def build_test_loader(args, class_name):
         resize=args.image_size,
         cropsize=args.crop_size,
     )
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
     return DataLoader(
         test_set,
         batch_size=16,
-        pin_memory=False,
         shuffle=False,
-        num_workers=args.num_workers,
         drop_last=False,
+        **loader_kwargs,
     )
 
 
@@ -252,7 +370,12 @@ def get_oto_loss(args):
     return common_utils.get_oto_loss(args.oto_loss, device)
 
 
-def evaluate_epoch(localnet, feature_extractor, test_loader, args):
+def evaluate_epoch(
+    localnet,
+    feature_extractor,
+    test_loader,
+    args,
+):
     return eval_utils.evaluate_multiclass_epoch(
         localnet=localnet,
         feature_extractor=feature_extractor,
@@ -286,21 +409,11 @@ def _update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k):
     return common_utils.update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k)
 
 
-def _sample_beta_anomaly(confident_feature_bank, class_idx_batch, dim):
-    class_idx_cpu = class_idx_batch.detach().cpu().numpy()
-    unique_batch_classes = np.unique(class_idx_cpu).tolist()
-
-    eligible_classes = []
-    for cls in unique_batch_classes:
-        pool = confident_feature_bank.get(int(cls), None)
-        if pool is not None and pool.shape[0] >= 2:
-            eligible_classes.append(int(cls))
-
-    if len(eligible_classes) == 0:
+def _sample_beta_anomaly(confident_feature_bank, dim):
+    if confident_feature_bank is None or confident_feature_bank.shape[0] < 2:
         return None, None
 
-    selected_class = random.choice(eligible_classes)
-    pool = confident_feature_bank[selected_class]
+    pool = confident_feature_bank
     pool_size = pool.shape[0]
 
     first_indices = torch.randint(low=0, high=pool_size, size=(784,))
@@ -318,7 +431,7 @@ def _sample_beta_anomaly(confident_feature_bank, class_idx_batch, dim):
     mix_ratio = random.random()
     syn_anomaly = mix_ratio * first_vector + (1 - mix_ratio) * second_vector
     syn_anomaly = syn_anomaly.reshape(1, 784, dim)
-    syn_class = torch.tensor([selected_class], dtype=torch.long)
+    syn_class = torch.tensor([0], dtype=torch.long)
     return syn_anomaly, syn_class
 
 
@@ -342,9 +455,14 @@ def train_one_epoch(
     local_loss = 0
     oto_loss = 0
     bce_loss = 0
+    gate_aux_loss = 0
     memory_bank_time = 0.0
     pseudo_label_time = 0.0
     kl_loss_time = 0.0
+    pseudo_normal_correct = 0
+    pseudo_normal_total = 0
+    pseudo_anomaly_correct = 0
+    pseudo_anomaly_total = 0
 
     distance_map = None
     confident_feature_bank = None
@@ -368,7 +486,7 @@ def train_one_epoch(
 
     for batch_data in tqdm.tqdm(local_loader, f"| run | train | {epoch + 1} |"):
         images, class_idx, sample_idx = batch_data[0], batch_data[1], batch_data[2]
-        class_idx = class_idx.to(device)
+        class_idx = class_idx.to(device, non_blocking=True)
         class_idx_np = class_idx.detach().cpu().numpy().astype(np.int64)
         sample_idx = sample_idx.detach().cpu().numpy()
         batch = images.shape[0]
@@ -376,8 +494,10 @@ def train_one_epoch(
         if batch != args.batch_size:
             continue
 
-        images = images.to(device)
-        x = extract_feature_batch(images, feature_extractor, args)
+        images = images.to(device, non_blocking=True)
+        x, cls_token = extract_feature_batch(
+            images, feature_extractor, args, return_cls_token=True
+        )
         dim = int(x.shape[-1]) if global_dim is None else int(global_dim)
 
         distance = np.zeros((batch, 784), dtype=np.float32)
@@ -391,7 +511,6 @@ def train_one_epoch(
                 default_threshold=threshold,
                 quantile=args.adaptive_threshold_quantile,
             )
-
         _copy = None
         if (threshold <= 1) and args.gaussian:
             uncertain_mask = (distance > threshold_map) & (distance < args.noise_threshold)
@@ -423,7 +542,6 @@ def train_one_epoch(
 
             syn_anomaly, syn_class = _sample_beta_anomaly(
                 confident_feature_bank=confident_feature_bank,
-                class_idx_batch=class_idx,
                 dim=dim,
             )
 
@@ -432,14 +550,16 @@ def train_one_epoch(
                 if (args.threshold <= 1) and args.gaussian:
                     _copy = torch.cat([_copy, syn_anomaly], dim=0)
                 else:
-                    x = torch.cat([x, syn_anomaly.to(device)], dim=0)
-                    class_idx_for_oto = torch.cat([class_idx_for_oto, syn_class.to(device)], dim=0)
+                    x = torch.cat([x, syn_anomaly.to(device, non_blocking=True)], dim=0)
+                    class_idx_for_oto = torch.cat([class_idx_for_oto, syn_class.to(device, non_blocking=True)], dim=0)
             else:
                 local_label = local_label[:-1]
         else:
             local_label = torch.zeros((args.batch_size, 784))
             if args.threshold <= 1:
-                distance_mask = torch.as_tensor(distance > threshold_map, dtype=torch.bool)
+                distance_mask = torch.as_tensor(
+                    distance > threshold_map, dtype=torch.bool
+                )
                 local_label[distance_mask] = 1
         pseudo_label_time += time.perf_counter() - pseudo_label_assign_start
 
@@ -448,17 +568,22 @@ def train_one_epoch(
         if args.alternative and onetoone_optimizer is not None:
             onetoone_optimizer.zero_grad()
 
-        x = x.to(device)
-        local_label = local_label.to(device)
+        x = x.to(device, non_blocking=True)
+        local_label = local_label.to(device, non_blocking=True)
 
-        batch_feature, local_pred = localnet(x)
-
+        gate_cls_token = cls_token if cls_token.shape[0] == x.shape[0] else None
+        batch_feature, local_pred = localnet(x, cls_token=gate_cls_token)
         pred_for_loss = local_pred
         if (threshold <= 1) and args.gaussian:
-            _copy = _copy.to(device)
-            _, gaussian_pred = localnet(_copy)
+            _copy = _copy.to(device, non_blocking=True)
+            gaussian_cls_token = (
+                cls_token if cls_token.shape[0] == _copy.shape[0] else None
+            )
+            gaussian_feature, gaussian_pred = localnet(
+                _copy, cls_token=gaussian_cls_token
+            )
             pred_for_loss = gaussian_pred
-
+            
         if args.balancing:
             _loss = compute_balanced_bce_loss(
                 localnet_criterion=localnet_criterion,
@@ -467,6 +592,18 @@ def train_one_epoch(
             )
         else:
             _loss = localnet_criterion(pred_for_loss, local_label)
+
+        with torch.no_grad():
+            pred_bin = pred_for_loss.detach() >= 0.5
+            target_bin = local_label >= 0.5
+            normal_mask = ~target_bin
+            anomaly_mask = target_bin
+            if normal_mask.any().item():
+                pseudo_normal_total += int(normal_mask.sum().item())
+                pseudo_normal_correct += int((~pred_bin[normal_mask]).sum().item())
+            if anomaly_mask.any().item():
+                pseudo_anomaly_total += int(anomaly_mask.sum().item())
+                pseudo_anomaly_correct += int(pred_bin[anomaly_mask].sum().item())
 
         if (iteration >= args.iter) and args.kl:
             kl_start = time.perf_counter()
@@ -483,7 +620,22 @@ def train_one_epoch(
         else:
             _l_loss = torch.tensor(0.0, device=local_pred.device)
 
+        if args.use_moe_discriminator:
+            discriminator = getattr(localnet, "discriminator", None)
+            if discriminator is not None and hasattr(discriminator, "get_loss"):
+                _gate_aux_loss = discriminator.get_loss(
+                    clear=True, reduction="mean", default=None
+                )
+                if _gate_aux_loss is None:
+                    _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+            else:
+                _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+        else:
+            _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
+
         _local_loss = _loss if args.alternative else (_loss + args.weight * _l_loss)
+        if args.use_moe_discriminator:
+            _local_loss = _local_loss + args.gate_aux_weight * _gate_aux_loss
 
         _local_loss.backward()
         localnet_optimizer.step()
@@ -495,6 +647,7 @@ def train_one_epoch(
         local_loss += _local_loss / total_batch
         bce_loss += _loss / total_batch
         oto_loss += _l_loss / total_batch
+        gate_aux_loss += _gate_aux_loss / total_batch
         iteration += 1
 
     local_loss_value = (
@@ -502,15 +655,35 @@ def train_one_epoch(
     )
     bce_loss_value = bce_loss.item() if torch.is_tensor(bce_loss) else float(bce_loss)
     oto_loss_value = oto_loss.item() if torch.is_tensor(oto_loss) else float(oto_loss)
+    gate_aux_loss_value = (
+        gate_aux_loss.item() if torch.is_tensor(gate_aux_loss) else float(gate_aux_loss)
+    )
+    pseudo_normal_acc = (
+        float(pseudo_normal_correct) / float(pseudo_normal_total)
+        if pseudo_normal_total > 0
+        else 0.0
+    )
+    pseudo_anomaly_acc = (
+        float(pseudo_anomaly_correct) / float(pseudo_anomaly_total)
+        if pseudo_anomaly_total > 0
+        else 0.0
+    )
 
     return (
         local_loss_value,
         bce_loss_value,
         oto_loss_value,
+        gate_aux_loss_value,
         iteration,
         memory_bank_time,
         pseudo_label_time,
         kl_loss_time,
+        pseudo_normal_acc,
+        pseudo_normal_correct,
+        pseudo_normal_total,
+        pseudo_anomaly_acc,
+        pseudo_anomaly_correct,
+        pseudo_anomaly_total,
     )
 
 
@@ -522,10 +695,15 @@ def main():
     _FAISS_GPU_TEMP_MEM_MB = int(args.faiss_gpu_temp_mem_mb)
     fix_seed(args.seed)
 
+    saved_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    os.makedirs(saved_dir, exist_ok=True)
+    _enable_print_logging(os.path.join(saved_dir, "run_stdout.log"))
+
     if args.synthetic:
         raise ValueError("当前多类脚本暂不支持 --synthetic。")
 
     class_names = get_all_class_names(args.dataset)
+    args.class_names = class_names
     train_dataset = MultiClassFeatureDataset(
         data_path=args.data_path,
         dataset_name=args.dataset,
@@ -535,30 +713,36 @@ def main():
         shuffle=True,
     )
 
-    local_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        pin_memory=False,
-        shuffle=True,
-        drop_last=True,
-        num_workers=args.num_workers,
-    )
-    mini_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        pin_memory=False,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
-
     feature_extractor = build_feature_extractor(args)
     inferred_patch_mask_size = infer_patch_mask_size(train_dataset, feature_extractor, args)
     train_dataset.patch_mask_size = inferred_patch_mask_size
     print(f"inferred patch_mask_size from feature extractor: {inferred_patch_mask_size}")
+
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
+    local_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    mini_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
+
     feature_dim = infer_feature_dim(feature_extractor, mini_loader, args)
 
-    localnet = model.localnet(len_feature=feature_dim).to(device)
+    localnet = model.localnet(
+        len_feature=feature_dim,
+        use_moe_discriminator=args.use_moe_discriminator,
+        moe_num_expert=args.moe_num_expert,
+        moe_top_k=args.moe_top_k,
+        moe_use_cls_token=args.moe_use_cls_token,
+    ).to(device)
     localnet_optimizer = optim.RMSprop(localnet.parameters(), lr=args.lr, momentum=0.2)
     onetoone_optimizer = optim.Adam(localnet.parameters(), lr=args.lr) if args.alternative else None
     localnet_criterion = nn.BCELoss().to(device)
@@ -578,9 +762,6 @@ def main():
         + "_multiclass"
     )
 
-    saved_dir = os.path.join(args.save_path, args.dataset, args.noise)
-    os.makedirs(saved_dir, exist_ok=True)
-
     iteration = 0
     best_mean = -1
     best_result_by_class = {}
@@ -590,10 +771,17 @@ def main():
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
+                gate_aux_loss_value,
             iteration,
             memory_bank_time,
             pseudo_label_time,
             kl_loss_time,
+            pseudo_normal_acc,
+            pseudo_normal_correct,
+            pseudo_normal_total,
+            pseudo_anomaly_acc,
+            pseudo_anomaly_correct,
+            pseudo_anomaly_total,
         ) = train_one_epoch(
             args=args,
             epoch=epoch,
@@ -609,10 +797,24 @@ def main():
             num_classes=len(class_names),
         )
 
-        print_epoch_losses(epoch, local_loss_value, bce_loss_value, oto_loss_value)
+        print_epoch_losses(
+            epoch,
+            local_loss_value,
+            bce_loss_value,
+            oto_loss_value,
+            gate_aux_loss=gate_aux_loss_value,
+        )
         print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
+        print(
+            f"epoch {epoch + 1} | pseudo normal->normal acc@0.5: {pseudo_normal_acc:.4f} "
+            f"({pseudo_normal_correct}/{pseudo_normal_total})"
+        )
+        print(
+            f"epoch {epoch + 1} | pseudo anomaly->anomaly acc@0.5: {pseudo_anomaly_acc:.4f} "
+            f"({pseudo_anomaly_correct}/{pseudo_anomaly_total})"
+        )
 
-        if epoch % args.eval_interval == 0:
+        if (epoch + 1) % args.eval_interval == 0:
             eval_rows = []
             mean_img_list = []
             mean_pixel_list = []
@@ -631,7 +833,12 @@ def main():
                     ap_px,
                     f1_px,
                     aupro_px,
-                ) = evaluate_epoch(localnet, feature_extractor, test_loader, args)
+                ) = evaluate_epoch(
+                    localnet,
+                    feature_extractor,
+                    test_loader,
+                    args,
+                )
                 eval_rows.append(
                     [class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px]
                 )
@@ -670,12 +877,15 @@ def main():
             if epoch_mean > best_mean:
                 best_mean = epoch_mean
                 best_result_by_class = {row[0]: tuple(row[1:]) for row in eval_rows}
-                torch.save({"net": localnet.state_dict()}, os.path.join(saved_dir, run_name + "_localnet.pt"))
+                torch.save(
+                    {"net": localnet.state_dict()},
+                    os.path.join(saved_dir, run_name + "_localnet.pt"),
+                )
 
             if args.save_log:
                 with open(os.path.join(saved_dir, "log.txt"), "a") as file:
                     file.write(
-                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
+                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | gate aux loss: {gate_aux_loss_value:.6f} | gate aux weight: {args.gate_aux_weight:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
                     )
 
     if len(best_result_by_class) == 0:
