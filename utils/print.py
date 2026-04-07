@@ -3,16 +3,28 @@ import os
 import numpy as np
 
 
-def print_epoch_losses(epoch, loss, bce_loss, oto_loss, origin_loss=None):
-    if origin_loss is None:
+def print_epoch_losses(epoch, loss, bce_loss, oto_loss, origin_loss=None, gate_aux_loss=None):
+    if origin_loss is None and gate_aux_loss is None:
         print(
             "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f"
             % (epoch + 1, loss, bce_loss, oto_loss)
         )
         return
+    if origin_loss is None:
+        print(
+            "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, gate aux loss: %.6f"
+            % (epoch + 1, loss, bce_loss, oto_loss, gate_aux_loss)
+        )
+        return
+    if gate_aux_loss is None:
+        print(
+            "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, origin loss: %.6f"
+            % (epoch + 1, loss, bce_loss, oto_loss, origin_loss)
+        )
+        return
     print(
-        "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, origin loss: %.6f"
-        % (epoch + 1, loss, bce_loss, oto_loss, origin_loss)
+        "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, origin loss: %.6f, gate aux loss: %.6f"
+        % (epoch + 1, loss, bce_loss, oto_loss, origin_loss, gate_aux_loss)
     )
 
 
@@ -113,13 +125,154 @@ def print_selected_clean_ratio(selected_indices: np.ndarray, dataset):
 
 
 def print_full_dataset_confusion_matrix_by_raw_score(
-    dataset_size: int,
-    image_scores: np.ndarray,
-    class_stack: np.ndarray,
-    dataset,
-    num_classes: int,
+    dataset_size: int = None,
+    image_scores: np.ndarray = None,
+    class_stack: np.ndarray = None,
+    dataset=None,
+    num_classes: int = None,
     threshold: float = 0.5,
+    selected_indices: np.ndarray = None,
+    gt_patch_masks: np.ndarray = None,
+    image_norm_scores: np.ndarray = None,
 ):
+    # Backward compatible adapter:
+    # - old call style: dataset_size/image_scores/class_stack/dataset/num_classes/threshold
+    # - new call style from multiclass precompute:
+    #   selected_indices/class_stack/gt_patch_masks/image_norm_scores
+    if (
+        image_scores is None
+        and image_norm_scores is not None
+        and class_stack is not None
+        and selected_indices is not None
+    ):
+        image_scores = np.asarray(image_norm_scores, dtype=np.float32)
+        class_stack = np.asarray(class_stack, dtype=np.int64)
+        selected_indices = np.asarray(selected_indices, dtype=np.int64)
+        if selected_indices.size == 0:
+            print(
+                "[Phase 1] confusion matrix (raw score, selected set): empty selected_indices."
+            )
+            return
+        if image_scores.shape[0] != class_stack.shape[0]:
+            print(
+                "[Phase 1] confusion matrix (raw score, selected set): "
+                "image_norm_scores/class_stack size mismatch."
+            )
+            return
+
+        n_cls = int(class_stack.max()) + 1 if class_stack.size > 0 else 0
+        if n_cls <= 0:
+            print(
+                "[Phase 1] confusion matrix (raw score, selected set): no valid classes."
+            )
+            return
+
+        # If gt_patch_masks provided, use patch-derived anomaly label; otherwise fall back
+        # to score thresholding on selected set as a weak self-consistency metric.
+        gt_image_is_anomaly = None
+        if gt_patch_masks is not None:
+            gt_patch_masks = np.asarray(gt_patch_masks)
+            if (
+                gt_patch_masks.ndim == 2
+                and gt_patch_masks.shape[0] == image_scores.shape[0]
+            ):
+                gt_image_is_anomaly = (
+                    gt_patch_masks.reshape(gt_patch_masks.shape[0], -1).sum(axis=1) > 0
+                )
+
+        def _init_counter():
+            return {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+
+        per_class = {i: _init_counter() for i in range(n_cls)}
+        overall = _init_counter()
+
+        for idx_int in selected_indices.tolist():
+            if idx_int < 0 or idx_int >= image_scores.shape[0]:
+                continue
+            cls = int(class_stack[idx_int])
+            if cls < 0 or cls >= n_cls:
+                continue
+
+            score = float(image_scores[idx_int])
+            pred_anomaly = score > float(threshold)
+            if gt_image_is_anomaly is None:
+                actual_anomaly = pred_anomaly
+            else:
+                actual_anomaly = bool(gt_image_is_anomaly[idx_int])
+
+            bucket = per_class[cls]
+            if pred_anomaly and actual_anomaly:
+                bucket["tp"] += 1
+                overall["tp"] += 1
+            elif pred_anomaly and (not actual_anomaly):
+                bucket["fp"] += 1
+                overall["fp"] += 1
+            elif (not pred_anomaly) and (not actual_anomaly):
+                bucket["tn"] += 1
+                overall["tn"] += 1
+            else:
+                bucket["fn"] += 1
+                overall["fn"] += 1
+
+        def _safe_div(num, den):
+            return float(num) / float(den) if den > 0 else 0.0
+
+        def _metrics(c):
+            tp, fp, tn, fn = c["tp"], c["fp"], c["tn"], c["fn"]
+            support = tp + fp + tn + fn
+            acc = _safe_div(tp + tn, support)
+            prec = _safe_div(tp, tp + fp)
+            rec = _safe_div(tp, tp + fn)
+            f1 = _safe_div(2 * prec * rec, prec + rec) if (prec + rec) > 0 else 0.0
+            return support, acc, prec, rec, f1
+
+        print(
+            "[Phase 1] confusion matrix by class (selected set, normalized score; "
+            f"threshold={float(threshold):.3f}, pred: score>thr => anomaly)"
+        )
+        print(
+            "CM_BY_CLASS|class_idx|class_name|support|tp|fp|tn|fn|accuracy|precision|recall|f1"
+        )
+        for cls in range(n_cls):
+            c = per_class[cls]
+            support, acc, prec, rec, f1 = _metrics(c)
+            print(
+                "CM_BY_CLASS|%d|%s|%d|%d|%d|%d|%d|%.4f|%.4f|%.4f|%.4f"
+                % (
+                    cls,
+                    f"class_{cls}",
+                    support,
+                    c["tp"],
+                    c["fp"],
+                    c["tn"],
+                    c["fn"],
+                    acc,
+                    prec,
+                    rec,
+                    f1,
+                )
+            )
+        s, acc, prec, rec, f1 = _metrics(overall)
+        print(
+            "CM_OVERALL|support=%d|tp=%d|fp=%d|tn=%d|fn=%d|accuracy=%.4f|precision=%.4f|recall=%.4f|f1=%.4f"
+            % (s, overall["tp"], overall["fp"], overall["tn"], overall["fn"], acc, prec, rec, f1)
+        )
+        return
+
+    if (
+        dataset_size is None
+        or image_scores is None
+        or class_stack is None
+        or dataset is None
+        or num_classes is None
+    ):
+        raise TypeError(
+            "print_full_dataset_confusion_matrix_by_raw_score: invalid arguments. "
+            "Expected either old signature "
+            "(dataset_size, image_scores, class_stack, dataset, num_classes[, threshold]) "
+            "or new signature "
+            "(selected_indices=..., class_stack=..., gt_patch_masks=..., image_norm_scores=...)."
+        )
     if not hasattr(dataset, "samples"):
         print(
             "[Phase 1] confusion matrix (raw score, full set): dataset has no samples metadata."

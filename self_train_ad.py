@@ -784,7 +784,7 @@ def main():
             backbone,
             resnet_channel,
             resnet_idx,
-        )
+        ) 
 
         if args.synthetic:
             synthetic_dataset = dataload.ImageDataset(

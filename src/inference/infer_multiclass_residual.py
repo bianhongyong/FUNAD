@@ -87,6 +87,12 @@ def parse_args():
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
 
     parser.add_argument("--use_cls_token", type=str2bool, default=False)
+    parser.add_argument(
+        "--moe_use_cls_token",
+        type=str2bool,
+        default=False,
+        help="Whether MoE discriminator gate uses cls_token as routing input.",
+    )
     parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
     parser.add_argument(
         "--dinov3_hub",
@@ -180,9 +186,10 @@ def build_feature_extractor(args, device):
     return feature_extractor
 
 
-def extract_feature_batch(input_tensor, feature_extractor, args):
+def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
     with torch.no_grad():
         feature_extractor.eval()
+        cls_token = None
         if args.feature_model == "clip":
             clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
             image_features, _, _, patch_projections = feature_extractor.encode_image(
@@ -192,6 +199,7 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             )
             x_norm = image_features
             x_prenorm = patch_projections[-1]
+            cls_token = x_norm
         else:
             # DINOv3：默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
             patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
@@ -199,10 +207,13 @@ def extract_feature_batch(input_tensor, feature_extractor, args):
             )[0]
             x_norm = cls_tok
             x_prenorm = patch_tokens
+            cls_token = cls_tok
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
         x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
+    if return_cls_token:
+        return x_prenorm, cls_token
     return x_prenorm
 
 
@@ -481,7 +492,10 @@ def main():
             f"patch 数 {num_patches} 不是完全平方数，无法形成热力图网格。"
         )
 
-    localnet = model.localnet(len_feature=feature_dim).to(device)
+    localnet = model.localnet(
+        len_feature=feature_dim,
+        moe_use_cls_token=args.moe_use_cls_token,
+    ).to(device)
     localnet.load_state_dict(checkpoint["net"], strict=True)
     localnet.eval()
     feature_extractor.eval()
@@ -527,7 +541,9 @@ def main():
         with torch.no_grad():
             for images, y, mask in test_loader:
                 images = images.to(device)
-                features = extract_feature_batch(images, feature_extractor, args)
+                features, cls_token = extract_feature_batch(
+                    images, feature_extractor, args, return_cls_token=True
+                )
                 class_idx_batch = torch.full(
                     (features.shape[0],),
                     int(class_idx),
@@ -541,7 +557,7 @@ def main():
                     reference_index_by_class,
                     num_patches=num_patches,
                 )
-                _, score = localnet(residual_features)
+                _, score = localnet(residual_features, cls_token=cls_token)
                 score_np = score.detach().cpu().numpy().reshape(-1, patch_side, patch_side)
                 score_flat = score.detach().cpu().numpy().reshape(score_np.shape[0], -1)
                 image_np = images.detach().cpu().numpy()

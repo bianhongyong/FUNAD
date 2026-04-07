@@ -11,11 +11,11 @@ source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
 # ===== User-configurable =====
-DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy20"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3_kl"
+DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_moe_no_cls_token"
 DATASET="mvtec"         # mvtec | visa
-NOISE="20%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
-EPOCH=200
+NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
+EPOCH=50
 BATCH_SIZE=16
 LR=2e-5
 SEED=0
@@ -27,7 +27,7 @@ FEATURE_MODEL="dino"    # dino | clip
 # EXTRA_ARGS+=(--faiss_cpu_index)
 # - Uncomment to enable class adaptive threshold:
 # EXTRA_ARGS+=(--use_class_adaptive_threshold --adaptive_threshold_quantile 0.7)
-EXTRA_ARGS=(--save_log  --threshold 0.15 --noise_threshold 0.85 --kl --weight 2.5)
+EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85 --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.1 --eval_interval 10) 
 
 python self_train_ad_multiclass_residual_dinov3.py \
   --data_path "$DATA_PATH" \

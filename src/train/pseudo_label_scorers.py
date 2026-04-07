@@ -1,0 +1,245 @@
+"""Pseudo-label patch scoring: k-NN (FAISS) vs. multivariate Gaussian (Mahalanobis)."""
+
+from __future__ import annotations
+
+import warnings
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+import torch
+from torch import Tensor, nn
+
+
+def postprocess_faiss_distances(distance: np.ndarray, k_number: int) -> np.ndarray:
+    """
+    distance: shape (N, k). Distances below 1e-4 are treated as 0 (self / duplicate).
+    Returns shape (N,): per row, mean of neighbors whose distance is > 0.
+    If all k neighbors are 0, returns 0 for that row.
+    """
+    _ = k_number
+    distance = np.asarray(distance, dtype=np.float32)
+    distance[distance < 1e-4] = 0
+    mask = distance > 0
+    sums = (distance * mask).sum(axis=1)
+    counts = mask.sum(axis=1)
+    return np.where(counts > 0, sums / counts.astype(np.float32), 0.0).astype(np.float32)
+
+
+class MultiVariateGaussian(nn.Module):
+    """SoftPatch-style multivariate Gaussian per patch index; use patch=1 for a single global Gaussian."""
+
+    def __init__(self, n_features: int, n_patches: int):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(n_features, n_patches))
+        self.register_buffer("inv_covariance", torch.eye(n_features).unsqueeze(0).repeat(n_patches, 1, 1))
+        self.mean: Tensor
+        self.inv_covariance: Tensor
+
+    @staticmethod
+    def _cov(
+        observations: Tensor,
+        rowvar: bool = False,
+        bias: bool = False,
+        ddof: Optional[int] = None,
+        aweights: Tensor = None,
+    ) -> Tensor:
+        if observations.dim() == 1:
+            observations = observations.view(-1, 1)
+        if rowvar and observations.shape[0] != 1:
+            observations = observations.t()
+        if ddof is None:
+            ddof = 0 if bias else 1
+        weights = aweights
+        weights_sum: Any
+        if weights is not None:
+            if not torch.is_tensor(weights):
+                weights = torch.tensor(weights, dtype=torch.float)
+            weights_sum = torch.sum(weights)
+            avg = torch.sum(observations * (weights / weights_sum)[:, None], 0)
+        else:
+            avg = torch.mean(observations, 0)
+        if weights is None:
+            fact = observations.shape[0] - ddof
+        elif ddof == 0:
+            fact = weights_sum
+        elif aweights is None:
+            fact = weights_sum - ddof
+        else:
+            fact = weights_sum - ddof * torch.sum(weights * weights) / weights_sum
+        observations_m = observations.sub(avg.expand_as(observations))
+        if weights is None:
+            x_transposed = observations_m.t()
+        else:
+            x_transposed = torch.mm(torch.diag(weights), observations_m).t()
+        covariance = torch.mm(x_transposed, observations_m)
+        covariance = covariance / fact
+        return covariance.squeeze()
+
+    def forward(self, embedding: Tensor) -> List[Tensor]:
+        device = embedding.device
+        patch, _, channel = embedding.shape
+        embedding_vectors = embedding.permute(1, 2, 0)
+        self.mean = torch.mean(embedding_vectors, dim=0)
+        covariance = torch.zeros(size=(channel, channel, patch), device=device)
+        identity = torch.eye(channel).to(device)
+        for i in range(patch):
+            covariance[:, :, i] = self._cov(embedding_vectors[:, :, i], rowvar=False) + 0.01 * identity
+        self.inv_covariance = torch.linalg.inv(covariance.permute(2, 0, 1))
+        return [self.mean, self.inv_covariance]
+
+    def fit(self, embedding: Tensor) -> List[Tensor]:
+        return self.forward(embedding)
+
+
+def mahalanobis_distance(
+    embedding: torch.Tensor,
+    mean: torch.Tensor,
+    inv_covariance: torch.Tensor,
+) -> torch.Tensor:
+    embedding = embedding.permute(1, 2, 0)
+    delta = (embedding - mean).permute(2, 0, 1)
+    distances_sq = (torch.matmul(delta, inv_covariance) * delta).sum(2)
+    return torch.sqrt(distances_sq)
+
+
+def fit_global_gaussian(representative: torch.Tensor, ridge: float = 0.01):
+    """representative: [N, D]. Unbiased cov when N>1; ridge on diagonal."""
+    n, d = representative.shape
+    mu = representative.mean(dim=0)
+    if n <= 1:
+        inv_cov = torch.eye(d, device=representative.device, dtype=representative.dtype) / ridge
+        return mu, inv_cov
+    centered = representative - mu
+    denom = max(n - 1, 1)
+    cov = centered.t().mm(centered) / denom
+    cov = cov + ridge * torch.eye(d, device=cov.device, dtype=cov.dtype)
+    inv_cov = torch.linalg.inv(cov)
+    return mu, inv_cov
+
+
+def mahalanobis_global(queries: torch.Tensor, mu: torch.Tensor, inv_cov: torch.Tensor) -> torch.Tensor:
+    """queries: [M, D], mu: [D], inv_cov: [D, D] -> [M]"""
+    delta = queries - mu
+    m = (delta @ inv_cov) * delta
+    return torch.sqrt(m.sum(dim=-1))
+
+
+class PseudoLabelScorer(ABC):
+    @abstractmethod
+    def fit_class(self, cls: int, features: np.ndarray) -> None:
+        """features: float32 [N, D]."""
+
+    @abstractmethod
+    def has_class(self, cls: int) -> bool:
+        ...
+
+    @abstractmethod
+    def score_patches(self, cls: int, queries: np.ndarray) -> np.ndarray:
+        """queries: [M, D] C-contiguous float -> [M] float32, larger = farther from normal bank."""
+
+
+class NNPseudoLabelScorer(PseudoLabelScorer):
+    def __init__(self, build_faiss_index_fn: Callable[[np.ndarray], Any], k_number: int):
+        self._build_faiss_index_fn = build_faiss_index_fn
+        self._k_number = int(k_number)
+        self._index_by_class: Dict[int, Any] = {}
+
+    def fit_class(self, cls: int, features: np.ndarray) -> None:
+        feats = np.asarray(features, dtype=np.float32)
+        if feats.size == 0:
+            return
+        self._index_by_class[int(cls)] = self._build_faiss_index_fn(feats)
+
+    def has_class(self, cls: int) -> bool:
+        return int(cls) in self._index_by_class
+
+    def score_patches(self, cls: int, queries: np.ndarray) -> np.ndarray:
+        idx = self._index_by_class[int(cls)]
+        q = np.ascontiguousarray(np.asarray(queries, dtype=np.float32))
+        distance, _ = idx.search(q, k=self._k_number)
+        return postprocess_faiss_distances(distance, self._k_number)
+
+
+class MahalanobisPseudoLabelScorer(PseudoLabelScorer):
+    """Per-class single Gaussian on memory bank; Mahalanobis distance per patch."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        ridge: float = 0.01,
+        fallback_ridge: float = 0.1,
+        gaussian_feature_dim: int = 128,
+    ):
+        self._device = device
+        self._ridge = float(ridge)
+        self._fallback_ridge = float(fallback_ridge)
+        self._gaussian_dim = int(gaussian_feature_dim)
+        self._mu: Dict[int, Tensor] = {}
+        self._inv_cov: Dict[int, Tensor] = {}
+        self._mapper_by_class: Dict[int, nn.Linear] = {}
+
+    def _project_if_needed(self, cls: int, t: Tensor) -> Tensor:
+        """When D is large, linearly project to gaussian_feature_dim before Gaussian fit/score."""
+        d = int(t.shape[1])
+        if self._gaussian_dim <= 0 or d <= self._gaussian_dim:
+            return t
+        c = int(cls)
+        if c not in self._mapper_by_class:
+            mapper = nn.Linear(d, self._gaussian_dim, bias=False).to(self._device)
+            self._mapper_by_class[c] = mapper
+        return self._mapper_by_class[c](t)
+
+    def fit_class(self, cls: int, features: np.ndarray) -> None:
+        feats = np.asarray(features, dtype=np.float32)
+        if feats.size == 0:
+            return
+        c = int(cls)
+        t = torch.from_numpy(feats).to(device=self._device, dtype=torch.float32)
+        t = self._project_if_needed(c, t)
+        n, d = t.shape
+        mu: Tensor
+        inv_cov: Tensor
+        if n <= 2:
+            mu, inv_cov = fit_global_gaussian(t, ridge=self._ridge)
+        else:
+            emb = t.unsqueeze(0)
+            try:
+                gaussian = MultiVariateGaussian(d, 1).to(self._device)
+                mean_b, inv_b = gaussian.fit(emb)
+                if not torch.isfinite(inv_b).all() or not torch.isfinite(mean_b).all():
+                    raise RuntimeError("non-finite gaussian stats")
+                mu = mean_b.squeeze(-1)
+                inv_cov = inv_b.squeeze(0)
+            except Exception:
+                mu, inv_cov = fit_global_gaussian(t, ridge=self._ridge)
+                if not torch.isfinite(inv_cov).all():
+                    warnings.warn(
+                        f"[MahalanobisPseudoLabelScorer] class {c}: fallback inv non-finite at ridge={self._ridge}, "
+                        f"retrying ridge={self._fallback_ridge}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    mu, inv_cov = fit_global_gaussian(t, ridge=self._fallback_ridge)
+        if not torch.isfinite(inv_cov).all():
+            warnings.warn(
+                f"[MahalanobisPseudoLabelScorer] class {c}: non-finite inv_cov, using isotropic fallback",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            d_dim = int(mu.numel())
+            inv_cov = torch.eye(d_dim, device=self._device, dtype=mu.dtype) / self._fallback_ridge
+        self._mu[c] = mu.detach()
+        self._inv_cov[c] = inv_cov.detach()
+
+    def has_class(self, cls: int) -> bool:
+        return int(cls) in self._mu
+
+    def score_patches(self, cls: int, queries: np.ndarray) -> np.ndarray:
+        c = int(cls)
+        q = torch.from_numpy(np.ascontiguousarray(np.asarray(queries, dtype=np.float32))).to(
+            device=self._device, dtype=torch.float32
+        )
+        q = self._project_if_needed(c, q)
+        dist = mahalanobis_global(q, self._mu[c], self._inv_cov[c])
+        return dist.detach().cpu().numpy().astype(np.float32)

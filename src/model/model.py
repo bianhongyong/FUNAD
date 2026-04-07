@@ -6,6 +6,7 @@ import numpy as np
 import random
 
 from src.model import model_utils
+from src.model.moeblock.transformer import FMoETransformerMLP
 from src.model.model_utils import (
         normalization,
         Downsample,
@@ -365,8 +366,60 @@ class UNetModel(nn.Module):
     
 
 
+class MoEDiscriminator(nn.Module):
+    def __init__(self, d_input, num_expert=4, top_k=2):
+        super().__init__()
+        self.moe_fc1 = FMoETransformerMLP(
+            num_expert=num_expert,
+            d_input=d_input,
+            d_hidden=1024,
+            d_output=128,
+            activation=nn.LeakyReLU(.2),
+            top_k=top_k,
+            world_size=1,
+        )
+        self.head = nn.Sequential(
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x, cls_token=None):
+        x = self.moe_fc1(x, cls_token=cls_token)
+        return self.head(x)
+
+    def get_loss(self, clear=False, reduction="mean", default=None):
+        losses = []
+        for moe_layer in (self.moe_fc1,):
+            gate = getattr(moe_layer, "gate", None)
+            if gate is not None and getattr(gate, "has_loss", False):
+                loss = gate.get_loss(clear=clear)
+                if loss is not None:
+                    losses.append(loss)
+
+        if len(losses) == 0:
+            return default
+
+        losses = torch.stack([l.view(1) for l in losses]).view(-1)
+        if reduction == "mean":
+            return losses.mean()
+        if reduction == "sum":
+            return losses.sum()
+        if reduction == "none":
+            return losses
+        raise ValueError(f"Unsupported reduction: {reduction}")
+
+
 class localnet(nn.Module):
-    def __init__(self, len_feature, feat_select=False):
+
+    def __init__(
+        self,
+        len_feature,
+        feat_select=False,
+        use_moe_discriminator=False,
+        moe_num_expert=4,
+        moe_top_k=2,
+        moe_use_cls_token=False,
+    ):
         super(localnet, self).__init__()
         
         # 论文中的 phi_adaptor(·):
@@ -378,27 +431,40 @@ class localnet(nn.Module):
 
         # 论文中的 phi_L(·):
         # patch-level anomaly probability predictor (Sigmoid 输出 [0, 1])。
-        self.discriminator = nn.Sequential(
-            nn.Linear(len_feature, 1024),
-            nn.LeakyReLU(.2),
-            nn.Linear(1024, 128),
-            nn.LeakyReLU(.2),
-            nn.Linear(128, 1),
-            nn.Sigmoid(),
-        )
+        self.use_moe_discriminator = bool(use_moe_discriminator)
+        self.moe_use_cls_token = bool(moe_use_cls_token)
+        if self.use_moe_discriminator:
+            self.discriminator = MoEDiscriminator(
+                d_input=len_feature,
+                num_expert=moe_num_expert,
+                top_k=moe_top_k,
+            )
+        else:
+            self.discriminator = nn.Sequential(
+                nn.Linear(len_feature, 1024),
+                nn.LeakyReLU(.2),
+                nn.Linear(1024, 128),
+                nn.LeakyReLU(.2),
+                nn.Linear(128, 1),
+                nn.Sigmoid(),
+            )
         
         # 可选特征选择分支（主流程默认不使用）。
         self.feat_select = feat_select
         if feat_select:
             self.conv1x1_layer = Conv1x1(in_channels=512, out_channels=1536).cuda()
 
-    def forward(self, x, synthetic_feat=None):
+    def forward(self, x, synthetic_feat=None, cls_token=None):
         # 输入 x: [B, P, C]，常见 P=784, C=1536。
         # 返回:
         # - adapted_features: 适配后 patch 特征 (用于 memory bank / 距离度量)
         # - local_score: patch 异常分数 (用于伪标签监督与推理)
         adapted_features = self.adaptor(x) 
-        local_score = self.discriminator(adapted_features)
+        if self.use_moe_discriminator:
+            gate_cls_token = cls_token if self.moe_use_cls_token else None
+            local_score = self.discriminator(adapted_features, cls_token=gate_cls_token)
+        else:
+            local_score = self.discriminator(adapted_features)
         return adapted_features, local_score.squeeze()
 
 class globalnet(nn.Module):
