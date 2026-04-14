@@ -404,6 +404,8 @@ def compute_pro(masks, amaps, num_th=200):
         return 0.0
     fpr_arr = fpr_arr[valid]
     pro_arr = pro_arr[valid]
+    if fpr_arr.size < 2:
+        return 0.0
     order = np.argsort(fpr_arr)
     fpr_arr = fpr_arr[order]
     pro_arr = pro_arr[order]
@@ -413,6 +415,24 @@ def compute_pro(masks, amaps, num_th=200):
         return 0.0
     fpr_arr = fpr_arr / fpr_max
     return float(auc(fpr_arr, pro_arr))
+
+
+def _safe_roc_auc(y_true, y_score):
+    if np.asarray(y_true).size == 0 or np.unique(y_true).size < 2:
+        return 0.0
+    try:
+        return float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        return 0.0
+
+
+def _safe_average_precision(y_true, y_score):
+    if np.asarray(y_true).size == 0 or np.unique(y_true).size < 2:
+        return 0.0
+    try:
+        return float(average_precision_score(y_true, y_score))
+    except ValueError:
+        return 0.0
 
 
 def finalize_metrics(y_true_img, y_score_img, gt_px, pr_px):
@@ -429,18 +449,12 @@ def finalize_metrics(y_true_img, y_score_img, gt_px, pr_px):
     y_true_px_flat = gt_px.ravel()
     y_score_px_flat = pr_px.ravel()
 
-    try:
-        auroc_sp = float(roc_auc_score(y_true_img, y_score_img))
-    except ValueError:
-        auroc_sp = 0.0
-    ap_sp = float(average_precision_score(y_true_img, y_score_img))
+    auroc_sp = _safe_roc_auc(y_true_img, y_score_img)
+    ap_sp = _safe_average_precision(y_true_img, y_score_img)
     f1_sp = f1_score_max(y_true_img, y_score_img)
 
-    try:
-        auroc_px = float(roc_auc_score(y_true_px_flat, y_score_px_flat))
-    except ValueError:
-        auroc_px = 0.0
-    ap_px = float(average_precision_score(y_true_px_flat, y_score_px_flat))
+    auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
+    ap_px = _safe_average_precision(y_true_px_flat, y_score_px_flat)
     f1_px = f1_score_max(y_true_px_flat, y_score_px_flat)
     aupro_px = compute_pro(gt_px, pr_px)
 
@@ -557,7 +571,22 @@ def main():
                     reference_index_by_class,
                     num_patches=num_patches,
                 )
-                _, score = localnet(residual_features, cls_token=cls_token)
+                patch_class_idx = None
+                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                    token_per_image = (
+                        int(residual_features.shape[1]) if residual_features.dim() >= 2 else 1
+                    )
+                    patch_class_idx = (
+                        class_idx_batch.to(device=residual_features.device, dtype=torch.long)
+                        .reshape(-1, 1, 1)
+                        .expand(-1, token_per_image, 1)
+                        .contiguous()
+                    )
+                _, score = localnet(
+                    residual_features,
+                    cls_token=cls_token,
+                    patch_class_idx=patch_class_idx,
+                )
                 score_np = score.detach().cpu().numpy().reshape(-1, patch_side, patch_side)
                 score_flat = score.detach().cpu().numpy().reshape(score_np.shape[0], -1)
                 image_np = images.detach().cpu().numpy()
