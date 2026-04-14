@@ -182,6 +182,11 @@ def parse_args():
         help="Whether MoE discriminator gate uses cls_token as routing input.",
     )
     parser.add_argument(
+        "--moe_hard_class_gate",
+        action="store_true",
+        help="Use fixed class->expert routing gate (expert count follows class count).",
+    )
+    parser.add_argument(
         "--moe_expert_vis_enable",
         action="store_true",
         help="Enable MoE class-to-expert routing visualization.",
@@ -1000,7 +1005,20 @@ def train_one_epoch(
         local_label = local_label.to(device, non_blocking=True)
 
         gate_cls_token = cls_token if cls_token.shape[0] == x.shape[0] else None
-        batch_feature, local_pred = localnet(x, cls_token=gate_cls_token)
+        patch_class_idx = None
+        if args.use_moe_discriminator and args.moe_hard_class_gate:
+            token_per_image = int(x.shape[1]) if x.dim() >= 2 else 1
+            patch_class_idx = (
+                class_idx_for_oto.to(device=x.device, dtype=torch.long)
+                .reshape(-1, 1, 1)
+                .expand(-1, token_per_image, 1)
+                .contiguous()
+            )
+        batch_feature, local_pred = localnet(
+            x,
+            cls_token=gate_cls_token,
+            patch_class_idx=patch_class_idx,
+        )
         origin_input_feature = x
         origin_output_feature = batch_feature
         if moe_vis_enabled:
@@ -1039,8 +1057,19 @@ def train_one_epoch(
             gaussian_cls_token = (
                 cls_token if cls_token.shape[0] == _copy.shape[0] else None
             )
+            gaussian_patch_class_idx = None
+            if args.use_moe_discriminator and args.moe_hard_class_gate:
+                token_per_image = int(_copy.shape[1]) if _copy.dim() >= 2 else 1
+                gaussian_patch_class_idx = class_idx_for_oto.to(
+                    device=_copy.device, dtype=torch.long
+                ).reshape(-1, 1, 1).expand(
+                    -1, token_per_image, 1
+                )
+                gaussian_patch_class_idx = gaussian_patch_class_idx.contiguous()
             gaussian_feature, gaussian_pred = localnet(
-                _copy, cls_token=gaussian_cls_token
+                _copy,
+                cls_token=gaussian_cls_token,
+                patch_class_idx=gaussian_patch_class_idx,
             )
             pred_for_loss = gaussian_pred
             
@@ -1207,6 +1236,9 @@ def main():
 
     class_names = get_all_class_names(args.dataset)
     args.class_names = class_names
+    num_classes_runtime = len(class_names)
+    if args.use_moe_discriminator and args.moe_hard_class_gate and args.beta:
+        raise ValueError("Hard class gate does not support --beta. Please disable beta.")
     train_dataset = MultiClassFeatureDataset(
         data_path=args.data_path,
         dataset_name=args.dataset,
@@ -1236,7 +1268,7 @@ def main():
     remove_reference_samples_from_dataset(train_dataset, reference_indices_by_class)
     print(f"train samples after removing references: {len(train_dataset)}")
 
-    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
+    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=1,persistent_workers=False)
     local_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -1253,12 +1285,17 @@ def main():
     )
     feature_dim = infer_feature_dim(feature_extractor, mini_loader, args)
 
+    moe_num_expert_runtime = (
+        num_classes_runtime if args.moe_hard_class_gate else int(args.moe_num_expert)
+    )
+    moe_top_k_runtime = 1 if args.moe_hard_class_gate else int(args.moe_top_k)
     localnet = model.localnet(
         len_feature=feature_dim,
         use_moe_discriminator=args.use_moe_discriminator,
-        moe_num_expert=args.moe_num_expert,
-        moe_top_k=args.moe_top_k,
+        moe_num_expert=moe_num_expert_runtime,
+        moe_top_k=moe_top_k_runtime,
         moe_use_cls_token=args.moe_use_cls_token,
+        moe_hard_class_gate=args.moe_hard_class_gate,
     ).to(device)
     if args.use_moe_discriminator:
         discriminator = getattr(localnet, "discriminator", None)
@@ -1287,7 +1324,7 @@ def main():
         "save_interval": max(1, int(args.moe_expert_vis_interval)),
         "save_dir": os.path.join(saved_dir, args.moe_expert_vis_dirname, run_name),
         "class_names": class_names,
-        "num_expert": int(args.moe_num_expert),
+        "num_expert": int(moe_num_expert_runtime),
     }
     if moe_expert_vis_ctx["enabled"] and args.use_moe_discriminator:
         os.makedirs(moe_expert_vis_ctx["save_dir"], exist_ok=True)
