@@ -22,6 +22,16 @@ def _cv2_resize_dsize_from_mask(mask_i):
     return (w, h)
 
 
+def _build_patch_class_idx(class_idx: torch.Tensor, patch_features: torch.Tensor):
+    token_per_image = int(patch_features.shape[1]) if patch_features.dim() >= 2 else 1
+    return (
+        class_idx.to(device=patch_features.device, dtype=torch.long)
+        .reshape(-1, 1, 1)
+        .expand(-1, token_per_image, 1)
+        .contiguous()
+    )
+
+
 def f1_score_max(y_true, y_score):
     y_true = np.asarray(y_true).astype(np.uint8).ravel()
     y_score = np.asarray(y_score).astype(np.float32).ravel()
@@ -84,6 +94,8 @@ def compute_pro(masks, amaps, num_th=200):
         return 0.0
     fpr_arr = fpr_arr[valid]
     pro_arr = pro_arr[valid]
+    if fpr_arr.size < 2:
+        return 0.0
     order = np.argsort(fpr_arr)
     fpr_arr = fpr_arr[order]
     pro_arr = pro_arr[order]
@@ -93,6 +105,24 @@ def compute_pro(masks, amaps, num_th=200):
         return 0.0
     fpr_arr = fpr_arr / fpr_max
     return float(auc(fpr_arr, pro_arr))
+
+
+def _safe_roc_auc(y_true, y_score):
+    if np.asarray(y_true).size == 0 or np.unique(y_true).size < 2:
+        return 0.0
+    try:
+        return float(roc_auc_score(y_true, y_score))
+    except ValueError:
+        return 0.0
+
+
+def _safe_average_precision(y_true, y_score):
+    if np.asarray(y_true).size == 0 or np.unique(y_true).size < 2:
+        return 0.0
+    try:
+        return float(average_precision_score(y_true, y_score))
+    except ValueError:
+        return 0.0
 
 
 def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
@@ -109,12 +139,12 @@ def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
     y_true_px_flat = gt_px.ravel()
     y_score_px_flat = pr_px.ravel()
 
-    auroc_sp = roc_auc_score(y_true_img, y_score_img)
-    ap_sp = average_precision_score(y_true_img, y_score_img)
+    auroc_sp = _safe_roc_auc(y_true_img, y_score_img)
+    ap_sp = _safe_average_precision(y_true_img, y_score_img)
     f1_sp = f1_score_max(y_true_img, y_score_img)
 
-    auroc_px = roc_auc_score(y_true_px_flat, y_score_px_flat)
-    ap_px = average_precision_score(y_true_px_flat, y_score_px_flat)
+    auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
+    ap_px = _safe_average_precision(y_true_px_flat, y_score_px_flat)
     f1_px = f1_score_max(y_true_px_flat, y_score_px_flat)
     aupro_px = compute_pro(gt_px, pr_px)
 
@@ -188,7 +218,10 @@ def evaluate_residual_multiclass_epoch(
                 reference_memory_by_class,
                 reference_index_by_class,
             )
-            _, score = localnet(residual_features)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(class_idx_batch, residual_features)
+            _, score = localnet(residual_features, patch_class_idx=patch_class_idx)
             score = score.detach().cpu().numpy()
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
             score = score.reshape(-1, 28, 28)

@@ -76,6 +76,18 @@ def _extract_features_with_optional_cls_token(
         return features, None
 
 
+def _build_patch_class_idx(class_idx: torch.Tensor, patch_features: torch.Tensor):
+    if class_idx is None or patch_features is None:
+        return None
+    token_per_image = int(patch_features.shape[1]) if patch_features.dim() >= 2 else 1
+    return (
+        class_idx.to(device=patch_features.device, dtype=torch.long)
+        .reshape(-1, 1, 1)
+        .expand(-1, token_per_image, 1)
+        .contiguous()
+    )
+
+
 def _plot_distance_distribution_normal_vs_anomaly(
     args, distance_values, gt_patch_masks, epoch=None
 ):
@@ -521,7 +533,12 @@ def precompute_pseudo_labels_multiclass(
             image_features, cls_token = _extract_features_with_optional_cls_token(
                 extract_feature_batch_fn, images, feature_extractor, args
             )
-            features, score = localnet(image_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, image_features)
+            features, score = localnet(
+                image_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             if features.shape[0] > args.batch_size:
                 features = features.unsqueeze(0)
 
@@ -641,7 +658,12 @@ def precompute_pseudo_labels_multiclass(
             image_features, cls_token = _extract_features_with_optional_cls_token(
                 extract_feature_batch_fn, images, feature_extractor, args
             )
-            features, _ = localnet(image_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, image_features)
+            features, _ = localnet(
+                image_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             features_np = features.detach().cpu().numpy()
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
 
@@ -735,7 +757,12 @@ def precompute_pseudo_labels_multiclass(
             image_features, cls_token = _extract_features_with_optional_cls_token(
                 extract_feature_batch_fn, images, feature_extractor, args
             )
-            features, _ = localnet(image_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, image_features)
+            features, _ = localnet(
+                image_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             features_np = features.detach().cpu().numpy()
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
             batch_size = int(batch_class_np.shape[0])
@@ -881,7 +908,12 @@ def precompute_pseudo_labels_multiclass_residual(
                 reference_memory_by_class,
                 reference_index_by_class,
             )
-            features, score = localnet(residual_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
+            features, score = localnet(
+                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             if features.shape[0] > args.batch_size:
                 features = features.unsqueeze(0)
 
@@ -1001,7 +1033,12 @@ def precompute_pseudo_labels_multiclass_residual(
                 reference_memory_by_class,
                 reference_index_by_class,
             )
-            features, _ = localnet(residual_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
+            features, _ = localnet(
+                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             features_np = features.detach().cpu().numpy()
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
 
@@ -1100,7 +1137,12 @@ def precompute_pseudo_labels_multiclass_residual(
                 reference_memory_by_class,
                 reference_index_by_class,
             )
-            features, _ = localnet(residual_features, cls_token=cls_token)
+            patch_class_idx = None
+            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
+            features, _ = localnet(
+                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+            )
             features_np = features.detach().cpu().numpy()
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
             batch_size = int(batch_class_np.shape[0])

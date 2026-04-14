@@ -7,6 +7,7 @@ import random
 
 from src.model import model_utils
 from src.model.moeblock.transformer import FMoETransformerMLP
+from src.model.moeblock.gates import ClassHardGate
 from src.model.model_utils import (
         normalization,
         Downsample,
@@ -440,16 +441,22 @@ class MoEStack(nn.Module):
 
 
 class MoEDiscriminator(nn.Module):
-    def __init__(self, d_input, num_expert=4, top_k=2):
+    def __init__(self, d_input, num_expert=4, top_k=2, hard_class_routing=False):
         super().__init__()
+        self.hard_class_routing = bool(hard_class_routing)
+        moe_kwargs = {}
+        effective_top_k = 1 if self.hard_class_routing else top_k
+        if self.hard_class_routing:
+            moe_kwargs["gate"] = ClassHardGate
         self.moe_layer = FMoETransformerMLP(
             num_expert=num_expert,
             d_input=d_input,
             d_hidden=d_input * 2,
             d_output=1,
             activation=nn.LeakyReLU(.2),
-            top_k=top_k,
+            top_k=effective_top_k,
             world_size=1,
+            **moe_kwargs,
         )
         self.out_activation = nn.Sigmoid()
 
@@ -463,11 +470,18 @@ class MoEDiscriminator(nn.Module):
             return None
         return top_k_idx, gate_score
 
-    def forward(self, x, cls_token=None):
-        x = self.moe_layer(x, cls_token=cls_token)
+    def forward(self, x, cls_token=None, patch_class_idx=None):
+        gate_input = cls_token
+        if self.hard_class_routing:
+            if patch_class_idx is None:
+                raise ValueError("patch_class_idx is required when hard_class_routing is enabled.")
+            gate_input = patch_class_idx.to(dtype=torch.long, device=x.device).contiguous()
+        x = self.moe_layer(x, cls_token=gate_input)
         return self.out_activation(x)
 
     def get_loss(self, clear=False, reduction="mean", default=None):
+        if self.hard_class_routing:
+            return default
         gate = getattr(self.moe_layer, "gate", None)
         if gate is None or not getattr(gate, "has_loss", False):
             return default
@@ -491,6 +505,7 @@ class localnet(nn.Module):
         moe_num_expert=4,
         moe_top_k=2,
         moe_use_cls_token=False,
+        moe_hard_class_gate=False,
     ):
         super(localnet, self).__init__()
         
@@ -505,11 +520,13 @@ class localnet(nn.Module):
         # patch-level anomaly probability predictor (Sigmoid 输出 [0, 1])。
         self.use_moe_discriminator = bool(use_moe_discriminator)
         self.moe_use_cls_token = bool(moe_use_cls_token)
+        self.moe_hard_class_gate = bool(moe_hard_class_gate)
         if self.use_moe_discriminator:
             self.discriminator = MoEDiscriminator(
                 d_input=len_feature,
                 num_expert=moe_num_expert,
                 top_k=moe_top_k,
+                hard_class_routing=self.moe_hard_class_gate,
             )
         else:
             self.discriminator = nn.Sequential(
@@ -526,15 +543,20 @@ class localnet(nn.Module):
         if feat_select:
             self.conv1x1_layer = Conv1x1(in_channels=512, out_channels=1536).cuda()
 
-    def forward(self, x, synthetic_feat=None, cls_token=None):
+    def forward(self, x, synthetic_feat=None, cls_token=None, patch_class_idx=None):
         # 输入 x: [B, P, C]，常见 P=784, C=1536。
         # 返回:
         # - adapted_features: 适配后 patch 特征 (用于 memory bank / 距离度量)
         # - local_score: patch 异常分数 (用于伪标签监督与推理)
         adapted_features = self.adaptor(x) 
         if self.use_moe_discriminator:
-            gate_cls_token = cls_token if self.moe_use_cls_token else None
-            local_score = self.discriminator(adapted_features, cls_token=gate_cls_token)
+            gate_cls_token = cls_token if (self.moe_use_cls_token and not self.moe_hard_class_gate) else None
+            route_patch_class = patch_class_idx if self.moe_hard_class_gate else None
+            local_score = self.discriminator(
+                adapted_features,
+                cls_token=gate_cls_token,
+                patch_class_idx=route_patch_class,
+            )
         else:
             local_score = self.discriminator(adapted_features)
         return adapted_features, local_score.squeeze()
