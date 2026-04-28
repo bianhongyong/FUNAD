@@ -1,4 +1,3 @@
-import argparse
 import datetime
 import os
 import random
@@ -32,7 +31,6 @@ from utils import evaluate as eval_utils
 from utils.loss import (
     build_adaptive_threshold_map,
     compute_balanced_bce_loss,
-    compute_origin_regularizer,
     compute_oto_loss_multiclass,
 )
 from src.model import model
@@ -45,6 +43,7 @@ from utils.print import (
     print_selected_score_distribution_by_class,
 )
 import utils.train_utils as common_utils
+from src.train.args_multiclass_residual_dinov3 import parse_args
 
 warnings.filterwarnings("ignore")
 
@@ -65,10 +64,6 @@ _FAISS_GPU_RESOURCES = None
 _FAISS_USE_CPU_INDEX = False
 _FAISS_GPU_TEMP_MEM_MB = 256
 _LOG_STREAM_HOLDER = []
-
-
-def str2bool(value):
-    return common_utils.str2bool(value)
 
 
 class _TeeStream:
@@ -97,6 +92,7 @@ def _enable_print_logging(log_path: str):
     print(f"[log] mirrored stdout/stderr to: {log_path}")
 
 
+<<<<<<< HEAD
 def parse_args():
     parser = argparse.ArgumentParser("self-train_ad_multiclass")
     parser.add_argument(
@@ -299,8 +295,15 @@ def parse_args():
         default="",
         help="Path to a training checkpoint (.pt) saved by this script; empty means start from scratch.",
     )
+=======
+def _print_args(args):
+    print("[args] ----")
+    for key in sorted(vars(args)):
+        print(f"[args] {key}: {getattr(args, key)}")
+    print("[args] ----")
 
-    return parser.parse_args()
+>>>>>>> a7a1007 ([chore]: 添加.gitignore文件)
+
 
 
 def fix_seed(number):
@@ -815,32 +818,6 @@ def _update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k):
     return common_utils.update_topk_features(top_feat, top_dist, cand_feat, cand_dist, k)
 
 
-def _sample_beta_anomaly(confident_feature_bank, dim):
-    if confident_feature_bank is None or confident_feature_bank.shape[0] < 2:
-        return None, None
-
-    pool = confident_feature_bank
-    pool_size = pool.shape[0]
-
-    first_indices = torch.randint(low=0, high=pool_size, size=(784,))
-    second_indices = torch.randint(low=0, high=pool_size, size=(784,))
-    same_positions = first_indices == second_indices
-    while same_positions.any():
-        second_indices[same_positions] = torch.randint(
-            low=0, high=pool_size, size=(int(same_positions.sum().item()),)
-        )
-        same_positions = first_indices == second_indices
-
-    first_vector = pool[first_indices]
-    second_vector = pool[second_indices]
-
-    mix_ratio = random.random()
-    syn_anomaly = mix_ratio * first_vector + (1 - mix_ratio) * second_vector
-    syn_anomaly = syn_anomaly.reshape(1, 784, dim)
-    syn_class = torch.tensor([0], dtype=torch.long)
-    return syn_anomaly, syn_class
-
-
 def train_one_epoch(
     args,
     epoch,
@@ -864,7 +841,6 @@ def train_one_epoch(
     local_loss = 0
     oto_loss = 0
     bce_loss = 0
-    origin_loss = 0
     gate_aux_loss = 0
     memory_bank_time = 0.0
     pseudo_label_time = 0.0
@@ -936,17 +912,9 @@ def train_one_epoch(
         distance = np.zeros((batch, 784), dtype=np.float32)
         if threshold <= 1:
             distance = distance_map[sample_idx]
-        threshold_map = np.full_like(distance, fill_value=threshold, dtype=np.float32)
-        if (threshold <= 1) and args.use_class_adaptive_threshold:
-            threshold_map = build_adaptive_threshold_map(
-                distance=distance,
-                class_idx_np=class_idx_np,
-                default_threshold=threshold,
-                quantile=args.adaptive_threshold_quantile,
-            )
         _copy = None
         if (threshold <= 1) and args.gaussian:
-            uncertain_mask = (distance > threshold_map) & (distance < args.noise_threshold)
+            uncertain_mask = (distance > threshold) & (distance < args.noise_threshold)
             uncertain_mask = uncertain_mask.reshape(-1)
             x_std = x.detach().std(dim=0).max(dim=0)[0]
             _copy = x.detach().clone().reshape(-1, dim)
@@ -966,34 +934,12 @@ def train_one_epoch(
 
         pseudo_label_assign_start = time.perf_counter()
         class_idx_for_oto = class_idx
-        if args.beta:
-            local_label = torch.zeros((args.batch_size + 1, 784))
-            distance_bin = np.zeros_like(distance)
-            if args.threshold <= 1:
-                distance_bin[distance > threshold_map] = 1
-            local_label[:-1] = torch.as_tensor(distance_bin, dtype=torch.float32)
-
-            syn_anomaly, syn_class = _sample_beta_anomaly(
-                confident_feature_bank=confident_feature_bank,
-                dim=dim,
+        local_label = torch.zeros((args.batch_size, 784))
+        if args.threshold <= 1:
+            distance_mask = torch.as_tensor(
+                distance > threshold, dtype=torch.bool
             )
-
-            if syn_anomaly is not None:
-                local_label[-1] = 1
-                if (args.threshold <= 1) and args.gaussian:
-                    _copy = torch.cat([_copy, syn_anomaly], dim=0)
-                else:
-                    x = torch.cat([x, syn_anomaly.to(device, non_blocking=True)], dim=0)
-                    class_idx_for_oto = torch.cat([class_idx_for_oto, syn_class.to(device, non_blocking=True)], dim=0)
-            else:
-                local_label = local_label[:-1]
-        else:
-            local_label = torch.zeros((args.batch_size, 784))
-            if args.threshold <= 1:
-                distance_mask = torch.as_tensor(
-                    distance > threshold_map, dtype=torch.bool
-                )
-                local_label[distance_mask] = 1
+            local_label[distance_mask] = 1
         pseudo_label_time += time.perf_counter() - pseudo_label_assign_start
 
         localnet.train()
@@ -1019,8 +965,6 @@ def train_one_epoch(
             cls_token=gate_cls_token,
             patch_class_idx=patch_class_idx,
         )
-        origin_input_feature = x
-        origin_output_feature = batch_feature
         if moe_vis_enabled:
             discriminator = getattr(localnet, "discriminator", None)
             get_stats = getattr(discriminator, "get_latest_gate_stats", None)
@@ -1109,33 +1053,6 @@ def train_one_epoch(
         else:
             _l_loss = torch.tensor(0.0, device=local_pred.device)
 
-        if args.use_origin_regularizer:
-            # Use only high-confidence extremes; overlap region is ignored.
-            normal_mask_np = distance < threshold
-            anomaly_mask_np = distance > args.noise_threshold
-            normal_mask_t = torch.as_tensor(
-                normal_mask_np.reshape(-1),
-                dtype=torch.bool,
-                device=origin_output_feature.device,
-            )
-            anomaly_mask_t = torch.as_tensor(
-                anomaly_mask_np.reshape(-1),
-                dtype=torch.bool,
-                device=origin_output_feature.device,
-            )
-            # Ignore synthetic sample if beta branch appends one sample.
-            origin_input_main = origin_input_feature[:batch]
-            origin_output_main = origin_output_feature[:batch]
-            _origin_loss = compute_origin_regularizer(
-                args=args,
-                input_feature=origin_input_main,
-                output_feature=origin_output_main,
-                normal_mask=normal_mask_t,
-                anomaly_mask=anomaly_mask_t,
-            )
-        else:
-            _origin_loss = torch.tensor(0.0, device=local_pred.device)
-
         if args.use_moe_discriminator:
             discriminator = getattr(localnet, "discriminator", None)
             if discriminator is not None and hasattr(discriminator, "get_loss"):
@@ -1150,7 +1067,6 @@ def train_one_epoch(
             _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
 
         _local_loss = _loss if args.alternative else (_loss + args.weight * _l_loss)
-        _local_loss = _local_loss + _origin_loss
         if args.use_moe_discriminator:
             _local_loss = _local_loss + args.gate_aux_weight * _gate_aux_loss
 
@@ -1164,7 +1080,6 @@ def train_one_epoch(
         local_loss += _local_loss / total_batch
         bce_loss += _loss / total_batch
         oto_loss += _l_loss / total_batch
-        origin_loss += _origin_loss / total_batch
         gate_aux_loss += _gate_aux_loss / total_batch
         iteration += 1
 
@@ -1183,9 +1098,6 @@ def train_one_epoch(
     )
     bce_loss_value = bce_loss.item() if torch.is_tensor(bce_loss) else float(bce_loss)
     oto_loss_value = oto_loss.item() if torch.is_tensor(oto_loss) else float(oto_loss)
-    origin_loss_value = (
-        origin_loss.item() if torch.is_tensor(origin_loss) else float(origin_loss)
-    )
     gate_aux_loss_value = (
         gate_aux_loss.item() if torch.is_tensor(gate_aux_loss) else float(gate_aux_loss)
     )
@@ -1204,7 +1116,6 @@ def train_one_epoch(
         local_loss_value,
         bce_loss_value,
         oto_loss_value,
-        origin_loss_value,
         gate_aux_loss_value,
         iteration,
         memory_bank_time,
@@ -1221,7 +1132,7 @@ def train_one_epoch(
 
 def main():
     torch.autograd.set_detect_anomaly(True)
-    args = parse_args()
+    args = parse_args(_FEATURE_MODEL_CHOICES)
     global _FAISS_USE_CPU_INDEX, _FAISS_GPU_TEMP_MEM_MB
     _FAISS_USE_CPU_INDEX = bool(args.faiss_cpu_index)
     _FAISS_GPU_TEMP_MEM_MB = int(args.faiss_gpu_temp_mem_mb)
@@ -1230,6 +1141,7 @@ def main():
     saved_dir = os.path.join(args.save_path, args.dataset, args.noise)
     os.makedirs(saved_dir, exist_ok=True)
     _enable_print_logging(os.path.join(saved_dir, "run_stdout.log"))
+    _print_args(args)
 
     if args.synthetic:
         raise ValueError("当前多类脚本暂不支持 --synthetic。")
@@ -1237,8 +1149,6 @@ def main():
     class_names = get_all_class_names(args.dataset)
     args.class_names = class_names
     num_classes_runtime = len(class_names)
-    if args.use_moe_discriminator and args.moe_hard_class_gate and args.beta:
-        raise ValueError("Hard class gate does not support --beta. Please disable beta.")
     train_dataset = MultiClassFeatureDataset(
         data_path=args.data_path,
         dataset_name=args.dataset,
@@ -1363,7 +1273,6 @@ def main():
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
-            origin_loss_value,
             gate_aux_loss_value,
             iteration,
             memory_bank_time,
@@ -1398,7 +1307,6 @@ def main():
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
-            origin_loss=origin_loss_value,
             gate_aux_loss=gate_aux_loss_value,
         )
         print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)

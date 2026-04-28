@@ -140,6 +140,6 @@ class NoisyGate(BaseGate):
         self.set_loss(loss)
 
         return (
-            top_k_indices.contiguous().view(-1),
+            top_k_indices.contiguous(),
             top_k_gates.contiguous().unsqueeze(1),
         )

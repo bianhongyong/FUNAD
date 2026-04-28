@@ -130,9 +130,6 @@ flowchart TB
 - 取第 1 近邻距离（若 `k=2` 且自匹配则退避到第 2 近邻），reshape 为 `[B, 784]`，写入 `distance_map[sample_idx]`。
 - 全局 min-max 归一化到约 `[0,1]`，得到训练时用的 **不确定度 / 伪标签阈值** 依据。
 
-可选 **`--beta`**：从高 anomaly score 的样本 patch 里维护全局 top-k 特征，得到 `confident_feature_bank`，用于合成异常（与参考库无关）。
-
----
 
 ## 6. 训练步内与参考库的交互
 
@@ -150,13 +147,6 @@ flowchart TB
 - **残差**：`residual_noisy = adapted_noisy − nearest_clean`，其中 **`nearest_clean` 与不加噪前向完全相同**（同一 patch 的 1-NN 向量）。
 - BCE 的 `pred_for_loss` 用 `discriminator(residual_noisy)`；OTO 等仍常用 **仅真实 B 张图** 的干净 `batch_feature` / `local_pred`（避免合成行污染类约束）。
 
-### 6.3 Beta 合成行
-
-- 合成向量来自 **伪标签 memory bank** 的凸组合，已是 **adapter 空间**。
-- **不得**再过 `adaptor`。
-- 与主 batch 拼接时：`subtract_nearest` 对整批算 `nearest`；高斯分支里对合成行单独有 `nearest_syn`，与主 batch 的 `nearest_clean` **concat** 后再减。
-
----
 
 ## 7. 迁移到其他代码时的检查清单
 

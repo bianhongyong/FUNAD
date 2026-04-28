@@ -74,12 +74,8 @@
 - `--llambda` (float, 默认: `1`)  
   兼容保留参数（当前主流程中几乎不直接影响关键逻辑）。
 
-## 5) Beta 合成异常与高斯扰动
+## 5) 高斯扰动
 
-- `--beta` (flag, 默认: 关闭)  
-  开启后启用 beta 方式的合成异常样本。
-- `--beta_number` (int, 默认: `15`)  
-  用于构建高置信异常池的上限大小（top-k）。
 - `--gaussian` (flag, `store_false`)  
   注意：默认是 `True`，传入该参数后变为 `False`（关闭高斯扰动分支）。
 - `--std` (float, 默认: `None`)  
