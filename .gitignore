@@ -1,0 +1,3 @@
+/shell/*
+__pycache__/
+*.py[cod]
