@@ -37,8 +37,8 @@
   伪标签二值化阈值（distance 大于该值视作异常 patch）。
 - `--noise_threshold` / `-n` (float, 默认: `0.9`)  
   高斯扰动使用的不确定区间上界。
-- `--random` / `-r` (float, 默认: `0.1`)  
-  memory bank 构建时，从低分样本中再随机保留的比例。
+- `--memory_bank_score_quantile` (float, 默认: `0.1`)  
+  memory bank 构建时，每类（或 legacy 特征路径下全局）按归一化图像分数取最低的该比例图像作为候选（`ceil(n * q)` 张，至少 1 张）。
 - `--bank_sample_ratio` (float, 默认: `0.1`, 可选: `0.05`/`0.1`)  
   precompute 前的全局抽样比例。
 - `--max_bank_images` (int, 默认: `128`)  
@@ -81,27 +81,16 @@
 - `--std` (float, 默认: `None`)  
   高斯噪声标准差；`None` 时按 batch 统计量自适应。
 
-## 6) 特征提取与主干
+## 6) 特征提取与主干（DINOv3）
 
-- `--feature_model` (str, 默认: `dino`, 可选: `dino`/`clip`)  
-  图像特征主干。
+- `--feature_model` (str, 默认: `dinov3_vitb16`)  
+  DINOv3 变体，对应 `torch.hub` 入口名；可选值见脚本内 `DINOV3_FEATURE_MODEL_REGISTRY`（如 `dinov3_vits16`、`dinov3_vitl16` 等）。  
+  表中每项含 `hub_entry`（传给 `torch.hub.load` 的模型名）与可选的 `hub_repo_dir`（本地 hub 目录；为 `None` 时不写死路径）。
+- 本地 hub 目录解析顺序：`hub_repo_dir`（若该项在注册表中配置了有效路径）→ 环境变量 `DINOV3_HUB_DIR` → `torch.hub.get_dir()/facebookresearch_dinov3_main` → `~/.cache/torch/hub/facebookresearch_dinov3_main`；均无效时从 GitHub `facebookresearch/dinov3` 加载。
 - `--use_cls_token` (bool, 默认: `True`)  
   是否拼接 CLS token 到 patch token。
-
-### CLIP/AnomalyCLIP 相关
-
-- `--clip_model_name` (str, 默认: `ViT-L/14@336px`)  
-  CLIP backbone 名称。
-- `--features_list` (int list, 默认: `[6,12,18,24]`)  
-  使用的层索引。
-- `--dpam_layer` (int, 默认: `24`)  
-  DPAM 层设置。
-- `--depth` (int, 默认: `9`)  
-  文本提示学习深度。
-- `--n_ctx` (int, 默认: `12`)  
-  Prompt 长度。
-- `--t_n_ctx` (int, 默认: `4`)  
-  文本上下文长度。
+- `--dino_layer_indices` (int list, 默认: `[22,23,24,25,26,27,28]`)  
+  按论文层编号（1-based）选择多层 ViT block 输出 token 并做均值聚合（Middle-7 Mean Pool）；层数不足时会自动回退到可用的中间层。
 
 ## 7) FAISS 与性能/显存
 

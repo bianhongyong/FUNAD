@@ -15,8 +15,8 @@ export MPLBACKEND=Agg
 DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
 SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_moe_discriminator_cls_token_1_0504"
 DATASET="mvtec"         # mvtec | visa
-NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
-EPOCH=200
+NOISE="20%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
+EPOCH=220
 BATCH_SIZE=16
 LR=2e-5
 SEED=0
@@ -32,11 +32,9 @@ FEATURE_MODEL="dinov3_vitb16"   # 见 self_train_ad_multiclass_residual_dinov3.p
 # EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_ev 0.99)
 # - Or set fixed PCA dimension instead of explained variance:
 # EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_dim 128)
-EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85 --memory_bank_score_quantile 0.2
-      --use_moe_discriminator --gate_aux_weight 0.5 --moe_top_k 2 --moe_use_cls_token
+EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85
+      --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.05 --moe_top_k 4
       --eval_interval 5 --greedy_keep_images 2 
-      #--resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_moe_discriminator_hard_gate/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
-      --moe_expert_vis_enable
 ) 
 
 python self_train_ad_multiclass_residual_dinov3.py \

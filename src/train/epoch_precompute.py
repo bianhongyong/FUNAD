@@ -48,6 +48,20 @@ def _minmax_normalize(values: np.ndarray) -> np.ndarray:
     return (values - vmin) / (vmax - vmin)
 
 
+def _indices_lowest_score_quantile(scores: np.ndarray, quantile: float) -> np.ndarray:
+    """Indices into ``scores`` (0..n-1) for the lowest ceil(n * quantile) scores (at least one)."""
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    n = int(scores.shape[0])
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    q = float(quantile)
+    q = min(max(q, 1e-6), 1.0)
+    k = max(1, int(np.ceil(n * q)))
+    k = min(k, n)
+    order = np.argsort(scores, kind="mergesort")
+    return order[:k].astype(np.int64)
+
+
 def _normalize_distance_map_per_class(
     distance_map: np.ndarray, class_stack: np.ndarray, num_classes: int, args
 ) -> np.ndarray:
@@ -441,15 +455,8 @@ def precompute_pseudo_labels_feature(
 
     normalized_score = _minmax_normalize(score_stack)
 
-    normal_indices = np.where(normalized_score < 0.5)[0]
-    if args.random < 1:
-        sample_num = int(normal_indices.shape[0] * args.random)
-        selected_normal_indices = np.random.choice(
-            normal_indices, size=sample_num, replace=False
-        )
-    else:
-        selected_normal_indices = normal_indices
-
+    q = float(getattr(args, "memory_bank_score_quantile", 0.1))
+    selected_normal_indices = _indices_lowest_score_quantile(normalized_score, q)
     selected_normal_indices = np.asarray(selected_normal_indices, dtype=np.int64)
 
     normal_features = []
@@ -465,7 +472,9 @@ def precompute_pseudo_labels_feature(
                 normal_features.append(features[keep_mask].reshape(-1, dim))
 
     if len(normal_features) == 0:
-        raise RuntimeError("构建 memory bank 时未选中任何 normal 特征，请检查 threshold/random。")
+        raise RuntimeError(
+            "构建 memory bank 时未选中任何 normal 特征，请检查 memory_bank_score_quantile 与分数归一化。"
+        )
 
     normal_features = np.concatenate(normal_features, axis=0)
 
@@ -621,17 +630,9 @@ def precompute_pseudo_labels_multiclass(
         cls_indices = np.where(cls_mask)[0].astype(np.int64)
         cls_norm_scores = normalized_score[cls_indices]
 
-        cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
-        if cls_normal_local.shape[0] == 0:
-            cls_selected = cls_indices
-        elif args.random < 1:
-            cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
-            pick_local = np.random.choice(
-                cls_normal_local, size=cls_sample_num, replace=False
-            )
-            cls_selected = cls_indices[pick_local]
-        else:
-            cls_selected = cls_indices[cls_normal_local]
+        q = float(getattr(args, "memory_bank_score_quantile", 0.1))
+        cls_normal_local = _indices_lowest_score_quantile(cls_norm_scores, q)
+        cls_selected = cls_indices[cls_normal_local]
         selected_local_list.append(cls_selected)
 
     if len(selected_local_list) == 0:
@@ -1066,17 +1067,9 @@ def precompute_pseudo_labels_multiclass_residual(
         cls_indices = np.where(cls_mask)[0].astype(np.int64)
         cls_norm_scores = normalized_score[cls_indices]
 
-        cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
-        if cls_normal_local.shape[0] == 0:
-            cls_selected = cls_indices
-        elif args.random < 1:
-            cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
-            pick_local = np.random.choice(
-                cls_normal_local, size=cls_sample_num, replace=False
-            )
-            cls_selected = cls_indices[pick_local]
-        else:
-            cls_selected = cls_indices[cls_normal_local]
+        q = float(getattr(args, "memory_bank_score_quantile", 0.1))
+        cls_normal_local = _indices_lowest_score_quantile(cls_norm_scores, q)
+        cls_selected = cls_indices[cls_normal_local]
         selected_local_list.append(cls_selected)
 
     if len(selected_local_list) == 0:

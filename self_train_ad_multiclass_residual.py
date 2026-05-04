@@ -108,7 +108,13 @@ def parse_args():
     parser.add_argument("-l", "--lr", type=float, default=2e-5)
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("-b", "--batch_size", type=int, default=16)
-    parser.add_argument("-r", "--random", type=float, default=0.15)
+    parser.add_argument(
+        "--memory_bank_score_quantile",
+        type=float,
+        default=0.1,
+        help="Per-class (multiclass) or global (legacy feature precompute): fraction of images "
+        "with lowest normalized image-level scores used as memory-bank normal candidates.",
+    )
     parser.add_argument("-t", "--threshold", type=float, default=0.5)
     parser.add_argument("-n", "--noise_threshold", type=float, default=0.995)
     parser.add_argument(
