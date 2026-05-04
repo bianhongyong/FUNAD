@@ -25,7 +25,6 @@ from scipy.ndimage import gaussian_filter
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
-import AnomalyCLIP_lib
 from dataset import dataset_extract, multiclass_feature_dataset
 from src.train.epoch_precompute import precompute_pseudo_labels_multiclass_residual
 from utils import evaluate as eval_utils
@@ -56,8 +55,21 @@ except (AttributeError, RuntimeError):
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# --feature_model 与 torch.hub 入口名、本地 hub 目录的映射。
+# hub_repo_dir 为 None 时表示不在表中写死路径，改由环境变量 DINOV3_HUB_DIR（若设置）
+# 或默认 <torch.hub.get_dir()>/facebookresearch_dinov3_main 解析；若仍不可用则回退从 GitHub 拉取。
+DINOV3_FEATURE_MODEL_REGISTRY = {
+    "dinov3_vits16": {"hub_entry": "dinov3_vits16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vits16plus": {"hub_entry": "dinov3_vits16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitb16": {"hub_entry": "dinov3_vitb16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitl16": {"hub_entry": "dinov3_vitl16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitl16plus": {"hub_entry": "dinov3_vitl16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vith16plus": {"hub_entry": "dinov3_vith16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vit7b16": {"hub_entry": "dinov3_vit7b16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+}
+
+_FEATURE_MODEL_CHOICES = tuple(DINOV3_FEATURE_MODEL_REGISTRY.keys())
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -205,13 +217,20 @@ def parse_args():
         help="Image-level score uses mean of top-k patch scores, k=ceil(num_patches*ratio).",
     )
     parser.add_argument("--use_cls_token", type=str2bool, default="False")
-    parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
-    parser.add_argument("--clip_model_name", type=str, default="ViT-L/14@336px")
-    parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24])
-    parser.add_argument("--dpam_layer", type=int, default=24)
-    parser.add_argument("--depth", type=int, default=9)
-    parser.add_argument("--n_ctx", type=int, default=12)
-    parser.add_argument("--t_n_ctx", type=int, default=4)
+    parser.add_argument(
+        "--feature_model",
+        type=str,
+        choices=_FEATURE_MODEL_CHOICES,
+        default="dinov3_vitb16",
+        help="DINOv3 variant (torch.hub entry); see DINOV3_FEATURE_MODEL_REGISTRY for hub_entry / hub_repo_dir.",
+    )
+    parser.add_argument(
+        "--dino_layer_indices",
+        type=int,
+        nargs="+",
+        default=[22, 23, 24, 25, 26, 27, 28],
+        help="DINOv3 layer ids (1-based, as in paper) to aggregate by mean pooling.",
+    )
     parser.add_argument(
         "--pseudo_label_scoring",
         type=str,
@@ -397,33 +416,37 @@ def find_matching(id_array):
     return common_utils.find_matching(id_array)
 
 
-def _convert_imagenet_norm_to_clip_norm(input_tensor):
-    mean_imagenet = torch.tensor(IMAGENET_MEAN, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    std_imagenet = torch.tensor(IMAGENET_STD, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    mean_clip = torch.tensor(CLIP_MEAN, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    std_clip = torch.tensor(CLIP_STD, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
+def _is_valid_local_torch_hub_dir(path: str) -> bool:
+    return bool(path) and os.path.isdir(path) and os.path.isfile(os.path.join(path, "hubconf.py"))
 
-    rgb_01 = input_tensor * std_imagenet + mean_imagenet
-    rgb_01 = torch.clamp(rgb_01, 0.0, 1.0)
-    clip_tensor = (rgb_01 - mean_clip) / std_clip
-    return clip_tensor
+
+def _resolve_dinov3_local_hub_dir(feature_model: str):
+    if feature_model not in DINOV3_FEATURE_MODEL_REGISTRY:
+        raise KeyError(f"Unknown feature_model={feature_model!r}")
+    entry = DINOV3_FEATURE_MODEL_REGISTRY[feature_model]
+    explicit = entry.get("hub_repo_dir")
+    if explicit:
+        p = os.path.expanduser(str(explicit))
+        if _is_valid_local_torch_hub_dir(p):
+            return p
+    env_dir = os.environ.get("DINOV3_HUB_DIR")
+    if env_dir:
+        p = os.path.expanduser(env_dir)
+        if _is_valid_local_torch_hub_dir(p):
+            return p
+    default_dir = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov3_main")
+    if _is_valid_local_torch_hub_dir(default_dir):
+        return default_dir
+    legacy = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov3_main")
+    if _is_valid_local_torch_hub_dir(legacy):
+        return legacy
+    return None
 
 
 def build_feature_extractor(args):
-    if args.feature_model == "clip":
-        anomalyclip_parameters = {
-            "Prompt_length": args.n_ctx,
-            "learnabel_text_embedding_depth": args.depth,
-            "learnabel_text_embedding_length": args.t_n_ctx,
-        }
-        feature_extractor, _ = AnomalyCLIP_lib.load(
-            args.clip_model_name,
-            device=device,
-            design_details=anomalyclip_parameters,
-        )
-        feature_extractor.eval()
-        feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
-        return feature_extractor
+    entry = DINOV3_FEATURE_MODEL_REGISTRY[args.feature_model]
+    hub_entry = entry["hub_entry"]
+    repo_dir = _resolve_dinov3_local_hub_dir(args.feature_model)
 
     # DINO imports `trunc_normal_` via `from utils import ...`.
     # This project also has `utils.py`, so temporarily unshadow it.
@@ -437,14 +460,21 @@ def build_feature_extractor(args):
     if should_restore_utils:
         del sys.modules["utils"]
     try:
-        repo_dir = "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"
-        feature_extractor = torch.hub.load(
-            repo_dir,
-            "dinov3_vitb16",
-            source="local",
-            pretrained=True,
-
-)
+        if repo_dir is not None:
+            print(f"[DINOv3] load {hub_entry} from local hub: {repo_dir}")
+            feature_extractor = torch.hub.load(
+                repo_dir,
+                hub_entry,
+                source="local",
+                pretrained=True,
+            )
+        else:
+            print(f"[DINOv3] load {hub_entry} from GitHub: facebookresearch/dinov3")
+            feature_extractor = torch.hub.load(
+                "facebookresearch/dinov3",
+                hub_entry,
+                pretrained=True,
+            )
     finally:
         if should_restore_utils:
             sys.modules["utils"] = local_utils_module
@@ -454,27 +484,42 @@ def build_feature_extractor(args):
 
 
 def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
+    def _resolve_dino_block_indices():
+        # CLI uses paper-style 1-based layer ids; DINO internals use 0-based block indices.
+        num_blocks = len(getattr(feature_extractor, "blocks", []))
+        requested_layers = list(getattr(args, "dino_layer_indices", [22, 23, 24, 25, 26, 27, 28]))
+        requested_blocks = sorted({int(layer_id) - 1 for layer_id in requested_layers})
+        valid_blocks = [idx for idx in requested_blocks if 0 <= idx < num_blocks]
+        if len(valid_blocks) > 0:
+            return valid_blocks
+
+        # Fallback for shallower backbones (e.g., ViT-B/16): use middle 7 blocks if available.
+        if num_blocks <= 0:
+            return [0]
+        if num_blocks <= 7:
+            return list(range(num_blocks))
+        center = num_blocks // 2
+        start = max(0, center - 3)
+        end = min(num_blocks, start + 7)
+        start = max(0, end - 7)
+        return list(range(start, end))
+
     with torch.no_grad():
         feature_extractor.eval()
         cls_token = None
-        if args.feature_model == "clip":
-            clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
-            image_features, _, _, patch_projections = feature_extractor.encode_image(
-                clip_input,
-                args.features_list,
-                DPAM_layer=args.dpam_layer,
-            )
-            x_norm = image_features
-            x_prenorm = patch_projections[-1]
-            cls_token = x_norm
-        else:
-            # DINOv3: 默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
-            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
-                input_tensor, return_class_token=True
-            )[0]
-            x_norm = cls_tok
-            x_prenorm = patch_tokens
-            cls_token = cls_tok
+        # DINOv3: mean-pool selected middle layers (paper default: 22-28).
+        selected_blocks = _resolve_dino_block_indices()
+        selected_layers = feature_extractor.get_intermediate_layers(
+            input_tensor,
+            n=selected_blocks,
+            return_class_token=True,
+        )
+        patch_tokens_list = [layer_patch for layer_patch, _layer_cls in selected_layers]
+        cls_tokens_list = [_layer_cls for _layer_patch, _layer_cls in selected_layers]
+        x_prenorm = torch.stack(patch_tokens_list, dim=0).mean(dim=0)
+        cls_tok = torch.stack(cls_tokens_list, dim=0).mean(dim=0)
+        x_norm = cls_tok
+        cls_token = cls_tok
 
     if args.use_cls_token:
         x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)

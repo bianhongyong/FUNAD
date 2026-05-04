@@ -21,7 +21,7 @@ BATCH_SIZE=16
 LR=2e-5
 SEED=0
 NUM_WORKERS=4
-FEATURE_MODEL="dino"    # dino | clip
+FEATURE_MODEL="dinov3_vitb16"    # dino | clip
 
 # Optional switches:
 # - Uncomment to force CPU FAISS index:
