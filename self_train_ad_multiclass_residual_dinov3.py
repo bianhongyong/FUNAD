@@ -964,8 +964,9 @@ def train_one_epoch(
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
     args = parse_args(_FEATURE_MODEL_CHOICES)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
     global _FAISS_USE_CPU_INDEX, _FAISS_GPU_TEMP_MEM_MB
     _FAISS_USE_CPU_INDEX = bool(args.faiss_cpu_index)
     _FAISS_GPU_TEMP_MEM_MB = int(args.faiss_gpu_temp_mem_mb)

@@ -150,6 +150,8 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--backbone_type", type=str, default="vit")
 
+    parser.add_argument("--detect_anomaly", action="store_true",
+                        help="Enable autograd anomaly detection (slows training, use for debugging only)")
     return parser.parse_args()
 
 
@@ -748,7 +750,8 @@ def train_one_epoch(
 def main():
     # 主训练流程对应论文 Algorithm 1:
     # 1) IRMB 构建 2) patch 伪标签 3) mutual smoothness 4) 联合优化。
-    torch.autograd.set_detect_anomaly(True)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     tsne = TSNE(n_components=2, random_state=args.seed)
     backbone, resnet_channel, resnet_idx = build_backbone(args)

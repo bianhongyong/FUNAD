@@ -41,6 +41,8 @@ def add_training_args(parser):
     parser.add_argument("--beta", action="store_true")
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--alternative", action="store_true")
+    parser.add_argument("--detect_anomaly", action="store_true",
+                        help="Enable autograd anomaly detection (slows training, use for debugging only)")
 def add_threshold_args(parser):
     parser.add_argument("-t", "--threshold", type=float, default=0.5)
     parser.add_argument("-n", "--noise_threshold", type=float, default=0.995)
