@@ -234,22 +234,9 @@ def parse_args():
     parser.add_argument(
         "--pseudo_label_scoring",
         type=str,
-        choices=["nn", "mahalanobis", "blend", "pca"],
         default="nn",
-        help="Patch vs. memory-bank score: k-NN, Mahalanobis, PCA reconstruction residual, "
-        "or per-class min-max normalized blend of k-NN and Mahalanobis.",
-    )
-    parser.add_argument(
-        "--pseudo_label_blend_nn_weight",
-        type=float,
-        default=0.5,
-        help="blend mode: weight for k-NN branch (Mahalanobis weight defaults complement; both renormalized to sum to 1).",
-    )
-    parser.add_argument(
-        "--pseudo_label_blend_maha_weight",
-        type=float,
-        default=0.5,
-        help="blend mode: weight for Mahalanobis branch.",
+        help="Scorer(s) separated by '+', e.g. 'nn', 'nn+mahalanobis', 'nn+mahalanobis+pca'. "
+        "Available: nn, mahalanobis, pca.",
     )
     parser.add_argument(
         "--pseudo_label_mahalanobis_dim",
@@ -279,9 +266,9 @@ def parse_args():
     parser.add_argument(
         "--pseudo_label_distance_norm",
         type=str,
-        choices=["minmax", "robust_mad"],
+        choices=["minmax", "percentile"],
         default="minmax",
-        help="Per-class patch-distance normalization: min-max or robust median+MAD.",
+        help="Per-class patch-distance normalization: minmax or percentile (robust to outliers).",
     )
     parser.add_argument(
         "--pseudo_label_distance_norm_eps",
@@ -290,16 +277,11 @@ def parse_args():
         help="Numerical stability epsilon for patch-distance normalization.",
     )
     parser.add_argument(
-        "--pseudo_label_distance_norm_robust_scale",
+        "--pseudo_label_distance_norm_percentile",
         type=float,
-        default=1.4826,
-        help="Robust MAD scale factor used in robust_mad normalization.",
-    )
-    parser.add_argument(
-        "--pseudo_label_distance_norm_robust_clip",
-        type=float,
-        default=3.0,
-        help="Clip range for robust z-score before mapping to [0, 1].",
+        default=99.0,
+        help="Percentile threshold (0-100) for percentile normalization. "
+        "Values outside this percentile range are clipped before min-max.",
     )
     parser.add_argument(
         "--greedy_keep_images",

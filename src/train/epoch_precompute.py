@@ -14,22 +14,16 @@ from torch.utils.data import DataLoader, Subset
 from utils.memory_bank_stats import print_greedy_memory_bank_anomaly_stats
 from utils.sampler import ApproximateGreedyCoresetSampler
 
+from src.train.pseudo_label_normalizers import PseudoLabelNormalizerFactory
 from src.train.pseudo_label_scorers import (
     MahalanobisPseudoLabelScorer,
     NNPseudoLabelScorer,
     PCAPseudoLabelScorer,
     PseudoLabelScorer,
+    PseudoLabelScorerFactory,
     postprocess_faiss_distances,
 )
 
-
-def _pseudo_label_blend_weights(args) -> tuple:
-    w_nn = float(getattr(args, "pseudo_label_blend_nn_weight", 0.5))
-    w_m = float(getattr(args, "pseudo_label_blend_maha_weight", 0.5))
-    s = w_nn + w_m
-    if s <= 0.0:
-        return 0.5, 0.5
-    return w_nn / s, w_m / s
 
 
 def _as_1d_float32(x: np.ndarray) -> np.ndarray:
@@ -51,11 +45,7 @@ def _minmax_normalize(values: np.ndarray) -> np.ndarray:
 def _normalize_distance_map_per_class(
     distance_map: np.ndarray, class_stack: np.ndarray, num_classes: int, args
 ) -> np.ndarray:
-    mode = str(getattr(args, "pseudo_label_distance_norm", "minmax")).strip().lower()
-    eps = float(getattr(args, "pseudo_label_distance_norm_eps", 1e-6))
-    robust_scale = float(
-        getattr(args, "pseudo_label_distance_norm_robust_scale", 1.4826)
-    )
+    normalizer = PseudoLabelNormalizerFactory.create(args)
     values = np.asarray(distance_map, dtype=np.float32)
     normalized = np.zeros_like(values, dtype=np.float32)
     has_valid_class = False
@@ -65,30 +55,7 @@ def _normalize_distance_map_per_class(
         if cls_indices.size == 0:
             continue
         cls_values = values[cls_indices]
-
-        if mode == "robust_mad":
-            cls_flat = cls_values.reshape(-1)
-            cls_med = float(np.median(cls_flat))
-            cls_mad = float(np.median(np.abs(cls_flat - cls_med)))
-            cls_scale = robust_scale * cls_mad
-            if (not np.isfinite(cls_scale)) or (cls_scale <= eps):
-                normalized[cls_indices] = 0.0
-                continue
-            z = (cls_values - cls_med) / (cls_scale + eps)
-            normalized[cls_indices] = z.astype(np.float32)
-            has_valid_class = True
-            continue
-
-        cls_min = float(cls_values.min())
-        cls_max = float(cls_values.max())
-        if (
-            (not np.isfinite(cls_min))
-            or (not np.isfinite(cls_max))
-            or (cls_max <= cls_min)
-        ):
-            normalized[cls_indices] = 0.0
-            continue
-        normalized[cls_indices] = (cls_values - cls_min) / (cls_max - cls_min)
+        normalized[cls_indices] = normalizer.normalize(cls_values)
         has_valid_class = True
 
     if not has_valid_class:
@@ -739,59 +706,12 @@ def precompute_pseudo_labels_multiclass(
         raise ValueError("No reduced features by class")
 
     scoring = str(getattr(args, "pseudo_label_scoring", "nn")).lower()
-    nn_scorer: Optional[NNPseudoLabelScorer] = None
-    maha_scorer: Optional[MahalanobisPseudoLabelScorer] = None
-    scorer: Optional[PseudoLabelScorer] = None
-
-    if scoring == "blend":
-        nn_scorer = NNPseudoLabelScorer(build_faiss_index_fn, args.k_number)
-        maha_scorer = MahalanobisPseudoLabelScorer(
-            device,
-            gaussian_feature_dim=int(getattr(args, "pseudo_label_mahalanobis_dim", 128)),
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            c = int(cls)
-            nn_scorer.fit_class(c, feats)
-            maha_scorer.fit_class(c, feats)
-    elif scoring == "mahalanobis":
-        scorer = pseudo_label_scorer or MahalanobisPseudoLabelScorer(
-            device,
-            gaussian_feature_dim=int(getattr(args, "pseudo_label_mahalanobis_dim", 128)),
-        )
+    scorers = PseudoLabelScorerFactory.create(scoring, args, device, build_faiss_index_fn)
+    for scorer in scorers:
         for cls, feats in reduced_features_by_class.items():
             if feats is None or feats.shape[0] == 0:
                 continue
             scorer.fit_class(int(cls), feats)
-    elif scoring == "pca":
-        scorer = pseudo_label_scorer or PCAPseudoLabelScorer(
-            pca_dim=int(getattr(args, "pseudo_label_pca_dim", 0)),
-            pca_ev=float(getattr(args, "pseudo_label_pca_ev", 0.99)),
-            eps=float(getattr(args, "pseudo_label_pca_eps", 1e-6)),
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            scorer.fit_class(int(cls), feats)
-    else:
-        scorer = (
-            pseudo_label_scorer
-            if pseudo_label_scorer is not None
-            else NNPseudoLabelScorer(build_faiss_index_fn, args.k_number)
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            scorer.fit_class(int(cls), feats)
-
-    blend_w_nn, blend_w_m = _pseudo_label_blend_weights(args)
-    distance_nn_buf: Optional[np.ndarray] = (
-        np.zeros((dataset_size, 784), dtype=np.float32) if scoring == "blend" else None
-    )
-    distance_maha_buf: Optional[np.ndarray] = (
-        np.zeros((dataset_size, 784), dtype=np.float32) if scoring == "blend" else None
-    )
 
     if args.beta:
         top_feat_global = None
@@ -821,28 +741,9 @@ def precompute_pseudo_labels_multiclass(
             batch_size = int(batch_class_np.shape[0])
 
             cls_distance_map = np.zeros((batch_size, 784), dtype=np.float32)
-            if scoring == "blend":
-                assert nn_scorer is not None and maha_scorer is not None
-                assert distance_nn_buf is not None and distance_maha_buf is not None
-                cls_nn = np.zeros((batch_size, 784), dtype=np.float32)
-                cls_maha = np.zeros((batch_size, 784), dtype=np.float32)
-                for cls in np.unique(batch_class_np).tolist():
-                    cls = int(cls)
-                    if not nn_scorer.has_class(cls) or not maha_scorer.has_class(cls):
-                        continue
-                    cls_mask = batch_class_np == cls
-                    if not np.any(cls_mask):
-                        continue
-                    cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
-                    d_nn = nn_scorer.score_patches(cls, cls_features_2d)
-                    d_m = maha_scorer.score_patches(cls, cls_features_2d)
-                    cls_nn[cls_mask] = d_nn.reshape(-1, 784).astype(np.float32)
-                    cls_maha[cls_mask] = d_m.reshape(-1, 784).astype(np.float32)
-                cls_distance_map = blend_w_nn * cls_nn + blend_w_m * cls_maha
-                distance_nn_buf[sample_idx_np] = cls_nn.astype(np.float32)
-                distance_maha_buf[sample_idx_np] = cls_maha.astype(np.float32)
-            else:
-                assert scorer is not None
+            all_scores = []
+            for scorer in scorers:
+                score_map = np.zeros((batch_size, 784), dtype=np.float32)
                 for cls in np.unique(batch_class_np).tolist():
                     cls = int(cls)
                     if not scorer.has_class(cls):
@@ -851,10 +752,10 @@ def precompute_pseudo_labels_multiclass(
                     if not np.any(cls_mask):
                         continue
                     cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
-                    cls_distance = scorer.score_patches(cls, cls_features_2d)
-                    cls_distance_map[cls_mask] = cls_distance.reshape(-1, 784).astype(
-                        np.float32
-                    )
+                    cls_score = scorer.score_patches(cls, cls_features_2d)
+                    score_map[cls_mask] = cls_score.reshape(-1, 784).astype(np.float32)
+                all_scores.append(score_map)
+            cls_distance_map = np.mean(all_scores, axis=0).astype(np.float32)
 
             distance_map[sample_idx_np] = cls_distance_map.astype(np.float32)
 
@@ -872,9 +773,6 @@ def precompute_pseudo_labels_multiclass(
                         cand_dist,
                         args.beta_number,
                     )
-
-    if scoring == "blend":
-        assert distance_nn_buf is not None and distance_maha_buf is not None
 
     _plot_classwise_abs_distance_box_before_norm(
         args=args,
@@ -1167,59 +1065,12 @@ def precompute_pseudo_labels_multiclass_residual(
         raise ValueError("No reduced features by class")
 
     scoring = str(getattr(args, "pseudo_label_scoring", "nn")).lower()
-    nn_scorer: Optional[NNPseudoLabelScorer] = None
-    maha_scorer: Optional[MahalanobisPseudoLabelScorer] = None
-    scorer: Optional[PseudoLabelScorer] = None
-
-    if scoring == "blend":
-        nn_scorer = NNPseudoLabelScorer(build_faiss_index_fn, args.k_number)
-        maha_scorer = MahalanobisPseudoLabelScorer(
-            device,
-            gaussian_feature_dim=int(getattr(args, "pseudo_label_mahalanobis_dim", 128)),
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            c = int(cls)
-            nn_scorer.fit_class(c, feats)
-            maha_scorer.fit_class(c, feats)
-    elif scoring == "mahalanobis":
-        scorer = pseudo_label_scorer or MahalanobisPseudoLabelScorer(
-            device,
-            gaussian_feature_dim=int(getattr(args, "pseudo_label_mahalanobis_dim", 128)),
-        )
+    scorers = PseudoLabelScorerFactory.create(scoring, args, device, build_faiss_index_fn)
+    for scorer in scorers:
         for cls, feats in reduced_features_by_class.items():
             if feats is None or feats.shape[0] == 0:
                 continue
             scorer.fit_class(int(cls), feats)
-    elif scoring == "pca":
-        scorer = pseudo_label_scorer or PCAPseudoLabelScorer(
-            pca_dim=int(getattr(args, "pseudo_label_pca_dim", 0)),
-            pca_ev=float(getattr(args, "pseudo_label_pca_ev", 0.99)),
-            eps=float(getattr(args, "pseudo_label_pca_eps", 1e-6)),
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            scorer.fit_class(int(cls), feats)
-    else:
-        scorer = (
-            pseudo_label_scorer
-            if pseudo_label_scorer is not None
-            else NNPseudoLabelScorer(build_faiss_index_fn, args.k_number)
-        )
-        for cls, feats in reduced_features_by_class.items():
-            if feats is None or feats.shape[0] == 0:
-                continue
-            scorer.fit_class(int(cls), feats)
-
-    blend_w_nn, blend_w_m = _pseudo_label_blend_weights(args)
-    distance_nn_buf: Optional[np.ndarray] = (
-        np.zeros((dataset_size, 784), dtype=np.float32) if scoring == "blend" else None
-    )
-    distance_maha_buf: Optional[np.ndarray] = (
-        np.zeros((dataset_size, 784), dtype=np.float32) if scoring == "blend" else None
-    )
 
     if args.beta:
         top_feat_global = None
@@ -1260,28 +1111,9 @@ def precompute_pseudo_labels_multiclass_residual(
             # 将距离按 batch 原顺序拼回：shape = (B, 784)
             cls_distance_map = np.zeros((batch_size, 784), dtype=np.float32)
 
-            if scoring == "blend":
-                assert nn_scorer is not None and maha_scorer is not None
-                assert distance_nn_buf is not None and distance_maha_buf is not None
-                cls_nn = np.zeros((batch_size, 784), dtype=np.float32)
-                cls_maha = np.zeros((batch_size, 784), dtype=np.float32)
-                for cls in np.unique(batch_class_np).tolist():
-                    cls = int(cls)
-                    if not nn_scorer.has_class(cls) or not maha_scorer.has_class(cls):
-                        continue
-                    cls_mask = batch_class_np == cls
-                    if not np.any(cls_mask):
-                        continue
-                    cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
-                    d_nn = nn_scorer.score_patches(cls, cls_features_2d)
-                    d_m = maha_scorer.score_patches(cls, cls_features_2d)
-                    cls_nn[cls_mask] = d_nn.reshape(-1, 784).astype(np.float32)
-                    cls_maha[cls_mask] = d_m.reshape(-1, 784).astype(np.float32)
-                cls_distance_map = blend_w_nn * cls_nn + blend_w_m * cls_maha
-                distance_nn_buf[sample_idx_np] = cls_nn.astype(np.float32)
-                distance_maha_buf[sample_idx_np] = cls_maha.astype(np.float32)
-            else:
-                assert scorer is not None
+            all_scores = []
+            for scorer in scorers:
+                score_map = np.zeros((batch_size, 784), dtype=np.float32)
                 for cls in np.unique(batch_class_np).tolist():
                     cls = int(cls)
                     if not scorer.has_class(cls):
@@ -1289,13 +1121,11 @@ def precompute_pseudo_labels_multiclass_residual(
                     cls_mask = batch_class_np == cls
                     if not np.any(cls_mask):
                         continue
-
                     cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
-                    cls_distance = scorer.score_patches(cls, cls_features_2d)
-
-                    cls_distance_map[cls_mask] = cls_distance.reshape(-1, 784).astype(
-                        np.float32
-                    )
+                    cls_score = scorer.score_patches(cls, cls_features_2d)
+                    score_map[cls_mask] = cls_score.reshape(-1, 784).astype(np.float32)
+                all_scores.append(score_map)
+            cls_distance_map = np.mean(all_scores, axis=0).astype(np.float32)
 
             distance_map[sample_idx_np] = cls_distance_map.astype(np.float32)
             patch_feature_l2_map[sample_idx_np] = feature_l2
@@ -1314,9 +1144,6 @@ def precompute_pseudo_labels_multiclass_residual(
                         cand_dist,
                         args.beta_number,
                     )
-
-    if scoring == "blend":
-        assert distance_nn_buf is not None and distance_maha_buf is not None
 
     _plot_classwise_abs_distance_box_before_norm(
         args=args,

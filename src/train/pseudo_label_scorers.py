@@ -322,3 +322,44 @@ class PCAPseudoLabelScorer(PseudoLabelScorer):
         residual = centered - proj
         scores = torch.sum(residual * residual, dim=1)
         return scores.detach().cpu().numpy().astype(np.float32)
+
+
+class PseudoLabelScorerFactory:
+    """根据 mode 字符串（如 "nn"、"nn+mahalanobis+pca"）创建打分器列表。"""
+
+    @staticmethod
+    def create(
+        mode: str,
+        args,
+        device: torch.device,
+        build_faiss_index_fn,
+    ) -> List[PseudoLabelScorer]:
+        names = [s.strip() for s in str(mode).lower().split("+")]
+        scorers: List[PseudoLabelScorer] = []
+        for name in names:
+            if name == "nn":
+                scorers.append(NNPseudoLabelScorer(build_faiss_index_fn, args.k_number))
+            elif name == "mahalanobis":
+                scorers.append(
+                    
+                    MahalanobisPseudoLabelScorer(
+                        device,
+                        gaussian_feature_dim=int(getattr(args, "pseudo_label_mahalanobis_dim", 128)),
+                    )
+                )
+            elif name == "pca":
+                scorers.append(
+                    PCAPseudoLabelScorer(
+                        pca_dim=int(getattr(args, "pseudo_label_pca_dim", 0)),
+                        pca_ev=float(getattr(args, "pseudo_label_pca_ev", 0.99)),
+                        eps=float(getattr(args, "pseudo_label_pca_eps", 1e-6)),
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"Unknown pseudo-label scorer '{name}'. "
+                    f"Valid options: nn, mahalanobis, pca (combinable with +, e.g. nn+mahalanobis)."
+                )
+        if not scorers:
+            raise ValueError("No scorer selected (empty --pseudo_label_scoring).")
+        return scorers
