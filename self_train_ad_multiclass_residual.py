@@ -200,7 +200,8 @@ def parse_args():
         help="Mahalanobis mode: project patch features to this dim (bias-free Linear) before "
         "Gaussian fit and scoring when feature dim is larger; set 0 to disable projection.",
     )
-
+    parser.add_argument("--detect_anomaly", action="store_true",
+                    help="Enable autograd anomaly detection (slows training, use for debugging only)")
     return parser.parse_args()
 
 
@@ -889,7 +890,8 @@ def train_one_epoch(
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
     args = parse_args()
     global _FAISS_USE_CPU_INDEX, _FAISS_GPU_TEMP_MEM_MB
     _FAISS_USE_CPU_INDEX = bool(args.faiss_cpu_index)
