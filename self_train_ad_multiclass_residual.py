@@ -191,21 +191,9 @@ def parse_args():
     parser.add_argument(
         "--pseudo_label_scoring",
         type=str,
-        choices=["nn", "mahalanobis", "blend"],
         default="nn",
-        help="Patch vs. memory-bank score: k-NN, Mahalanobis, or per-class min-max normalized blend of both.",
-    )
-    parser.add_argument(
-        "--pseudo_label_blend_nn_weight",
-        type=float,
-        default=0.5,
-        help="blend mode: weight for k-NN branch (Mahalanobis weight defaults complement; both renormalized to sum to 1).",
-    )
-    parser.add_argument(
-        "--pseudo_label_blend_maha_weight",
-        type=float,
-        default=0.5,
-        help="blend mode: weight for Mahalanobis branch.",
+        help="Scorer(s) separated by '+', e.g. 'nn', 'nn+mahalanobis', 'nn+mahalanobis+pca'. "
+        "Available: nn, mahalanobis, pca.",
     )
     parser.add_argument(
         "--pseudo_label_mahalanobis_dim",
