@@ -228,8 +228,8 @@ def parse_args():
         "--dino_layer_indices",
         type=int,
         nargs="+",
-        default=[22, 23, 24, 25, 26, 27, 28],
-        help="DINOv3 layer ids (1-based, as in paper) to aggregate by mean pooling.",
+        default=[-1],
+        help="DINOv3 layer ids (1-based) to aggregate by mean pooling. -1 means last layer.",
     )
     parser.add_argument(
         "--pseudo_label_scoring",
@@ -465,32 +465,29 @@ def build_feature_extractor(args):
     return feature_extractor
 
 
+def _resolve_dino_block_indices(feature_extractor, dino_layer_indices):
+    """Resolve 1-based layer indices to 0-based block indices. Returns sorted list of 0-based block indices."""
+    num_blocks = len(getattr(feature_extractor, "blocks", []))
+    raw = list(dino_layer_indices)
+    requested_layers = [num_blocks if x == -1 else x for x in raw]
+
+    for lid in requested_layers:
+        if lid < 1 or lid > num_blocks:
+            raise ValueError(
+                f"--dino_layer_indices {lid} (1-based) is out of range. "
+                f"Model has {num_blocks} blocks (1-based: 1..{num_blocks}). "
+                f"Received: {raw}"
+            )
+
+    return sorted({int(lid) - 1 for lid in requested_layers})
+
+
 def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
-    def _resolve_dino_block_indices():
-        # CLI uses paper-style 1-based layer ids; DINO internals use 0-based block indices.
-        num_blocks = len(getattr(feature_extractor, "blocks", []))
-        requested_layers = list(getattr(args, "dino_layer_indices", [22, 23, 24, 25, 26, 27, 28]))
-        requested_blocks = sorted({int(layer_id) - 1 for layer_id in requested_layers})
-        valid_blocks = [idx for idx in requested_blocks if 0 <= idx < num_blocks]
-        if len(valid_blocks) > 0:
-            return valid_blocks
-
-        # Fallback for shallower backbones (e.g., ViT-B/16): use middle 7 blocks if available.
-        if num_blocks <= 0:
-            return [0]
-        if num_blocks <= 7:
-            return list(range(num_blocks))
-        center = num_blocks // 2
-        start = max(0, center - 3)
-        end = min(num_blocks, start + 7)
-        start = max(0, end - 7)
-        return list(range(start, end))
-
     with torch.no_grad():
         feature_extractor.eval()
         cls_token = None
         # DINOv3: mean-pool selected middle layers (paper default: 22-28).
-        selected_blocks = _resolve_dino_block_indices()
+        selected_blocks = _resolve_dino_block_indices(feature_extractor, args.dino_layer_indices)
         selected_layers = feature_extractor.get_intermediate_layers(
             input_tensor,
             n=selected_blocks,
@@ -1256,6 +1253,9 @@ def main():
     inferred_patch_mask_size = infer_patch_mask_size(train_dataset, feature_extractor, args)
     train_dataset.patch_mask_size = inferred_patch_mask_size
     print(f"inferred patch_mask_size from feature extractor: {inferred_patch_mask_size}")
+    _selected_blocks = _resolve_dino_block_indices(feature_extractor, args.dino_layer_indices)
+    _display = [b + 1 for b in _selected_blocks]
+    print(f"[DINOv3] aggregating layers {_display} (0-based blocks {_selected_blocks})")
     reference_memory_by_class_cpu, reference_index_by_class = build_reference_memory_bank(
         train_dataset, reference_indices_by_class, feature_extractor, args
     )
