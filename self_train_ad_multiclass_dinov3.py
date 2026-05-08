@@ -272,6 +272,13 @@ def parse_args():
         help="Enable residual feature computation (feat - nearest_class_reference). "
         "Set to False to use raw DINOv3 features directly.",
     )
+    parser.add_argument(
+        "--global_memory_bank",
+        action="store_true",
+        help="Merge all classes into a single global memory bank (instead of per-class). "
+        "GreedyCoreset is applied on the merged features. Scoring uses one global "
+        "scorer for all patches, which tests whether per-class memory bank is beneficial.",
+    )
 
     return parser.parse_args()
 

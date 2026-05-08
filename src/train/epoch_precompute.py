@@ -63,6 +63,17 @@ def _normalize_distance_map_per_class(
     return normalized.astype(np.float32)
 
 
+def _normalize_distance_map_global(
+    distance_map: np.ndarray, args
+) -> np.ndarray:
+    """Global min-max (or percentile) normalization across ALL patches regardless of class."""
+    normalizer = PseudoLabelNormalizerFactory.create(args)
+    values = np.asarray(distance_map, dtype=np.float32)
+    flat = values.reshape(-1)
+    normalized = normalizer.normalize(flat)
+    return normalized.reshape(values.shape).astype(np.float32)
+
+
 def _extract_features_with_optional_cls_token(
     extract_feature_batch_fn, images, feature_extractor, args
 ):
@@ -1050,44 +1061,75 @@ def precompute_pseudo_labels_multiclass_residual(
                 cls_features = features_np[cls_mask].reshape(-1, global_dim)
                 class_feature_buffers[cls].append(cls_features)
 
-    # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
     reduced_features_by_class = {}
     coreset_indices_by_class = {}
-    for cls in range(num_classes):
-        if len(class_feature_buffers[cls]) == 0:
-            continue
-        normal_features_cls = np.concatenate(class_feature_buffers[cls], axis=0)
+    if getattr(args, "global_memory_bank", False):
+        # 全局记忆库：将各类特征合并，统一做 GreedyCoreset
+        global_features_list = []
+        for cls in range(num_classes):
+            if len(class_feature_buffers[cls]) == 0:
+                continue
+            global_features_list.append(np.concatenate(class_feature_buffers[cls], axis=0))
+        if global_features_list:
+            all_features = np.concatenate(global_features_list, axis=0)
+            total_images = max(1, selected_indices.shape[0])
+            patches_per_image_global = max(1, all_features.shape[0] // total_images)
+            greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
+            target_images_global = min(greedy_keep_images, total_images)
+            target_features_global = patches_per_image_global * target_images_global
 
-        num_selected_images_cls = selected_images_by_class.get(cls, np.array([], dtype=np.int64)).shape[0]
-        if num_selected_images_cls > 0 and normal_features_cls.shape[0] > 0:
-            patches_per_image = normal_features_cls.shape[0] // num_selected_images_cls
-        else:
-            patches_per_image = normal_features_cls.shape[0]
-
-        greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
-        target_images = (
-            min(greedy_keep_images, num_selected_images_cls)
-            if num_selected_images_cls > 0
-            else 1
+            if 0 < target_features_global < all_features.shape[0]:
+                percentage = float(target_features_global) / float(all_features.shape[0])
+                sampler = ApproximateGreedyCoresetSampler(
+                    percentage=percentage,
+                    device=device,
+                )
+                all_features, core_idx = sampler.run(
+                    all_features, return_indices=True
+                )
+                _ = core_idx  # unused but kept for interface compatibility
+            reduced_features_by_class[0] = all_features
+        print(
+            f"[GlobalMemoryBank] merged {len(global_features_list)} classes → "
+            f"{all_features.shape[0] if global_features_list else 0} patches after greedy coreset"
         )
-        target_features = patches_per_image * target_images
+    else:
+        # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
+        for cls in range(num_classes):
+            if len(class_feature_buffers[cls]) == 0:
+                continue
+            normal_features_cls = np.concatenate(class_feature_buffers[cls], axis=0)
 
-        if 0 < target_features < normal_features_cls.shape[0]:
-            percentage = float(target_features) / float(normal_features_cls.shape[0])
-            sampler = ApproximateGreedyCoresetSampler(
-                percentage=percentage,
-                device=device,
+            num_selected_images_cls = selected_images_by_class.get(cls, np.array([], dtype=np.int64)).shape[0]
+            if num_selected_images_cls > 0 and normal_features_cls.shape[0] > 0:
+                patches_per_image = normal_features_cls.shape[0] // num_selected_images_cls
+            else:
+                patches_per_image = normal_features_cls.shape[0]
+
+            greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
+            target_images = (
+                min(greedy_keep_images, num_selected_images_cls)
+                if num_selected_images_cls > 0
+                else 1
             )
-            normal_features_cls, core_idx = sampler.run(
-                normal_features_cls, return_indices=True
-            )
-        else:
-            core_idx = np.arange(normal_features_cls.shape[0], dtype=np.int64)
+            target_features = patches_per_image * target_images
 
-        reduced_features_by_class[cls] = normal_features_cls
-        coreset_indices_by_class[cls] = core_idx
+            if 0 < target_features < normal_features_cls.shape[0]:
+                percentage = float(target_features) / float(normal_features_cls.shape[0])
+                sampler = ApproximateGreedyCoresetSampler(
+                    percentage=percentage,
+                    device=device,
+                )
+                normal_features_cls, core_idx = sampler.run(
+                    normal_features_cls, return_indices=True
+                )
+            else:
+                core_idx = np.arange(normal_features_cls.shape[0], dtype=np.int64)
 
-    if len(reduced_features_by_class) > 0:
+            reduced_features_by_class[cls] = normal_features_cls
+            coreset_indices_by_class[cls] = core_idx
+
+    if len(reduced_features_by_class) > 0 and not getattr(args, "global_memory_bank", False):
         print_greedy_memory_bank_anomaly_stats(
             num_classes=num_classes,
             selected_images_by_class=selected_images_by_class,
@@ -1156,16 +1198,23 @@ def precompute_pseudo_labels_multiclass_residual(
             all_scores = []
             for scorer in scorers:
                 score_map = np.zeros((batch_size, 784), dtype=np.float32)
-                for cls in np.unique(batch_class_np).tolist():
-                    cls = int(cls)
-                    if not scorer.has_class(cls):
-                        continue
-                    cls_mask = batch_class_np == cls
-                    if not np.any(cls_mask):
-                        continue
-                    cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
-                    cls_score = scorer.score_patches(cls, cls_features_2d)
-                    score_map[cls_mask] = cls_score.reshape(-1, 784).astype(np.float32)
+                if getattr(args, "global_memory_bank", False):
+                    # 全局记忆库：所有 patch 对全局 scorer(class 0) 打分
+                    if scorer.has_class(0):
+                        features_2d = features_np.reshape(-1, global_dim)
+                        global_scores = scorer.score_patches(0, features_2d)
+                        score_map = global_scores.reshape(batch_size, 784).astype(np.float32)
+                else:
+                    for cls in np.unique(batch_class_np).tolist():
+                        cls = int(cls)
+                        if not scorer.has_class(cls):
+                            continue
+                        cls_mask = batch_class_np == cls
+                        if not np.any(cls_mask):
+                            continue
+                        cls_features_2d = features_np[cls_mask].reshape(-1, global_dim)
+                        cls_score = scorer.score_patches(cls, cls_features_2d)
+                        score_map[cls_mask] = cls_score.reshape(-1, 784).astype(np.float32)
                 all_scores.append(score_map)
             cls_distance_map = np.mean(all_scores, axis=0).astype(np.float32)
 
@@ -1187,22 +1236,29 @@ def precompute_pseudo_labels_multiclass_residual(
                         args.beta_number,
                     )
 
-    _plot_classwise_abs_distance_box_before_norm(
-        args=args,
-        class_stack=class_stack,
-        distance_map=distance_map,
-        gt_patch_masks=gt_patch_masks,
-        num_classes=num_classes,
-        class_names=getattr(args, "class_names", None),
-        epoch=epoch,
-    )
+    if not getattr(args, "global_memory_bank", False):
+        _plot_classwise_abs_distance_box_before_norm(
+            args=args,
+            class_stack=class_stack,
+            distance_map=distance_map,
+            gt_patch_masks=gt_patch_masks,
+            num_classes=num_classes,
+            class_names=getattr(args, "class_names", None),
+            epoch=epoch,
+        )
 
-    distance_map = _normalize_distance_map_per_class(
-        distance_map=distance_map,
-        class_stack=class_stack,
-        num_classes=num_classes,
-        args=args,
-    )
+    if getattr(args, "global_memory_bank", False):
+        distance_map = _normalize_distance_map_global(
+            distance_map=distance_map,
+            args=args,
+        )
+    else:
+        distance_map = _normalize_distance_map_per_class(
+            distance_map=distance_map,
+            class_stack=class_stack,
+            num_classes=num_classes,
+            args=args,
+        )
 
     if args.beta:
         if top_feat_global is None or top_feat_global.shape[0] == 0:
@@ -1241,63 +1297,64 @@ def precompute_pseudo_labels_multiclass_residual(
         f"({pred_anomaly_correct}/{pred_anomaly_count})"
     )
 
-    classwise_region_gt_means = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
-    classwise_region_gt_stds = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
-    classwise_region_gt_medians = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
-    classwise_region_gt_counts = np.zeros((num_classes, 3, 2), dtype=np.int64)
-    region_masks = (pred_normal, pred_uncertain, pred_anomaly)
-    region_names = ("distance<threshold", "threshold<=distance<=noise_threshold", "distance>noise_threshold")
-    gt_names = ("gt_normal", "gt_anomaly")
+    if not getattr(args, "global_memory_bank", False):
+        classwise_region_gt_means = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
+        classwise_region_gt_stds = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
+        classwise_region_gt_medians = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
+        classwise_region_gt_counts = np.zeros((num_classes, 3, 2), dtype=np.int64)
+        region_masks = (pred_normal, pred_uncertain, pred_anomaly)
+        region_names = ("distance<threshold", "threshold<=distance<=noise_threshold", "distance>noise_threshold")
+        gt_names = ("gt_normal", "gt_anomaly")
 
-    for cls in range(num_classes):
-        cls_idx = np.where(class_stack == cls)[0]
-        if cls_idx.size == 0:
-            continue
-        cls_norm = patch_feature_l2_map[cls_idx]
-        cls_gt = gt_mask_bool[cls_idx]
-        for ridx, rmask in enumerate(region_masks):
-            cls_region = rmask[cls_idx]
-            normal_sel = np.logical_and(cls_region, np.logical_not(cls_gt))
-            anomaly_sel = np.logical_and(cls_region, cls_gt)
-            for gidx, sel in enumerate((normal_sel, anomaly_sel)):
-                cnt = int(sel.sum())
-                classwise_region_gt_counts[cls, ridx, gidx] = cnt
-                if cnt > 0:
-                    selected_vals = cls_norm[sel].astype(np.float32)
-                    classwise_region_gt_means[cls, ridx, gidx] = float(selected_vals.mean())
-                    classwise_region_gt_stds[cls, ridx, gidx] = float(selected_vals.std())
-                    classwise_region_gt_medians[cls, ridx, gidx] = float(
-                        np.median(selected_vals)
-                    )
+        for cls in range(num_classes):
+            cls_idx = np.where(class_stack == cls)[0]
+            if cls_idx.size == 0:
+                continue
+            cls_norm = patch_feature_l2_map[cls_idx]
+            cls_gt = gt_mask_bool[cls_idx]
+            for ridx, rmask in enumerate(region_masks):
+                cls_region = rmask[cls_idx]
+                normal_sel = np.logical_and(cls_region, np.logical_not(cls_gt))
+                anomaly_sel = np.logical_and(cls_region, cls_gt)
+                for gidx, sel in enumerate((normal_sel, anomaly_sel)):
+                    cnt = int(sel.sum())
+                    classwise_region_gt_counts[cls, ridx, gidx] = cnt
+                    if cnt > 0:
+                        selected_vals = cls_norm[sel].astype(np.float32)
+                        classwise_region_gt_means[cls, ridx, gidx] = float(selected_vals.mean())
+                        classwise_region_gt_stds[cls, ridx, gidx] = float(selected_vals.std())
+                        classwise_region_gt_medians[cls, ridx, gidx] = float(
+                            np.median(selected_vals)
+                        )
 
-    class_names = getattr(args, "class_names", None)
-    for cls in range(num_classes):
-        cls_name = (
-            class_names[cls]
-            if isinstance(class_names, (list, tuple)) and cls < len(class_names)
-            else f"cls_{cls}"
+        class_names = getattr(args, "class_names", None)
+        for cls in range(num_classes):
+            cls_name = (
+                class_names[cls]
+                if isinstance(class_names, (list, tuple)) and cls < len(class_names)
+                else f"cls_{cls}"
+            )
+            stat_parts = []
+            for ridx, rname in enumerate(region_names):
+                for gidx, gname in enumerate(gt_names):
+                    m = classwise_region_gt_means[cls, ridx, gidx]
+                    s = classwise_region_gt_stds[cls, ridx, gidx]
+                    med = classwise_region_gt_medians[cls, ridx, gidx]
+                    n = int(classwise_region_gt_counts[cls, ridx, gidx])
+                    if np.isfinite(m):
+                        stat_parts.append(
+                            f"{rname}/{gname}: mean={m:.4f}, std={s:.4f}, median={med:.4f} (n={n})"
+                        )
+                    else:
+                        stat_parts.append(f"{rname}/{gname}: NA (n=0)")
+            print(f"[PseudoLabel-L2Norm] {cls_name} | " + " | ".join(stat_parts))
+
+        _plot_classwise_feature_l2_by_distance_regions(
+            args=args,
+            class_names=class_names,
+            region_gt_means=classwise_region_gt_means,
+            epoch=epoch,
         )
-        stat_parts = []
-        for ridx, rname in enumerate(region_names):
-            for gidx, gname in enumerate(gt_names):
-                m = classwise_region_gt_means[cls, ridx, gidx]
-                s = classwise_region_gt_stds[cls, ridx, gidx]
-                med = classwise_region_gt_medians[cls, ridx, gidx]
-                n = int(classwise_region_gt_counts[cls, ridx, gidx])
-                if np.isfinite(m):
-                    stat_parts.append(
-                        f"{rname}/{gname}: mean={m:.4f}, std={s:.4f}, median={med:.4f} (n={n})"
-                    )
-                else:
-                    stat_parts.append(f"{rname}/{gname}: NA (n=0)")
-        print(f"[PseudoLabel-L2Norm] {cls_name} | " + " | ".join(stat_parts))
-
-    _plot_classwise_feature_l2_by_distance_regions(
-        args=args,
-        class_names=class_names,
-        region_gt_means=classwise_region_gt_means,
-        epoch=epoch,
-    )
 
     _plot_distance_distribution_normal_vs_anomaly(
         args=args,
