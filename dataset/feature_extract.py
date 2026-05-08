@@ -1,3 +1,6 @@
+import sys
+import warnings
+
 from dataset import dataset_extract
 import AnomalyCLIP_lib
 import torch
@@ -5,6 +8,7 @@ import argparse
 from torch.utils.data import DataLoader
 import numpy as np
 import os
+from PIL import Image
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -208,6 +212,161 @@ def main():
             extract_and_save_features(feature_extractor, test_loader, args.feature_path, class_name, args.noise,
                                       is_train=False, use_cls_token=args.use_cls_token,
                                       feature_model=args.feature_model, features_list=args.features_list, dpam_layer=args.dpam_layer)
+
+# ---------------------------------------------------------------------------
+# DINOv3 特征提取（供 self_train_ad_multiclass_dinov3.py 使用）
+# ---------------------------------------------------------------------------
+
+DINOV3_FEATURE_MODEL_REGISTRY = {
+    "dinov3_vits16": {"hub_entry": "dinov3_vits16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vits16plus": {"hub_entry": "dinov3_vits16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitb16": {"hub_entry": "dinov3_vitb16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitl16": {"hub_entry": "dinov3_vitl16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vitl16plus": {"hub_entry": "dinov3_vitl16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vith16plus": {"hub_entry": "dinov3_vith16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    "dinov3_vit7b16": {"hub_entry": "dinov3_vit7b16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+}
+
+_FEATURE_MODEL_CHOICES = tuple(DINOV3_FEATURE_MODEL_REGISTRY.keys())
+
+
+def _is_valid_local_torch_hub_dir(path: str) -> bool:
+    return bool(path) and os.path.isdir(path) and os.path.isfile(os.path.join(path, "hubconf.py"))
+
+
+def resolve_dinov3_local_hub_dir(feature_model: str):
+    if feature_model not in DINOV3_FEATURE_MODEL_REGISTRY:
+        raise KeyError(f"Unknown feature_model={feature_model!r}")
+    entry = DINOV3_FEATURE_MODEL_REGISTRY[feature_model]
+    explicit = entry.get("hub_repo_dir")
+    if explicit:
+        p = os.path.expanduser(str(explicit))
+        if _is_valid_local_torch_hub_dir(p):
+            return p
+    env_dir = os.environ.get("DINOV3_HUB_DIR")
+    if env_dir:
+        p = os.path.expanduser(env_dir)
+        if _is_valid_local_torch_hub_dir(p):
+            return p
+    default_dir = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov3_main")
+    if _is_valid_local_torch_hub_dir(default_dir):
+        return default_dir
+    legacy = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov3_main")
+    if _is_valid_local_torch_hub_dir(legacy):
+        return legacy
+    return None
+
+
+def build_dinov3_feature_extractor(feature_model: str, device: torch.device):
+    """Build a DINOv3 feature extractor from torch.hub."""
+    entry = DINOV3_FEATURE_MODEL_REGISTRY[feature_model]
+    hub_entry = entry["hub_entry"]
+    repo_dir = resolve_dinov3_local_hub_dir(feature_model)
+
+    # DINO imports `trunc_normal_` via `from utils import ...`.
+    # This project also has `utils.py`, so temporarily unshadow it.
+    local_utils_module = sys.modules.get("utils")
+    should_restore_utils = (
+        local_utils_module is not None
+        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
+            os.path.join("FUNAD", "utils.py")
+        )
+    )
+    if should_restore_utils:
+        del sys.modules["utils"]
+    try:
+        if repo_dir is not None:
+            print(f"[DINOv3] load {hub_entry} from local hub: {repo_dir}")
+            feature_extractor = torch.hub.load(
+                repo_dir,
+                hub_entry,
+                source="local",
+                pretrained=True,
+            )
+        else:
+            print(f"[DINOv3] load {hub_entry} from GitHub: facebookresearch/dinov3")
+            feature_extractor = torch.hub.load(
+                "facebookresearch/dinov3",
+                hub_entry,
+                pretrained=True,
+            )
+    finally:
+        if should_restore_utils:
+            sys.modules["utils"] = local_utils_module
+    feature_extractor = feature_extractor.to(device)
+    feature_extractor.eval()
+    return feature_extractor
+
+
+def resolve_dino_block_indices(feature_extractor, dino_layer_indices):
+    """Resolve 1-based layer indices to 0-based block indices."""
+    num_blocks = len(getattr(feature_extractor, "blocks", []))
+    raw = list(dino_layer_indices)
+    requested_layers = [num_blocks if x == -1 else x for x in raw]
+
+    for lid in requested_layers:
+        if lid < 1 or lid > num_blocks:
+            raise ValueError(
+                f"--dino_layer_indices {lid} (1-based) is out of range. "
+                f"Model has {num_blocks} blocks (1-based: 1..{num_blocks}). "
+                f"Received: {raw}"
+            )
+
+    return sorted({int(lid) - 1 for lid in requested_layers})
+
+
+def extract_dinov3_feature_batch(input_tensor, feature_extractor, dino_layer_indices, use_cls_token=False, return_cls_token=False):
+    """Extract DINOv3 patch features from a batch of images."""
+    with torch.no_grad():
+        feature_extractor.eval()
+        selected_blocks = resolve_dino_block_indices(feature_extractor, dino_layer_indices)
+        selected_layers = feature_extractor.get_intermediate_layers(
+            input_tensor,
+            n=selected_blocks,
+            return_class_token=True,
+        )
+        patch_tokens_list = [layer_patch for layer_patch, _layer_cls in selected_layers]
+        cls_tokens_list = [_layer_cls for _layer_patch, _layer_cls in selected_layers]
+        x_prenorm = torch.stack(patch_tokens_list, dim=0).mean(dim=0)
+        cls_tok = torch.stack(cls_tokens_list, dim=0).mean(dim=0)
+        x_norm = cls_tok
+        cls_token = cls_tok
+
+    if use_cls_token:
+        x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
+        x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
+    if return_cls_token:
+        return x_prenorm, cls_token
+    return x_prenorm
+
+
+def infer_dinov3_feature_dim(feature_extractor, train_loader, dino_layer_indices, use_cls_token, device):
+    for batch in train_loader:
+        images = batch[0]
+        images = images.to(device, non_blocking=True)
+        features = extract_dinov3_feature_batch(
+            images, feature_extractor, dino_layer_indices, use_cls_token=use_cls_token,
+        )
+        return int(features.shape[-1])
+    raise RuntimeError("训练集为空，无法推断特征维度。")
+
+
+def infer_dinov3_patch_mask_size(train_dataset, feature_extractor, dino_layer_indices, use_cls_token, device):
+    if len(train_dataset.samples) == 0:
+        raise RuntimeError("训练集为空，无法推断 patch_mask_size。")
+    image_path, _ = train_dataset.samples[0]
+    image = Image.open(image_path).convert("RGB")
+    image = train_dataset.transform_x(image).unsqueeze(0).to(device, non_blocking=True)
+    features = extract_dinov3_feature_batch(
+        image, feature_extractor, dino_layer_indices, use_cls_token=use_cls_token,
+    )
+    num_patches = int(features.shape[1])
+    patch_mask_size = int(np.sqrt(num_patches))
+    if patch_mask_size * patch_mask_size != num_patches:
+        raise RuntimeError(
+            f"无法从 patch 数 {num_patches} 推断方形 patch 网格，请检查模型与输入尺寸。"
+        )
+    return patch_mask_size
 
 if __name__ == "__main__":
     main()

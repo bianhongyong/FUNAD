@@ -11,9 +11,7 @@ FUNAD (WACV 2025) 的全无监督异常检测复现 + 扩展。核心思路：�
 | 脚本 | 说明 |
 |------|------|
 | `self_train_ad.py` | 原始 FUNAD，单类别含噪自训练 |
-| `self_train_ad_multiclass.py` | 多类别扩展（每个 batch 混合多个类别） |
-| `self_train_ad_multiclass_residual.py` | 残差特征 + 多类自训练（使用 DINO / CLIP 特征） |
-| `self_train_ad_multiclass_residual_dinov3.py` | 同残差方案，但主干使用 DINOv3 (torch.hub) |
+| `self_train_ad_multiclass_dinov3.py` | 残差特征 + 多类自训练，主干使用 DINOv3 (torch.hub) |
 
 Shell 脚本启动示例（`shell/` 目录）：
 ```bash

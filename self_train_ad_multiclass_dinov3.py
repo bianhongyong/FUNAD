@@ -2,85 +2,76 @@ import argparse
 import datetime
 import os
 import random
-from re import A
 import sys
 import time
 import warnings
 
 import cv2
-import faiss
 import numpy as np
 import pandas as pd
 import torch
+import torch.multiprocessing as torch_mp
 from PIL import Image
-import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
 import tqdm
-from scipy.ndimage import gaussian_filter
-from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
-import AnomalyCLIP_lib
 from dataset import dataset_extract, multiclass_feature_dataset
-from src.train.epoch_precompute import precompute_pseudo_labels_multiclass
+from dataset.feature_extract import (
+    _FEATURE_MODEL_CHOICES,
+    build_dinov3_feature_extractor,
+    resolve_dino_block_indices,
+    extract_dinov3_feature_batch,
+    infer_dinov3_feature_dim,
+    infer_dinov3_patch_mask_size,
+)
+from dataset.multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
+from src.model import model
+from src.train.epoch_precompute import precompute_pseudo_labels_multiclass_residual
 from utils import evaluate as eval_utils
+from utils.logging import enable_print_logging
 from utils.loss import (
     build_adaptive_threshold_map,
     compute_balanced_bce_loss,
+    compute_origin_regularizer,
     compute_oto_loss_multiclass,
 )
-from src.model import model
-from dataset.multiclass_feature_dataset import MultiClassFeatureDataset, get_all_class_names
 from utils.print import (
     print_epoch_losses,
     print_epoch_times,
+    print_full_dataset_confusion_matrix_by_raw_score,
+    print_selected_clean_ratio,
+    print_selected_score_distribution_by_class,
 )
 import utils.train_utils as common_utils
+from utils.visualize import save_moe_expert_visualizations
 
 warnings.filterwarnings("ignore")
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+try:
+    # Avoid exhausting file descriptors when DataLoader workers share CPU tensors.
+    torch_mp.set_sharing_strategy("file_system")
+except (AttributeError, RuntimeError):
+    warnings.warn("Failed to set torch multiprocessing sharing strategy.")
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 _FAISS_GPU_RESOURCES = None
 _FAISS_USE_CPU_INDEX = False
 _FAISS_GPU_TEMP_MEM_MB = 256
-_LOG_STREAM_HOLDER = []
+
+
+def _adapt_extract_fn(images, feature_extractor, args, return_cls_token=False):
+    """Adapter: epoch_precompute passes args (Namespace), extract_dinov3_feature_batch needs dino_layer_indices."""
+    return extract_dinov3_feature_batch(
+        images, feature_extractor, args.dino_layer_indices,
+        use_cls_token=args.use_cls_token, return_cls_token=return_cls_token,
+    )
 
 
 def str2bool(value):
     return common_utils.str2bool(value)
-
-
-class _TeeStream:
-    """Mirror writes to terminal and log file."""
-
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for stream in self.streams:
-            stream.write(data)
-            stream.flush()
-        return len(data)
-
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
-
-def _enable_print_logging(log_path: str):
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    log_f = open(log_path, "a", encoding="utf-8")
-    _LOG_STREAM_HOLDER.append(log_f)
-    sys.stdout = _TeeStream(sys.__stdout__, log_f)
-    sys.stderr = _TeeStream(sys.__stderr__, log_f)
-    print(f"[log] mirrored stdout/stderr to: {log_path}")
 
 
 def parse_args():
@@ -132,8 +123,13 @@ def parse_args():
     parser.add_argument("--crop_size", type=int, default=448)
     parser.add_argument("--faiss_cpu_index", action="store_true")
     parser.add_argument("--faiss_gpu_temp_mem_mb", type=int, default=256)
+    parser.add_argument("--num_reference_images_per_class", type=int, default=4)
+    parser.add_argument("--strict_clean_reference", action="store_true")
     parser.add_argument("--use_class_adaptive_threshold", action="store_true")
     parser.add_argument("--adaptive_threshold_quantile", type=float, default=0.7)
+    parser.add_argument("--use_origin_regularizer", action="store_true")
+    parser.add_argument("--origin_normal_weight", type=float, default=0.001)
+    parser.add_argument("--origin_anomaly_weight", type=float, default=0.001)
     parser.add_argument(
         "--gate_aux_weight",
         type=float,
@@ -159,9 +155,30 @@ def parse_args():
     )
     parser.add_argument(
         "--moe_use_cls_token",
-        type=str2bool,
-        default="False",
+        action="store_true",
         help="Whether MoE discriminator gate uses cls_token as routing input.",
+    )
+    parser.add_argument(
+        "--moe_hard_class_gate",
+        action="store_true",
+        help="Use fixed class->expert routing gate (expert count follows class count).",
+    )
+    parser.add_argument(
+        "--moe_expert_vis_enable",
+        action="store_true",
+        help="Enable MoE class-to-expert routing visualization.",
+    )
+    parser.add_argument(
+        "--moe_expert_vis_interval",
+        type=int,
+        default=1,
+        help="Save MoE class-to-expert visualization every N epochs.",
+    )
+    parser.add_argument(
+        "--moe_expert_vis_dirname",
+        type=str,
+        default="moe_expert_vis",
+        help="Sub-directory name for MoE class-to-expert visualization outputs.",
     )
     parser.add_argument(
         "--img_score_topk_ratio",
@@ -170,13 +187,20 @@ def parse_args():
         help="Image-level score uses mean of top-k patch scores, k=ceil(num_patches*ratio).",
     )
     parser.add_argument("--use_cls_token", type=str2bool, default="False")
-    parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
-    parser.add_argument("--clip_model_name", type=str, default="ViT-L/14@336px")
-    parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24])
-    parser.add_argument("--dpam_layer", type=int, default=24)
-    parser.add_argument("--depth", type=int, default=9)
-    parser.add_argument("--n_ctx", type=int, default=12)
-    parser.add_argument("--t_n_ctx", type=int, default=4)
+    parser.add_argument(
+        "--feature_model",
+        type=str,
+        choices=_FEATURE_MODEL_CHOICES,
+        default="dinov3_vitb16",
+        help="DINOv3 variant (torch.hub entry); see DINOV3_FEATURE_MODEL_REGISTRY for hub_entry / hub_repo_dir.",
+    )
+    parser.add_argument(
+        "--dino_layer_indices",
+        type=int,
+        nargs="+",
+        default=[-1],
+        help="DINOv3 layer ids (1-based) to aggregate by mean pooling. -1 means last layer.",
+    )
     parser.add_argument(
         "--pseudo_label_scoring",
         type=str,
@@ -191,6 +215,63 @@ def parse_args():
         help="Mahalanobis mode: project patch features to this dim (bias-free Linear) before "
         "Gaussian fit and scoring when feature dim is larger; set 0 to disable projection.",
     )
+    parser.add_argument(
+        "--pseudo_label_pca_dim",
+        type=int,
+        default=0,
+        help="PCA mode: retained principal components; set 0 to auto-select by explained variance.",
+    )
+    parser.add_argument(
+        "--pseudo_label_pca_ev",
+        type=float,
+        default=0.99,
+        help="PCA mode: explained variance target used when --pseudo_label_pca_dim=0.",
+    )
+    parser.add_argument(
+        "--pseudo_label_pca_eps",
+        type=float,
+        default=1e-6,
+        help="PCA mode: numerical stability epsilon for eigenvalue clamping and ratio computation.",
+    )
+    parser.add_argument(
+        "--pseudo_label_distance_norm",
+        type=str,
+        choices=["minmax", "percentile"],
+        default="minmax",
+        help="Per-class patch-distance normalization: minmax or percentile (robust to outliers).",
+    )
+    parser.add_argument(
+        "--pseudo_label_distance_norm_eps",
+        type=float,
+        default=1e-6,
+        help="Numerical stability epsilon for patch-distance normalization.",
+    )
+    parser.add_argument(
+        "--pseudo_label_distance_norm_percentile",
+        type=float,
+        default=99.0,
+        help="Percentile threshold (0-100) for percentile normalization. "
+        "Values outside this percentile range are clipped before min-max.",
+    )
+    parser.add_argument(
+        "--greedy_keep_images",
+        type=int,
+        default=2,
+        help="Greedy coreset keeps feature points equivalent to this many images per class.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Path to a training checkpoint (.pt) saved by this script; empty means start from scratch.",
+    )
+    parser.add_argument(
+        "--residual",
+        type=str2bool,
+        default="True",
+        help="Enable residual feature computation (feat - nearest_class_reference). "
+        "Set to False to use raw DINOv3 features directly.",
+    )
 
     return parser.parse_args()
 
@@ -203,116 +284,7 @@ def find_matching(id_array):
     return common_utils.find_matching(id_array)
 
 
-def _convert_imagenet_norm_to_clip_norm(input_tensor):
-    mean_imagenet = torch.tensor(IMAGENET_MEAN, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    std_imagenet = torch.tensor(IMAGENET_STD, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    mean_clip = torch.tensor(CLIP_MEAN, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
-    std_clip = torch.tensor(CLIP_STD, device=input_tensor.device, dtype=input_tensor.dtype).view(1, 3, 1, 1)
 
-    rgb_01 = input_tensor * std_imagenet + mean_imagenet
-    rgb_01 = torch.clamp(rgb_01, 0.0, 1.0)
-    clip_tensor = (rgb_01 - mean_clip) / std_clip
-    return clip_tensor
-
-
-def build_feature_extractor(args):
-    if args.feature_model == "clip":
-        anomalyclip_parameters = {
-            "Prompt_length": args.n_ctx,
-            "learnabel_text_embedding_depth": args.depth,
-            "learnabel_text_embedding_length": args.t_n_ctx,
-        }
-        feature_extractor, _ = AnomalyCLIP_lib.load(
-            args.clip_model_name,
-            device=device,
-            design_details=anomalyclip_parameters,
-        )
-        feature_extractor.eval()
-        feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
-        return feature_extractor
-
-    # DINO imports `trunc_normal_` via `from utils import ...`.
-    # This project also has `utils.py`, so temporarily unshadow it.
-    local_utils_module = sys.modules.get("utils")
-    should_restore_utils = (
-        local_utils_module is not None
-        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
-            os.path.join("FUNAD", "utils.py")
-        )
-    )
-    if should_restore_utils:
-        del sys.modules["utils"]
-    try:
-        repo_dir = "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"
-        feature_extractor = torch.hub.load(
-            repo_dir,
-            "dinov3_vitb16",
-            source="local",
-            pretrained=True,
-
-)
-    finally:
-        if should_restore_utils:
-            sys.modules["utils"] = local_utils_module
-    feature_extractor = feature_extractor.to(device)
-    feature_extractor.eval()
-    return feature_extractor
-
-
-def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
-    with torch.no_grad():
-        feature_extractor.eval()
-        cls_token = None
-        if args.feature_model == "clip":
-            clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
-            image_features, _, _, patch_projections = feature_extractor.encode_image(
-                clip_input,
-                args.features_list,
-                DPAM_layer=args.dpam_layer,
-            )
-            x_norm = image_features
-            x_prenorm = patch_projections[-1]
-            cls_token = x_norm
-        else:
-            # DINOv3: 默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
-            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
-                input_tensor, return_class_token=True
-            )[0]
-            x_norm = cls_tok
-            x_prenorm = patch_tokens
-            cls_token = cls_tok
-
-    if args.use_cls_token:
-        x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
-        x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
-    if return_cls_token:
-        return x_prenorm, cls_token
-    return x_prenorm
-
-
-def infer_feature_dim(feature_extractor, train_loader, args):
-    for batch in train_loader:
-        images = batch[0]
-        images = images.to(device, non_blocking=True)
-        features = extract_feature_batch(images, feature_extractor, args)
-        return int(features.shape[-1])
-    raise RuntimeError("训练集为空，无法推断特征维度。")
-
-
-def infer_patch_mask_size(train_dataset, feature_extractor, args):
-    if len(train_dataset.samples) == 0:
-        raise RuntimeError("训练集为空，无法推断 patch_mask_size。")
-    image_path, _ = train_dataset.samples[0]
-    image = Image.open(image_path).convert("RGB")
-    image = train_dataset.transform_x(image).unsqueeze(0).to(device, non_blocking=True)
-    features = extract_feature_batch(image, feature_extractor, args)
-    num_patches = int(features.shape[1])
-    patch_mask_size = int(np.sqrt(num_patches))
-    if patch_mask_size * patch_mask_size != num_patches:
-        raise RuntimeError(
-            f"无法从 patch 数 {num_patches} 推断方形 patch 网格，请检查模型与输入尺寸。"
-        )
-    return patch_mask_size
 
 
 def compute_distance(feature):
@@ -324,17 +296,6 @@ def compute_distance(feature):
     )
 
 
-def build_loader_kwargs(num_workers, pin_memory=True, prefetch_factor=4):
-    kwargs = {
-        "num_workers": int(num_workers),
-        "pin_memory": bool(pin_memory),
-    }
-    if int(num_workers) > 0:
-        kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = int(prefetch_factor)
-    return kwargs
-
-
 def build_test_loader(args, class_name):
     test_set = dataset_extract.MyDataset(
         dataset_path=args.data_path,
@@ -344,7 +305,15 @@ def build_test_loader(args, class_name):
         resize=args.image_size,
         cropsize=args.crop_size,
     )
-    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
+    # Eval loader is created/destroyed per class; keep workers small and
+    # non-persistent to avoid accumulating processes/resources.
+    eval_num_workers = max(1, min(int(args.num_workers), 2))
+    loader_kwargs = common_utils.build_loader_kwargs(
+        eval_num_workers,
+        pin_memory=False,
+        prefetch_factor=1,
+        persistent_workers=False,
+    )
     return DataLoader(
         test_set,
         batch_size=16,
@@ -363,14 +332,22 @@ def evaluate_epoch(
     feature_extractor,
     test_loader,
     args,
+    class_idx_eval,
+    reference_memory_by_class,
+    reference_index_by_class,
+    compute_residual_fn=common_utils.compute_residual_feature_batch,
 ):
-    return eval_utils.evaluate_multiclass_epoch(
+    return eval_utils.evaluate_residual_multiclass_epoch(
         localnet=localnet,
         feature_extractor=feature_extractor,
         test_loader=test_loader,
         args=args,
+        class_idx_eval=class_idx_eval,
+        reference_memory_by_class=reference_memory_by_class,
+        reference_index_by_class=reference_index_by_class,
         device=device,
-        extract_feature_batch_fn=extract_feature_batch,
+        extract_feature_batch_fn=_adapt_extract_fn,
+        compute_residual_feature_batch_fn=compute_residual_fn,
     )
 
 
@@ -436,6 +413,10 @@ def train_one_epoch(
     mini_loader,
     iteration,
     num_classes,
+    reference_memory_by_class,
+    reference_index_by_class,
+    moe_expert_vis_ctx=None,
+    compute_residual_fn=common_utils.compute_residual_feature_batch,
 ):
     total_batch = len(local_loader)
     threshold = args.threshold
@@ -443,6 +424,7 @@ def train_one_epoch(
     local_loss = 0
     oto_loss = 0
     bce_loss = 0
+    origin_loss = 0
     gate_aux_loss = 0
     memory_bank_time = 0.0
     pseudo_label_time = 0.0
@@ -455,19 +437,36 @@ def train_one_epoch(
     distance_map = None
     confident_feature_bank = None
     global_dim = None
+    moe_vis_enabled = bool(
+        moe_expert_vis_ctx is not None
+        and moe_expert_vis_ctx.get("enabled", False)
+        and args.use_moe_discriminator
+    )
+    class_expert_count = None
+    if moe_vis_enabled:
+        num_expert = int(moe_expert_vis_ctx["num_expert"])
+        class_expert_count = np.zeros((num_classes, num_expert), dtype=np.float64)
 
     if threshold <= 1:
-        distance_map, confident_feature_bank, global_dim, mb_time, pl_time = precompute_pseudo_labels_multiclass(
+        distance_map, confident_feature_bank, global_dim, mb_time, pl_time = precompute_pseudo_labels_multiclass_residual(
             args=args,
             localnet=localnet,
             feature_extractor=feature_extractor,
             mini_loader=mini_loader,
             num_classes=num_classes,
+            reference_memory_by_class=reference_memory_by_class,
+            reference_index_by_class=reference_index_by_class,
             device=device,
-            extract_feature_batch_fn=extract_feature_batch,
+            extract_feature_batch_fn=_adapt_extract_fn,
+            compute_residual_feature_batch_fn=compute_residual_fn,
             aggregate_image_scores_fn=aggregate_image_scores,
             build_faiss_index_fn=_build_faiss_index,
             update_topk_features_fn=_update_topk_features,
+            print_selected_score_distribution_fn=print_selected_score_distribution_by_class,
+            print_selected_clean_ratio_fn=print_selected_clean_ratio,
+            print_confusion_matrix_fn=print_full_dataset_confusion_matrix_by_raw_score,
+            epoch=epoch,
+            pseudo_label_scorer=None,
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
@@ -483,8 +482,14 @@ def train_one_epoch(
             continue
 
         images = images.to(device, non_blocking=True)
-        x, cls_token = extract_feature_batch(
-            images, feature_extractor, args, return_cls_token=True
+        x, cls_token = extract_dinov3_feature_batch(
+            images, feature_extractor, args.dino_layer_indices, use_cls_token=args.use_cls_token, return_cls_token=True
+        )
+        x = compute_residual_fn(
+            x,
+            class_idx,
+            reference_memory_by_class,
+            reference_index_by_class,
         )
         dim = int(x.shape[-1]) if global_dim is None else int(global_dim)
 
@@ -560,15 +565,71 @@ def train_one_epoch(
         local_label = local_label.to(device, non_blocking=True)
 
         gate_cls_token = cls_token if cls_token.shape[0] == x.shape[0] else None
-        batch_feature, local_pred = localnet(x, cls_token=gate_cls_token)
+        patch_class_idx = None
+        if args.use_moe_discriminator and args.moe_hard_class_gate:
+            token_per_image = int(x.shape[1]) if x.dim() >= 2 else 1
+            patch_class_idx = (
+                class_idx_for_oto.to(device=x.device, dtype=torch.long)
+                .reshape(-1, 1, 1)
+                .expand(-1, token_per_image, 1)
+                .contiguous()
+            )
+        batch_feature, local_pred = localnet(
+            x,
+            cls_token=gate_cls_token,
+            patch_class_idx=patch_class_idx,
+        )
+        origin_input_feature = x
+        origin_output_feature = batch_feature
+        if moe_vis_enabled:
+            discriminator = getattr(localnet, "discriminator", None)
+            get_stats = getattr(discriminator, "get_latest_gate_stats", None)
+            gate_stats = get_stats() if callable(get_stats) else None
+            if gate_stats is not None:
+                gate_top_k_idx, _gate_score = gate_stats
+                token_per_image = int(batch_feature.shape[1]) if batch_feature.dim() >= 2 else 1
+                class_for_gate = class_idx_for_oto
+                if class_for_gate.shape[0] == batch_feature.shape[0]:
+                    token_labels = (
+                        class_for_gate.detach().cpu().numpy().astype(np.int64).repeat(token_per_image)
+                    )
+                    gate_idx = gate_top_k_idx.detach().reshape(-1).cpu().numpy().astype(np.int64)
+                    if token_labels.size > 0 and gate_idx.size % token_labels.size == 0:
+                        rep = gate_idx.size // token_labels.size
+                        if rep > 1:
+                            token_labels = np.repeat(token_labels, rep)
+                        valid = (
+                            (token_labels >= 0)
+                            & (token_labels < num_classes)
+                            & (gate_idx >= 0)
+                            & (gate_idx < class_expert_count.shape[1])
+                        )
+                        if np.any(valid):
+                            np.add.at(
+                                class_expert_count,
+                                (token_labels[valid], gate_idx[valid]),
+                                1.0,
+                            )
+
         pred_for_loss = local_pred
         if (threshold <= 1) and args.gaussian:
             _copy = _copy.to(device, non_blocking=True)
             gaussian_cls_token = (
                 cls_token if cls_token.shape[0] == _copy.shape[0] else None
             )
+            gaussian_patch_class_idx = None
+            if args.use_moe_discriminator and args.moe_hard_class_gate:
+                token_per_image = int(_copy.shape[1]) if _copy.dim() >= 2 else 1
+                gaussian_patch_class_idx = class_idx_for_oto.to(
+                    device=_copy.device, dtype=torch.long
+                ).reshape(-1, 1, 1).expand(
+                    -1, token_per_image, 1
+                )
+                gaussian_patch_class_idx = gaussian_patch_class_idx.contiguous()
             gaussian_feature, gaussian_pred = localnet(
-                _copy, cls_token=gaussian_cls_token
+                _copy,
+                cls_token=gaussian_cls_token,
+                patch_class_idx=gaussian_patch_class_idx,
             )
             pred_for_loss = gaussian_pred
             
@@ -608,6 +669,33 @@ def train_one_epoch(
         else:
             _l_loss = torch.tensor(0.0, device=local_pred.device)
 
+        if args.use_origin_regularizer:
+            # Use only high-confidence extremes; overlap region is ignored.
+            normal_mask_np = distance < threshold
+            anomaly_mask_np = distance > args.noise_threshold
+            normal_mask_t = torch.as_tensor(
+                normal_mask_np.reshape(-1),
+                dtype=torch.bool,
+                device=origin_output_feature.device,
+            )
+            anomaly_mask_t = torch.as_tensor(
+                anomaly_mask_np.reshape(-1),
+                dtype=torch.bool,
+                device=origin_output_feature.device,
+            )
+            # Ignore synthetic sample if beta branch appends one sample.
+            origin_input_main = origin_input_feature[:batch]
+            origin_output_main = origin_output_feature[:batch]
+            _origin_loss = compute_origin_regularizer(
+                args=args,
+                input_feature=origin_input_main,
+                output_feature=origin_output_main,
+                normal_mask=normal_mask_t,
+                anomaly_mask=anomaly_mask_t,
+            )
+        else:
+            _origin_loss = torch.tensor(0.0, device=local_pred.device)
+
         if args.use_moe_discriminator:
             discriminator = getattr(localnet, "discriminator", None)
             if discriminator is not None and hasattr(discriminator, "get_loss"):
@@ -622,6 +710,7 @@ def train_one_epoch(
             _gate_aux_loss = torch.tensor(0.0, device=local_pred.device)
 
         _local_loss = _loss if args.alternative else (_loss + args.weight * _l_loss)
+        _local_loss = _local_loss + _origin_loss
         if args.use_moe_discriminator:
             _local_loss = _local_loss + args.gate_aux_weight * _gate_aux_loss
 
@@ -635,14 +724,28 @@ def train_one_epoch(
         local_loss += _local_loss / total_batch
         bce_loss += _loss / total_batch
         oto_loss += _l_loss / total_batch
+        origin_loss += _origin_loss / total_batch
         gate_aux_loss += _gate_aux_loss / total_batch
         iteration += 1
+
+    if moe_vis_enabled:
+        save_interval = max(1, int(moe_expert_vis_ctx.get("save_interval", 1)))
+        if (epoch + 1) % save_interval == 0:
+            save_moe_expert_visualizations(
+                epoch=epoch,
+                class_expert_count=class_expert_count,
+                class_names=moe_expert_vis_ctx.get("class_names", []),
+                save_dir=moe_expert_vis_ctx["save_dir"],
+            )
 
     local_loss_value = (
         local_loss.item() if torch.is_tensor(local_loss) else float(local_loss)
     )
     bce_loss_value = bce_loss.item() if torch.is_tensor(bce_loss) else float(bce_loss)
     oto_loss_value = oto_loss.item() if torch.is_tensor(oto_loss) else float(oto_loss)
+    origin_loss_value = (
+        origin_loss.item() if torch.is_tensor(origin_loss) else float(origin_loss)
+    )
     gate_aux_loss_value = (
         gate_aux_loss.item() if torch.is_tensor(gate_aux_loss) else float(gate_aux_loss)
     )
@@ -661,6 +764,7 @@ def train_one_epoch(
         local_loss_value,
         bce_loss_value,
         oto_loss_value,
+        origin_loss_value,
         gate_aux_loss_value,
         iteration,
         memory_bank_time,
@@ -685,13 +789,16 @@ def main():
 
     saved_dir = os.path.join(args.save_path, args.dataset, args.noise)
     os.makedirs(saved_dir, exist_ok=True)
-    _enable_print_logging(os.path.join(saved_dir, "run_stdout.log"))
+    enable_print_logging(os.path.join(saved_dir, "run_stdout.log"))
 
     if args.synthetic:
         raise ValueError("当前多类脚本暂不支持 --synthetic。")
 
     class_names = get_all_class_names(args.dataset)
     args.class_names = class_names
+    num_classes_runtime = len(class_names)
+    if args.use_moe_discriminator and args.moe_hard_class_gate and args.beta:
+        raise ValueError("Hard class gate does not support --beta. Please disable beta.")
     train_dataset = MultiClassFeatureDataset(
         data_path=args.data_path,
         dataset_name=args.dataset,
@@ -701,12 +808,47 @@ def main():
         shuffle=True,
     )
 
-    feature_extractor = build_feature_extractor(args)
-    inferred_patch_mask_size = infer_patch_mask_size(train_dataset, feature_extractor, args)
+    feature_extractor = build_dinov3_feature_extractor(args.feature_model, device)
+    inferred_patch_mask_size = infer_dinov3_patch_mask_size(train_dataset, feature_extractor, args.dino_layer_indices, args.use_cls_token, device)
     train_dataset.patch_mask_size = inferred_patch_mask_size
     print(f"inferred patch_mask_size from feature extractor: {inferred_patch_mask_size}")
+    _selected_blocks = resolve_dino_block_indices(feature_extractor, args.dino_layer_indices)
+    _display = [b + 1 for b in _selected_blocks]
+    print(f"[DINOv3] aggregating layers {_display} (0-based blocks {_selected_blocks})")
 
-    loader_kwargs = build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=4)
+    if args.residual:
+        reference_indices_by_class = common_utils.select_reference_indices_by_class(
+            train_dataset, len(class_names),
+            num_reference_images_per_class=args.num_reference_images_per_class,
+            seed=args.seed,
+            strict_clean_reference=args.strict_clean_reference,
+        )
+        for class_idx, ref_ids in reference_indices_by_class.items():
+            print(
+                f"class {class_idx} | selected clean references: {len(ref_ids)} "
+                f"(target={args.num_reference_images_per_class})"
+            )
+        reference_memory_by_class_cpu, reference_index_by_class = common_utils.build_reference_memory_bank(
+            train_dataset, reference_indices_by_class,
+            extract_feature_fn=lambda images: extract_dinov3_feature_batch(
+                images, feature_extractor, args.dino_layer_indices, use_cls_token=args.use_cls_token,
+            ),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device=device,
+        )
+        reference_memory_by_class = common_utils.move_reference_memory_to_gpu(reference_memory_by_class_cpu, device)
+        common_utils.remove_reference_samples_from_dataset(train_dataset, reference_indices_by_class)
+        print(f"train samples after removing references: {len(train_dataset)}")
+        compute_residual_fn = common_utils.compute_residual_feature_batch
+    else:
+        reference_indices_by_class = {cls: [] for cls in range(len(class_names))}
+        reference_memory_by_class_cpu = {}
+        reference_memory_by_class = {}
+        reference_index_by_class = {}
+        compute_residual_fn = common_utils.identity_residual
+
+    loader_kwargs = common_utils.build_loader_kwargs(args.num_workers, pin_memory=True, prefetch_factor=1,persistent_workers=False)
     local_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -721,21 +863,30 @@ def main():
         drop_last=False,
         **loader_kwargs,
     )
+    feature_dim = infer_dinov3_feature_dim(feature_extractor, mini_loader, args.dino_layer_indices, args.use_cls_token, device)
 
-    feature_dim = infer_feature_dim(feature_extractor, mini_loader, args)
-
+    moe_num_expert_runtime = (
+        num_classes_runtime if args.moe_hard_class_gate else int(args.moe_num_expert)
+    )
+    moe_top_k_runtime = 1 if args.moe_hard_class_gate else int(args.moe_top_k)
     localnet = model.localnet(
         len_feature=feature_dim,
         use_moe_discriminator=args.use_moe_discriminator,
-        moe_num_expert=args.moe_num_expert,
-        moe_top_k=args.moe_top_k,
+        moe_num_expert=moe_num_expert_runtime,
+        moe_top_k=moe_top_k_runtime,
         moe_use_cls_token=args.moe_use_cls_token,
+        moe_hard_class_gate=args.moe_hard_class_gate,
     ).to(device)
+    if args.use_moe_discriminator:
+        discriminator = getattr(localnet, "discriminator", None)
+        if discriminator is not None and hasattr(discriminator, "enable_gate_stats"):
+            discriminator.enable_gate_stats(bool(args.moe_expert_vis_enable))
     localnet_optimizer = optim.RMSprop(localnet.parameters(), lr=args.lr, momentum=0.2)
     onetoone_optimizer = optim.Adam(localnet.parameters(), lr=args.lr) if args.alternative else None
     localnet_criterion = nn.BCELoss().to(device)
     l_loss = get_oto_loss(args)
 
+    residual_tag = "" if args.residual else "_no_residual"
     run_name = (
         "gaussian_"
         + str(args.gaussian)
@@ -747,19 +898,55 @@ def main():
         + str(args.kl)
         + "_weight_"
         + str(args.weight)
-        + "_multiclass"
+        + "_multiclass_residual"
+        + residual_tag
     )
+    moe_expert_vis_ctx = {
+        "enabled": bool(args.moe_expert_vis_enable),
+        "save_interval": max(1, int(args.moe_expert_vis_interval)),
+        "save_dir": os.path.join(saved_dir, args.moe_expert_vis_dirname, run_name),
+        "class_names": class_names,
+        "num_expert": int(moe_num_expert_runtime),
+    }
+    if moe_expert_vis_ctx["enabled"] and args.use_moe_discriminator:
+        os.makedirs(moe_expert_vis_ctx["save_dir"], exist_ok=True)
 
+    resume_path = (args.resume or "").strip()
+
+    start_epoch = 0
     iteration = 0
-    best_mean = -1
+    best_mean = -1.0
     best_result_by_class = {}
 
-    for epoch in range(args.epoch):
+    if resume_path:
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"--resume path not found: {resume_path}")
+        print(f"[resume] loading training checkpoint: {resume_path}")
+        last_done, iteration, best_mean, best_result_by_class = common_utils.load_train_checkpoint(
+            resume_path,
+            localnet,
+            localnet_optimizer,
+            onetoone_optimizer,
+        )
+        start_epoch = last_done + 1
+        if start_epoch >= args.epoch:
+            print(
+                f"[resume] checkpoint epoch {last_done} finished; "
+                f"--epoch {args.epoch} means no further epochs to run."
+            )
+        else:
+            print(
+                f"[resume] will continue from epoch {start_epoch + 1} "
+                f"(completed through epoch {last_done + 1}), global_iteration={iteration}"
+            )
+
+    for epoch in range(start_epoch, args.epoch):
         (
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
-                gate_aux_loss_value,
+            origin_loss_value,
+            gate_aux_loss_value,
             iteration,
             memory_bank_time,
             pseudo_label_time,
@@ -783,6 +970,10 @@ def main():
             mini_loader=mini_loader,
             iteration=iteration,
             num_classes=len(class_names),
+            reference_memory_by_class=reference_memory_by_class,
+            reference_index_by_class=reference_index_by_class,
+            moe_expert_vis_ctx=moe_expert_vis_ctx,
+            compute_residual_fn=compute_residual_fn,
         )
 
         print_epoch_losses(
@@ -790,6 +981,7 @@ def main():
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
+            origin_loss=origin_loss_value,
             gate_aux_loss=gate_aux_loss_value,
         )
         print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
@@ -811,7 +1003,7 @@ def main():
             mean_ap_px_list = []
             mean_f1_px_list = []
             mean_aupro_px_list = []
-            for class_name in class_names:
+            for class_idx_eval, class_name in enumerate(class_names):
                 test_loader = build_test_loader(args, class_name)
                 (
                     auroc,
@@ -826,6 +1018,10 @@ def main():
                     feature_extractor,
                     test_loader,
                     args,
+                    class_idx_eval=class_idx_eval,
+                    reference_memory_by_class=reference_memory_by_class,
+                    reference_index_by_class=reference_index_by_class,
+                    compute_residual_fn=compute_residual_fn,
                 )
                 eval_rows.append(
                     [class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px]
@@ -866,7 +1062,11 @@ def main():
                 best_mean = epoch_mean
                 best_result_by_class = {row[0]: tuple(row[1:]) for row in eval_rows}
                 torch.save(
-                    {"net": localnet.state_dict()},
+                    {
+                        "net": localnet.state_dict(),
+                        "reference_memory_by_class": reference_memory_by_class_cpu,
+                        "reference_indices_by_class": reference_indices_by_class,
+                    },
                     os.path.join(saved_dir, run_name + "_localnet.pt"),
                 )
 
@@ -875,6 +1075,19 @@ def main():
                     file.write(
                         f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | gate aux loss: {gate_aux_loss_value:.6f} | gate aux weight: {args.gate_aux_weight:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
                     )
+
+        ckpt_path = common_utils.default_train_checkpoint_path(saved_dir, run_name)
+        common_utils.save_train_checkpoint(
+            ckpt_path,
+            epoch_completed=epoch,
+            iteration=iteration,
+            localnet=localnet,
+            localnet_optimizer=localnet_optimizer,
+            onetoone_optimizer=onetoone_optimizer,
+            best_mean=best_mean,
+            best_result_by_class=best_result_by_class,
+        )
+        print(f"[checkpoint] saved training state -> {ckpt_path}")
 
     if len(best_result_by_class) == 0:
         raise RuntimeError("训练未产生可用评估结果，请检查数据与参数。")

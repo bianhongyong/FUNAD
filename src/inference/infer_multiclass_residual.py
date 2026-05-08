@@ -157,7 +157,7 @@ def build_feature_extractor(args, device):
         feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
         return feature_extractor
 
-    # DINOv3 hub 会 `import utils`，与工程内 `utils` 包冲突；与 self_train_ad_multiclass_residual_dinov3 一致地临时解除。
+    # DINOv3 hub 会 `import utils`，与工程内 `utils` 包冲突；与 self_train_ad_multiclass_dinov3 一致地临时解除。
     local_utils_module = sys.modules.get("utils")
     should_restore_utils = (
         local_utils_module is not None

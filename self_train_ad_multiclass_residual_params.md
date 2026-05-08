@@ -1,6 +1,6 @@
-# `self_train_ad_multiclass_residual.py` 参数说明
+# ~~`self_train_ad_multiclass_residual.py`~~（已删除）参数说明
 
-本文档对应脚本：`self_train_ad_multiclass_residual.py`  
+本文档对应脚本：`self_train_ad_multiclass_residual.py`（已删除，功能已整合至 `self_train_ad_multiclass_dinov3.py`）  
 用途：多类别异常检测的残差特征自训练。
 
 ## 1) 路径与数据

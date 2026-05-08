@@ -9,27 +9,45 @@ CONDA_ENV="${CONDA_ENV:-funad}"
 # shellcheck source=/dev/null
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
+export MPLBACKEND=Agg
 
 # ===== User-configurable =====
 DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_correst_moe_no_cls_token"
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_nn"
 DATASET="mvtec"         # mvtec | visa
 NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
-EPOCH=50
-BATCH_SIZE=16
+EPOCH=200
+BATCH_SIZE=32
 LR=2e-5
 SEED=0
 NUM_WORKERS=4
-FEATURE_MODEL="dino"    # dino | clip
+FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vitl16 | dinov3_vitl16plus | dinov3_vith16plus | dinov3_vit7b16
 
 # Optional switches:
 # - Uncomment to force CPU FAISS index:
 # EXTRA_ARGS+=(--faiss_cpu_index)
 # - Uncomment to enable class adaptive threshold:
 # EXTRA_ARGS+=(--use_class_adaptive_threshold --adaptive_threshold_quantile 0.7)
-EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85 --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.1 --eval_interval 5) 
+# - Uncomment to enable per-class PCA pseudo-label scorer:
+# EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_ev 0.99)
+# - Or set fixed PCA dimension instead of explained variance:
+# EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_dim 128)
 
-python self_train_ad_multiclass.py \
+
+# EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.4 --noise_threshold 0.8
+#       --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.5 --moe_top_k 1 --moe_use_cls_token
+#       --eval_interval 10 --greedy_keep_images 2                 
+#       --moe_expert_vis_enable
+#       --pseudo_label_distance_norm percentile --pseudo_label_distance_norm_percentile 99 --pseudo_label_scoring nn
+# )
+
+EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85
+      #--use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.5 --moe_top_k 4 
+      --eval_interval 10 --greedy_keep_images 2                 
+      --moe_expert_vis_enable --pseudo_label_scoring nn
+      --resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_nn/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
+)
+python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \
   --save_path "$SAVE_PATH" \
   --dataset "$DATASET" \
