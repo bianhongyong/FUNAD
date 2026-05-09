@@ -13,7 +13,7 @@ export MPLBACKEND=Agg
 
 # ===== User-configurable =====
 DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_nn"
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_moe_discriminator_nn_screw"
 DATASET="mvtec"         # mvtec | visa
 NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
 EPOCH=200
@@ -42,10 +42,9 @@ FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vi
 # )
 
 EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85
-      #--use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.5 --moe_top_k 4 
+      --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.5 --moe_top_k 4 
       --eval_interval 10 --greedy_keep_images 2                 
       --moe_expert_vis_enable --pseudo_label_scoring nn
-      --resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_nn/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
 )
 python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \

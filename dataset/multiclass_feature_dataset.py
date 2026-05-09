@@ -12,21 +12,21 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 MVTEC_CLASS_NAMES = [
-     "bottle",
-     "cable",
-     "capsule",
-     "carpet",
-     "grid",
-     "hazelnut",
-     "leather",
-     "metal_nut",
-     "pill",
+    #  "bottle",
+    #  "cable",
+    #  "capsule",
+    #  "carpet",
+    #  "grid",
+    #  "hazelnut",
+    #  "leather",
+    #  "metal_nut",
+    #  "pill",
      "screw",
-     "tile",
-     "toothbrush",
-     "transistor",
-     "wood",
-     "zipper",
+    #  "tile",
+    #  "toothbrush",
+    #  "transistor",
+    #  "wood",
+    #  "zipper",
 ]
 
 VISA_CLASS_NAMES = [

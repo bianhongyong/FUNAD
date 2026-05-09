@@ -126,7 +126,9 @@ class NoisyGate(BaseGate):
         zeros = torch.zeros_like(logits, requires_grad=True)
         gates = zeros.scatter(1, top_k_indices, top_k_gates)
 
-        if self.top_k < self.tot_expert:
+        # _prob_in_top_k divides by noise_stddev; in eval(), noise_stddev is
+        # zeroed by design (no stochastic noise), which would yield inf/nan.
+        if self.top_k < self.tot_expert and self.training:
             load = (
                 self._prob_in_top_k(
                     clean_logits, noisy_logits, noise_stddev, top_logits
@@ -139,7 +141,10 @@ class NoisyGate(BaseGate):
         loss = self.cv_squared(importance) + self.cv_squared(load)
         self.set_loss(loss)
 
+        # Keep [batch, top_k] like NaiveGate. A flattened 1-D index tensor makes
+        # _fmoe_general_global_forward assume topk==1, so pos indexes rows past
+        # the real batch and CUDA index_select asserts.
         return (
-            top_k_indices.contiguous().view(-1),
+            top_k_indices.contiguous(),
             top_k_gates.contiguous().unsqueeze(1),
         )

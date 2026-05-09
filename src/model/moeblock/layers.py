@@ -114,7 +114,7 @@ class FMoE(nn.Module):
         moe_group=None,
         top_k=2,
         # gate=NaiveGate,
-        gate=SwitchGate,
+        gate=NoisyGate,
         expert=None,
         gate_hook=None,
         mask=None,
