@@ -12,12 +12,12 @@ conda activate "$CONDA_ENV"
 export MPLBACKEND=Agg
 
 # ===== User-configurable =====
-DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_moe_discriminator_nn_screw"
+DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy20"
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_moe_discriminator_cls_token_nn"
 DATASET="mvtec"         # mvtec | visa
-NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
+NOISE="20%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
 EPOCH=200
-BATCH_SIZE=32
+BATCH_SIZE=8
 LR=2e-5
 SEED=0
 NUM_WORKERS=4
@@ -41,10 +41,16 @@ FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vi
 #       --pseudo_label_distance_norm percentile --pseudo_label_distance_norm_percentile 99 --pseudo_label_scoring nn
 # )
 
+# Normal sample selection mode in Phase 2:
+#   --normal_sample_selection threshold  (default, uses norm_score < 0.5)
+#   --normal_sample_selection quantile   (uses top N% lowest scores, set via --normal_sample_quantile)
+# Example: EXTRA_ARGS+=(--normal_sample_selection quantile --normal_sample_quantile 0.3)
+
 EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85
-      --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.5 --moe_top_k 4 
-      --eval_interval 10 --greedy_keep_images 2                 
-      --moe_expert_vis_enable --pseudo_label_scoring nn
+      --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.05 --moe_top_k 1 --moe_use_cls_token
+      --eval_interval 1                
+      --moe_expert_vis_enable
+      --normal_sample_selection quantile --normal_sample_quantile 0.3
 )
 python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \

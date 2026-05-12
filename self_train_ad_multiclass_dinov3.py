@@ -279,6 +279,23 @@ def parse_args():
         "GreedyCoreset is applied on the merged features. Scoring uses one global "
         "scorer for all patches, which tests whether per-class memory bank is beneficial.",
     )
+    parser.add_argument(
+        "--normal_sample_selection",
+        type=str,
+        choices=["threshold", "quantile"],
+        default="threshold",
+        help="How to select 'normal' images in Phase 2 of pseudo-label pipeline. "
+        "'threshold' (default): select images with norm_score < 0.5. "
+        "'quantile': select images with norm_score below the top-N quantile (e.g. top 30%).",
+    )
+    parser.add_argument(
+        "--normal_sample_quantile",
+        type=float,
+        default=0.3,
+        help="Quantile threshold for 'quantile' selection mode. "
+        "E.g., 0.3 means top 30% lowest-scoring images are considered normal candidates. "
+        "Only used when --normal_sample_selection=quantile.",
+    )
 
     return parser.parse_args()
 
@@ -797,6 +814,16 @@ def main():
     saved_dir = os.path.join(args.save_path, args.dataset, args.noise)
     os.makedirs(saved_dir, exist_ok=True)
     enable_print_logging(os.path.join(saved_dir, "run_stdout.log"))
+
+    # 将 CLI 参数保存为 CSV
+    import csv
+    args_csv_path = os.path.join(saved_dir, "cli_args.csv")
+    with open(args_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["key", "value"])
+        for key, value in sorted(vars(args).items()):
+            writer.writerow([key, value])
+    print(f"[CLI Args] saved -> {args_csv_path}")
 
     if args.synthetic:
         raise ValueError("当前多类脚本暂不支持 --synthetic。")
