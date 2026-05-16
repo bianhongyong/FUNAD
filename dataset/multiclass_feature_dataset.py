@@ -21,7 +21,7 @@ MVTEC_CLASS_NAMES = [
      "leather",
      "metal_nut",
      "pill",
-     "screw",
+    #  "screw",
      "tile",
      "toothbrush",
      "transistor",

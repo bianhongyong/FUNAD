@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import faiss
 import matplotlib
@@ -100,68 +100,102 @@ def _build_patch_class_idx(class_idx: torch.Tensor, patch_features: torch.Tensor
 
 
 def _plot_distance_distribution_normal_vs_anomaly(
-    args, distance_values, gt_patch_masks, epoch=None
+    args, distance_values, gt_patch_masks, epoch=None,
+    class_stack=None, num_classes=None, class_names=None,
 ):
     values = np.asarray(distance_values, dtype=np.float32).reshape(-1)
     labels = np.asarray(gt_patch_masks, dtype=np.uint8).reshape(-1) > 0
     if values.size == 0 or labels.size != values.size:
         return
 
-    normal_values = values[~labels]
-    anomaly_values = values[labels]
-    if normal_values.size == 0 and anomaly_values.size == 0:
-        return
-
     # Keep plotting lightweight even for large datasets.
     max_points = 200000
-    if normal_values.size > max_points:
-        normal_values = np.random.choice(normal_values, size=max_points, replace=False)
-    if anomaly_values.size > max_points:
-        anomaly_values = np.random.choice(anomaly_values, size=max_points, replace=False)
+
+    def _plot_single_hist(values, labels, save_path, title_suffix=""):
+        normal_values = values[~labels]
+        anomaly_values = values[labels]
+        if normal_values.size == 0 and anomaly_values.size == 0:
+            return False
+
+        _normal_vals = normal_values
+        _anomaly_vals = anomaly_values
+        if _normal_vals.size > max_points:
+            _normal_vals = np.random.choice(_normal_vals, size=max_points, replace=False)
+        if _anomaly_vals.size > max_points:
+            _anomaly_vals = np.random.choice(_anomaly_vals, size=max_points, replace=False)
+
+        plt.figure(figsize=(10, 6))
+        bins = np.linspace(0.0, 1.0, 101)
+        if _normal_vals.size > 0:
+            plt.hist(
+                _normal_vals,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:blue",
+                label=f"normal ({_normal_vals.size})",
+            )
+        if _anomaly_vals.size > 0:
+            plt.hist(
+                _anomaly_vals,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:red",
+                label=f"anomaly ({_anomaly_vals.size})",
+            )
+
+        plt.xlabel("Normalized distance")
+        plt.ylabel("Density")
+        plt.title(f"Distance Distribution: Normal vs Anomaly Patches{title_suffix}")
+        plt.xlim(0.0, 1.0)
+        plt.grid(alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+        print(f"[PseudoLabel-Plot] saved: {save_path}")
+        return True
 
     save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    # Put epoch plots in a subfolder
+    if epoch is not None:
+        save_dir = os.path.join(save_dir, f"epoch_{int(epoch) + 1:03d}")
     os.makedirs(save_dir, exist_ok=True)
+
     if epoch is None:
         filename = "distance_distribution_normal_vs_anomaly.png"
     else:
-        filename = f"distance_distribution_normal_vs_anomaly_epoch_{int(epoch) + 1:03d}.png"
+        filename = "distance_distribution_normal_vs_anomaly.png"
     save_path = os.path.join(save_dir, filename)
+    _plot_single_hist(values, labels, save_path)
 
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0.0, 1.0, 101)
-    if normal_values.size > 0:
-        plt.hist(
-            normal_values,
-            bins=bins,
-            density=True,
-            alpha=0.55,
-            color="tab:blue",
-            label=f"normal ({normal_values.size})",
-        )
-    if anomaly_values.size > 0:
-        plt.hist(
-            anomaly_values,
-            bins=bins,
-            density=True,
-            alpha=0.55,
-            color="tab:red",
-            label=f"anomaly ({anomaly_values.size})",
-        )
+    # Per-class plots
+    if class_stack is not None and num_classes is not None:
+        cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+        if cls_arr.shape[0] == values.shape[0]:
+            name_list = list(class_names) if class_names is not None else []
+            if len(name_list) != int(num_classes):
+                name_list = [f"cls_{i}" for i in range(int(num_classes))]
 
-    plt.xlabel("Normalized distance")
-    plt.ylabel("Density")
-    plt.title("Distance Distribution: Normal vs Anomaly Patches")
-    plt.xlim(0.0, 1.0)
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
-    print(f"[PseudoLabel-Plot] saved: {save_path}")
+            for cls in range(int(num_classes)):
+                cls_idx = np.where(cls_arr == cls)[0]
+                if cls_idx.size == 0:
+                    continue
+                cls_values = values[cls_idx]
+                cls_labels = labels[cls_idx]
+                cls_save_path = os.path.join(
+                    save_dir, f"distance_distribution_{name_list[cls]}.png"
+                )
+                _plot_single_hist(
+                    cls_values, cls_labels, cls_save_path,
+                    title_suffix=f" — {name_list[cls]}",
+                )
 
 
 def _plot_image_norm_score_distribution_normal_vs_anomaly(
-    args, image_norm_scores, gt_patch_masks, epoch=None
+    args, image_norm_scores, gt_patch_masks, epoch=None,
+    class_stack=None, num_classes=None, class_names=None,
 ):
     scores = np.asarray(image_norm_scores, dtype=np.float32).reshape(-1)
     patch_masks = np.asarray(gt_patch_masks, dtype=np.uint8)
@@ -170,52 +204,79 @@ def _plot_image_norm_score_distribution_normal_vs_anomaly(
 
     # Image is anomaly if any patch is anomaly.
     image_is_anomaly = patch_masks.reshape(patch_masks.shape[0], -1).sum(axis=1) > 0
-    normal_scores = scores[~image_is_anomaly]
-    anomaly_scores = scores[image_is_anomaly]
-    if normal_scores.size == 0 and anomaly_scores.size == 0:
-        return
+
+    def _plot_single_hist(scores, image_is_anomaly, save_path, title_suffix=""):
+        normal_scores = scores[~image_is_anomaly]
+        anomaly_scores = scores[image_is_anomaly]
+        if normal_scores.size == 0 and anomaly_scores.size == 0:
+            return False
+
+        plt.figure(figsize=(10, 6))
+        bins = np.linspace(0.0, 1.0, 51)
+        if normal_scores.size > 0:
+            plt.hist(
+                normal_scores,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:blue",
+                label=f"normal ({normal_scores.size})",
+            )
+        if anomaly_scores.size > 0:
+            plt.hist(
+                anomaly_scores,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:red",
+                label=f"anomaly ({anomaly_scores.size})",
+            )
+
+        plt.xlabel("Image normalized score")
+        plt.ylabel("Density")
+        plt.title(f"Image Norm Score Distribution: Normal vs Anomaly Images{title_suffix}")
+        plt.xlim(0.0, 1.0)
+        plt.grid(alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+        print(f"[PseudoLabel-Plot] saved: {save_path}")
+        return True
 
     save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if epoch is not None:
+        save_dir = os.path.join(save_dir, f"epoch_{int(epoch) + 1:03d}")
     os.makedirs(save_dir, exist_ok=True)
+
     if epoch is None:
         filename = "image_norm_scores_distribution_normal_vs_anomaly.png"
     else:
-        filename = (
-            f"image_norm_scores_distribution_normal_vs_anomaly_epoch_{int(epoch) + 1:03d}.png"
-        )
+        filename = "image_norm_scores_distribution_normal_vs_anomaly.png"
     save_path = os.path.join(save_dir, filename)
+    _plot_single_hist(scores, image_is_anomaly, save_path)
 
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0.0, 1.0, 51)
-    if normal_scores.size > 0:
-        plt.hist(
-            normal_scores,
-            bins=bins,
-            density=True,
-            alpha=0.55,
-            color="tab:blue",
-            label=f"normal ({normal_scores.size})",
-        )
-    if anomaly_scores.size > 0:
-        plt.hist(
-            anomaly_scores,
-            bins=bins,
-            density=True,
-            alpha=0.55,
-            color="tab:red",
-            label=f"anomaly ({anomaly_scores.size})",
-        )
+    # Per-class plots
+    if class_stack is not None and num_classes is not None:
+        cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+        if cls_arr.shape[0] == scores.shape[0]:
+            name_list = list(class_names) if class_names is not None else []
+            if len(name_list) != int(num_classes):
+                name_list = [f"cls_{i}" for i in range(int(num_classes))]
 
-    plt.xlabel("Image normalized score")
-    plt.ylabel("Density")
-    plt.title("Image Norm Score Distribution: Normal vs Anomaly Images")
-    plt.xlim(0.0, 1.0)
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
-    print(f"[PseudoLabel-Plot] saved: {save_path}")
+            for cls in range(int(num_classes)):
+                cls_idx = np.where(cls_arr == cls)[0]
+                if cls_idx.size == 0:
+                    continue
+                cls_scores = scores[cls_idx]
+                cls_anomaly = image_is_anomaly[cls_idx]
+                cls_save_path = os.path.join(
+                    save_dir, f"image_norm_scores_distribution_{name_list[cls]}.png"
+                )
+                _plot_single_hist(
+                    cls_scores, cls_anomaly, cls_save_path,
+                    title_suffix=f" — {name_list[cls]}",
+                )
 
 
 def _plot_classwise_feature_l2_by_distance_regions(
@@ -383,6 +444,25 @@ def _plot_classwise_abs_distance_box_before_norm(
     plt.savefig(save_path, dpi=220)
     plt.close()
     print(f"[PseudoLabel-Plot] saved: {save_path}")
+
+
+def _write_memory_bank_snapshot(
+    memory_bank_snapshot: Dict[str, Any],
+    reduced_features_by_class: dict,
+    class_stack: np.ndarray,
+    gt_patch_masks: np.ndarray,
+    global_dim: int,
+) -> None:
+    memory_bank_snapshot.clear()
+    memory_bank_snapshot["reduced_features_by_class"] = {
+        int(k): np.asarray(v, dtype=np.float32).copy()
+        for k, v in reduced_features_by_class.items()
+    }
+    memory_bank_snapshot["class_stack"] = np.asarray(class_stack, dtype=np.int64).copy()
+    memory_bank_snapshot["gt_patch_masks"] = np.asarray(gt_patch_masks, dtype=np.uint8).copy()
+    memory_bank_snapshot["global_dim"] = int(global_dim)
+
+
 def precompute_pseudo_labels_multiclass_residual(
     args,
     localnet,
@@ -402,270 +482,331 @@ def precompute_pseudo_labels_multiclass_residual(
     print_confusion_matrix_fn,
     epoch=None,
     pseudo_label_scorer: Optional[PseudoLabelScorer] = None,
+    memory_bank_snapshot: Optional[Dict[str, Any]] = None,
+    threshold: Optional[float] = None,
 ):
     memory_bank_start = time.perf_counter()
 
     dataset_size = len(mini_loader.dataset)
-    image_scores = np.zeros(dataset_size, dtype=np.float32)
-    class_stack = np.zeros(dataset_size, dtype=np.int64)
-    gt_patch_masks = np.zeros((dataset_size, 784), dtype=np.uint8)
-    global_dim = None
+    freeze_start = int(getattr(args, "memory_bank_freeze_start_epoch", -1))
+    if freeze_start < 1:
+        freeze_start = -1
 
-    print("[Phase 1/3] Computing image scores...")
-    with torch.no_grad():
-        localnet.eval()
-        feature_extractor.eval()
-        for batch in tqdm.tqdm(mini_loader, desc="Phase 1"):
-            if len(batch) == 4:
-                images, mini_class_idx, mini_sample_idx, mini_patch_mask = batch
-            else:
-                images, mini_class_idx, mini_sample_idx = batch
-                mini_patch_mask = None
-            images = images.to(device)
-            image_features, cls_token = _extract_features_with_optional_cls_token(
-                extract_feature_batch_fn, images, feature_extractor, args
-            )
-            residual_features = compute_residual_feature_batch_fn(
-                image_features,
-                mini_class_idx.to(device),
-                reference_memory_by_class,
-                reference_index_by_class,
-            )
-            patch_class_idx = None
-            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
-                patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
-            features, score = localnet(
-                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
-            )
-            if features.shape[0] > args.batch_size:
-                features = features.unsqueeze(0)
-
-            if global_dim is None:
-                global_dim = int(features.shape[-1])
-
-            score_np = score.detach().cpu().numpy()
-            score_np = _as_1d_float32(
-                aggregate_image_scores_fn(
-                    score_np,
-                    topk_ratio=args.img_score_topk_ratio,
-                )
-            )
-
-            sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
-            class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
-            image_scores[sample_idx_np] = score_np.astype(np.float32)
-            class_stack[sample_idx_np] = class_np
-            if mini_patch_mask is not None:
-                mask_np = mini_patch_mask.detach().cpu().numpy()
-                gt_patch_masks[sample_idx_np] = (mask_np > 0).astype(np.uint8)
-    image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
-    normalized_score = np.zeros_like(image_scores, dtype=np.float32)
-    #分类归一化
-    for cls in range(num_classes):
-        cls_mask = class_stack == cls
-        if not np.any(cls_mask):
-            continue
-        cls_scores = image_scores[cls_mask]
-        cls_norm = _minmax_normalize(cls_scores)
-        normalized_score[cls_mask] = cls_norm.astype(np.float32)
-
-    image_norm_scores[:] = normalized_score.astype(np.float32)
-    _plot_image_norm_score_distribution_normal_vs_anomaly(
-        args=args,
-        image_norm_scores=image_norm_scores,
-        gt_patch_masks=gt_patch_masks,
-        epoch=epoch,
+    frozen_mode = (
+        freeze_start >= 1
+        and epoch is not None
+        and int(epoch) >= freeze_start
+        and memory_bank_snapshot is not None
+        and memory_bank_snapshot.get("reduced_features_by_class")
     )
-    
-    selected_local_list = []
-    print("[Phase 2/3] Building memory bank from normal samples...")
-    #下采样选取
-    select_mode = str(getattr(args, "normal_sample_selection", "threshold"))
-    select_quantile = float(getattr(args, "normal_sample_quantile", 0.3))
-    for cls in range(num_classes):
-        cls_mask = class_stack == cls
-        if not np.any(cls_mask):
-            continue
-        cls_indices = np.where(cls_mask)[0].astype(np.int64)
-        cls_norm_scores = normalized_score[cls_indices]
-
-        if select_mode == "quantile":
-            # 取归一化分数最低的前 N% 图片作为正常候选
-            q = np.percentile(cls_norm_scores, select_quantile * 100.0)
-            cls_normal_local = np.where(cls_norm_scores <= q)[0]
-        else:
-            # 默认：取分数 < 0.5 的图片作为正常候选
-            cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
-
-        if cls_normal_local.shape[0] == 0:
-            cls_selected = cls_indices
-        elif select_mode == "quantile":
-            # quantile 模式下已选出前 N% 图片，无需再随机下采样
-            cls_selected = cls_indices[cls_normal_local]
-        elif args.random < 1:
-            cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
-            pick_local = np.random.choice(
-                cls_normal_local, size=cls_sample_num, replace=False
+    if frozen_mode:
+        snap_cs = memory_bank_snapshot.get("class_stack")
+        if snap_cs is None or len(snap_cs) != dataset_size:
+            print(
+                "[MemoryBank] snapshot incompatible with current dataset "
+                f"(class_stack len {0 if snap_cs is None else len(snap_cs)} "
+                f"vs dataset_size {dataset_size}); running full Phase 1/2"
             )
-            cls_selected = cls_indices[pick_local]
-        else:
-            cls_selected = cls_indices[cls_normal_local]
-        selected_local_list.append(cls_selected)
+            frozen_mode = False
 
-    if len(selected_local_list) == 0:
-        selected_indices = np.arange(dataset_size, dtype=np.int64)
-    else:
-        selected_indices = np.concatenate(selected_local_list, axis=0).astype(np.int64)
-    print_selected_score_distribution_fn(
-        selected_indices=selected_indices,
-        class_stack=class_stack,
-        image_scores=image_scores,
-    )
-    print_selected_clean_ratio_fn(
-        selected_indices=selected_indices,
-        dataset=mini_loader.dataset,
-    )
-
-    distance_map = np.zeros((dataset_size, 784), dtype=np.float16)
-    patch_feature_l2_map = np.zeros((dataset_size, 784), dtype=np.float32)
-    confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
-    if selected_indices.shape[0] == 0:
-        pseudo_label_time = time.perf_counter() - memory_bank_start
-        return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
-
-    # 按类别记录被选中的图像索引
-    selected_images_by_class = {}
-    for cls in range(num_classes):
-        cls_mask = class_stack[selected_indices] == cls
-        selected_images_by_class[cls] = selected_indices[cls_mask]
-
-    # Phase 2: 提取选中样本的 residual 特征，并按类别缓存
-    class_feature_buffers = {cls: [] for cls in range(num_classes)}
-    with torch.no_grad():
-        localnet.eval()
-        feature_extractor.eval()
-        selected_subset = Subset(mini_loader.dataset, selected_indices.tolist())
-        selected_loader = DataLoader(
-            selected_subset,
-            batch_size=mini_loader.batch_size,
-            pin_memory=mini_loader.pin_memory,
-            shuffle=False,
-            num_workers=0,
-            drop_last=False,
-        )
-        for batch in tqdm.tqdm(selected_loader, desc="Phase 2"):
-            if len(batch) == 4:
-                images, mini_class_idx, _mini_sample_idx, _mini_patch_mask = batch
-            else:
-                images, mini_class_idx, _mini_sample_idx = batch
-            images = images.to(device)
-            image_features, cls_token = _extract_features_with_optional_cls_token(
-                extract_feature_batch_fn, images, feature_extractor, args
-            )
-            residual_features = compute_residual_feature_batch_fn(
-                image_features,
-                mini_class_idx.to(device),
-                reference_memory_by_class,
-                reference_index_by_class,
-            )
-            patch_class_idx = None
-            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
-                patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
-            features, _ = localnet(
-                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
-            )
-            features_np = features.detach().cpu().numpy()
-            batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
-
-            for cls in np.unique(batch_class_np).tolist():
-                cls = int(cls)
-                cls_mask = batch_class_np == cls
-                if not np.any(cls_mask):
-                    continue
-                cls_features = features_np[cls_mask].reshape(-1, global_dim)
-                class_feature_buffers[cls].append(cls_features)
-
-    reduced_features_by_class = {}
-    coreset_indices_by_class = {}
-    if getattr(args, "global_memory_bank", False):
-        # 全局记忆库：将各类特征合并，统一做 GreedyCoreset
-        global_features_list = []
-        for cls in range(num_classes):
-            if len(class_feature_buffers[cls]) == 0:
-                continue
-            global_features_list.append(np.concatenate(class_feature_buffers[cls], axis=0))
-        if global_features_list:
-            all_features = np.concatenate(global_features_list, axis=0)
-            total_images = max(1, selected_indices.shape[0])
-            patches_per_image_global = max(1, all_features.shape[0] // total_images)
-            greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
-            target_images_global = min(greedy_keep_images, total_images)
-            target_features_global = patches_per_image_global * target_images_global
-
-            if 0 < target_features_global < all_features.shape[0]:
-                percentage = float(target_features_global) / float(all_features.shape[0])
-                sampler = ApproximateGreedyCoresetSampler(
-                    percentage=percentage,
-                    device=device,
-                )
-                all_features, core_idx = sampler.run(
-                    all_features, return_indices=True
-                )
-                _ = core_idx  # unused but kept for interface compatibility
-            reduced_features_by_class[0] = all_features
+    if frozen_mode:
         print(
-            f"[GlobalMemoryBank] merged {len(global_features_list)} classes → "
-            f"{all_features.shape[0] if global_features_list else 0} patches after greedy coreset"
+            f"[MemoryBank] frozen from epoch {freeze_start} "
+            f"(current epoch index {int(epoch)}): skipping Phase 1/2"
         )
-    else:
-        # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
+        reduced_features_by_class = {
+            int(k): np.asarray(v, dtype=np.float32).copy()
+            for k, v in memory_bank_snapshot["reduced_features_by_class"].items()
+        }
+        class_stack = np.asarray(memory_bank_snapshot["class_stack"], dtype=np.int64).copy()
+        gt_patch_masks = np.asarray(memory_bank_snapshot["gt_patch_masks"], dtype=np.uint8).copy()
+        global_dim = int(memory_bank_snapshot["global_dim"])
+        image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
+        distance_map = np.zeros((dataset_size, 784), dtype=np.float16)
+        patch_feature_l2_map = np.zeros((dataset_size, 784), dtype=np.float32)
+        confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
+    if not frozen_mode:
+        image_scores = np.zeros(dataset_size, dtype=np.float32)
+        class_stack = np.zeros(dataset_size, dtype=np.int64)
+        gt_patch_masks = np.zeros((dataset_size, 784), dtype=np.uint8)
+        global_dim = None
+
+        print("[Phase 1/3] Computing image scores...")
+        with torch.no_grad():
+            localnet.eval()
+            feature_extractor.eval()
+            for batch in tqdm.tqdm(mini_loader, desc="Phase 1"):
+                if len(batch) == 4:
+                    images, mini_class_idx, mini_sample_idx, mini_patch_mask = batch
+                else:
+                    images, mini_class_idx, mini_sample_idx = batch
+                    mini_patch_mask = None
+                images = images.to(device)
+                image_features, cls_token = _extract_features_with_optional_cls_token(
+                    extract_feature_batch_fn, images, feature_extractor, args
+                )
+                residual_features = compute_residual_feature_batch_fn(
+                    image_features,
+                    mini_class_idx.to(device),
+                    reference_memory_by_class,
+                    reference_index_by_class,
+                )
+                patch_class_idx = None
+                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                    patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
+                features, score = localnet(
+                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+                )
+                if features.shape[0] > args.batch_size:
+                    features = features.unsqueeze(0)
+
+                if global_dim is None:
+                    global_dim = int(features.shape[-1])
+
+                score_np = score.detach().cpu().numpy()
+                score_np = _as_1d_float32(
+                    aggregate_image_scores_fn(
+                        score_np,
+                        topk_ratio=args.img_score_topk_ratio,
+                    )
+                )
+
+                sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
+                class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
+                image_scores[sample_idx_np] = score_np.astype(np.float32)
+                class_stack[sample_idx_np] = class_np
+                if mini_patch_mask is not None:
+                    mask_np = mini_patch_mask.detach().cpu().numpy()
+                    gt_patch_masks[sample_idx_np] = (mask_np > 0).astype(np.uint8)
+        image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
+        normalized_score = np.zeros_like(image_scores, dtype=np.float32)
+        #分类归一化
         for cls in range(num_classes):
-            if len(class_feature_buffers[cls]) == 0:
+            cls_mask = class_stack == cls
+            if not np.any(cls_mask):
                 continue
-            normal_features_cls = np.concatenate(class_feature_buffers[cls], axis=0)
+            cls_scores = image_scores[cls_mask]
+            cls_norm = _minmax_normalize(cls_scores)
+            normalized_score[cls_mask] = cls_norm.astype(np.float32)
 
-            num_selected_images_cls = selected_images_by_class.get(cls, np.array([], dtype=np.int64)).shape[0]
-            if num_selected_images_cls > 0 and normal_features_cls.shape[0] > 0:
-                patches_per_image = normal_features_cls.shape[0] // num_selected_images_cls
-            else:
-                patches_per_image = normal_features_cls.shape[0]
-
-            greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
-            target_images = (
-                min(greedy_keep_images, num_selected_images_cls)
-                if num_selected_images_cls > 0
-                else 1
-            )
-            target_features = patches_per_image * target_images
-
-            if 0 < target_features < normal_features_cls.shape[0]:
-                percentage = float(target_features) / float(normal_features_cls.shape[0])
-                sampler = ApproximateGreedyCoresetSampler(
-                    percentage=percentage,
-                    device=device,
-                )
-                normal_features_cls, core_idx = sampler.run(
-                    normal_features_cls, return_indices=True
-                )
-            else:
-                core_idx = np.arange(normal_features_cls.shape[0], dtype=np.int64)
-
-            reduced_features_by_class[cls] = normal_features_cls
-            coreset_indices_by_class[cls] = core_idx
-
-    if len(reduced_features_by_class) > 0 and not getattr(args, "global_memory_bank", False):
-        print_greedy_memory_bank_anomaly_stats(
-            num_classes=num_classes,
-            selected_images_by_class=selected_images_by_class,
+        image_norm_scores[:] = normalized_score.astype(np.float32)
+        _plot_image_norm_score_distribution_normal_vs_anomaly(
+            args=args,
+            image_norm_scores=image_norm_scores,
             gt_patch_masks=gt_patch_masks,
-            reduced_features_by_class=reduced_features_by_class,
-            coreset_indices_by_class=coreset_indices_by_class,
-            class_names=getattr(args, "class_names", None),
             epoch=epoch,
+            class_stack=class_stack,
+            num_classes=num_classes,
+            class_names=getattr(args, "class_names", None),
+        )
+    
+        selected_local_list = []
+        print("[Phase 2/3] Building memory bank from normal samples...")
+        #下采样选取
+        select_mode = str(getattr(args, "normal_sample_selection", "threshold"))
+        select_quantile = float(getattr(args, "normal_sample_quantile", 0.3))
+        for cls in range(num_classes):
+            cls_mask = class_stack == cls
+            if not np.any(cls_mask):
+                continue
+            cls_indices = np.where(cls_mask)[0].astype(np.int64)
+            cls_norm_scores = normalized_score[cls_indices]
+
+            if select_mode == "quantile":
+                # 取归一化分数最低的前 N% 图片作为正常候选
+                q = np.percentile(cls_norm_scores, select_quantile * 100.0)
+                cls_normal_local = np.where(cls_norm_scores <= q)[0]
+            else:
+                # 默认：取分数 < 0.5 的图片作为正常候选
+                cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
+
+            if cls_normal_local.shape[0] == 0:
+                cls_selected = cls_indices
+            elif select_mode == "quantile":
+                # quantile 模式下已选出前 N% 图片，无需再随机下采样
+                cls_selected = cls_indices[cls_normal_local]
+            elif args.random < 1:
+                cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
+                pick_local = np.random.choice(
+                    cls_normal_local, size=cls_sample_num, replace=False
+                )
+                cls_selected = cls_indices[pick_local]
+            else:
+                cls_selected = cls_indices[cls_normal_local]
+            selected_local_list.append(cls_selected)
+
+        if len(selected_local_list) == 0:
+            selected_indices = np.arange(dataset_size, dtype=np.int64)
+        else:
+            selected_indices = np.concatenate(selected_local_list, axis=0).astype(np.int64)
+        print_selected_score_distribution_fn(
+            selected_indices=selected_indices,
+            class_stack=class_stack,
+            image_scores=image_scores,
+        )
+        print_selected_clean_ratio_fn(
+            selected_indices=selected_indices,
+            dataset=mini_loader.dataset,
         )
 
-    if len(reduced_features_by_class) == 0:
-        raise ValueError("No reduced features by class")
+        distance_map = np.zeros((dataset_size, 784), dtype=np.float16)
+        patch_feature_l2_map = np.zeros((dataset_size, 784), dtype=np.float32)
+        confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
+        if selected_indices.shape[0] == 0:
+            pseudo_label_time = time.perf_counter() - memory_bank_start
+            return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
+
+        # 按类别记录被选中的图像索引
+        selected_images_by_class = {}
+        for cls in range(num_classes):
+            cls_mask = class_stack[selected_indices] == cls
+            selected_images_by_class[cls] = selected_indices[cls_mask]
+
+        # Phase 2: 提取选中样本的 residual 特征，并按类别缓存
+        class_feature_buffers = {cls: [] for cls in range(num_classes)}
+        with torch.no_grad():
+            localnet.eval()
+            feature_extractor.eval()
+            selected_subset = Subset(mini_loader.dataset, selected_indices.tolist())
+            selected_loader = DataLoader(
+                selected_subset,
+                batch_size=mini_loader.batch_size,
+                pin_memory=mini_loader.pin_memory,
+                shuffle=False,
+                num_workers=0,
+                drop_last=False,
+            )
+            for batch in tqdm.tqdm(selected_loader, desc="Phase 2"):
+                if len(batch) == 4:
+                    images, mini_class_idx, _mini_sample_idx, _mini_patch_mask = batch
+                else:
+                    images, mini_class_idx, _mini_sample_idx = batch
+                images = images.to(device)
+                image_features, cls_token = _extract_features_with_optional_cls_token(
+                    extract_feature_batch_fn, images, feature_extractor, args
+                )
+                residual_features = compute_residual_feature_batch_fn(
+                    image_features,
+                    mini_class_idx.to(device),
+                    reference_memory_by_class,
+                    reference_index_by_class,
+                )
+                patch_class_idx = None
+                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                    patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
+                features, _ = localnet(
+                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+                )
+                features_np = features.detach().cpu().numpy()
+                batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
+
+                for cls in np.unique(batch_class_np).tolist():
+                    cls = int(cls)
+                    cls_mask = batch_class_np == cls
+                    if not np.any(cls_mask):
+                        continue
+                    cls_features = features_np[cls_mask].reshape(-1, global_dim)
+                    class_feature_buffers[cls].append(cls_features)
+
+        reduced_features_by_class = {}
+        coreset_indices_by_class = {}
+        if getattr(args, "global_memory_bank", False):
+            # 全局记忆库：将各类特征合并，统一做 GreedyCoreset
+            global_features_list = []
+            for cls in range(num_classes):
+                if len(class_feature_buffers[cls]) == 0:
+                    continue
+                global_features_list.append(np.concatenate(class_feature_buffers[cls], axis=0))
+            if global_features_list:
+                all_features = np.concatenate(global_features_list, axis=0)
+                total_images = max(1, selected_indices.shape[0])
+                patches_per_image_global = max(1, all_features.shape[0] // total_images)
+                greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
+                target_images_global = min(greedy_keep_images, total_images)
+                target_features_global = patches_per_image_global * target_images_global
+
+                if 0 < target_features_global < all_features.shape[0]:
+                    percentage = float(target_features_global) / float(all_features.shape[0])
+                    sampler = ApproximateGreedyCoresetSampler(
+                        percentage=percentage,
+                        device=device,
+                    )
+                    all_features, core_idx = sampler.run(
+                        all_features, return_indices=True
+                    )
+                    _ = core_idx  # unused but kept for interface compatibility
+                reduced_features_by_class[0] = all_features
+            print(
+                f"[GlobalMemoryBank] merged {len(global_features_list)} classes → "
+                f"{all_features.shape[0] if global_features_list else 0} patches after greedy coreset"
+            )
+        else:
+            # 按类别做 GreedyCoreset，下采样到「约等于 2 张图片的 patch 数」
+            for cls in range(num_classes):
+                if len(class_feature_buffers[cls]) == 0:
+                    continue
+                normal_features_cls = np.concatenate(class_feature_buffers[cls], axis=0)
+
+                num_selected_images_cls = selected_images_by_class.get(cls, np.array([], dtype=np.int64)).shape[0]
+                if num_selected_images_cls > 0 and normal_features_cls.shape[0] > 0:
+                    patches_per_image = normal_features_cls.shape[0] // num_selected_images_cls
+                else:
+                    patches_per_image = normal_features_cls.shape[0]
+
+                greedy_keep_images = max(1, int(getattr(args, "greedy_keep_images", 2)))
+                target_images = (
+                    min(greedy_keep_images, num_selected_images_cls)
+                    if num_selected_images_cls > 0
+                    else 1
+                )
+                target_features = patches_per_image * target_images
+
+                if 0 < target_features < normal_features_cls.shape[0]:
+                    percentage = float(target_features) / float(normal_features_cls.shape[0])
+                    sampler = ApproximateGreedyCoresetSampler(
+                        percentage=percentage,
+                        device=device,
+                    )
+                    normal_features_cls, core_idx = sampler.run(
+                        normal_features_cls, return_indices=True
+                    )
+                else:
+                    core_idx = np.arange(normal_features_cls.shape[0], dtype=np.int64)
+
+                reduced_features_by_class[cls] = normal_features_cls
+                coreset_indices_by_class[cls] = core_idx
+
+        if len(reduced_features_by_class) > 0 and not getattr(args, "global_memory_bank", False):
+            print_greedy_memory_bank_anomaly_stats(
+                num_classes=num_classes,
+                selected_images_by_class=selected_images_by_class,
+                gt_patch_masks=gt_patch_masks,
+                reduced_features_by_class=reduced_features_by_class,
+                coreset_indices_by_class=coreset_indices_by_class,
+                class_names=getattr(args, "class_names", None),
+                epoch=epoch,
+            )
+
+        if len(reduced_features_by_class) == 0:
+            raise ValueError("No reduced features by class")
+
+        if (
+            freeze_start >= 1
+            and epoch is not None
+            and int(epoch) == freeze_start - 1
+            and memory_bank_snapshot is not None
+        ):
+            _write_memory_bank_snapshot(
+                memory_bank_snapshot,
+                reduced_features_by_class,
+                class_stack,
+                gt_patch_masks,
+                global_dim,
+            )
+            print(
+                f"[MemoryBank] snapshot saved at epoch {int(epoch)} "
+                f"(frozen Phase 1/2 from epoch index {freeze_start} onward)"
+            )
 
     scoring = str(getattr(args, "pseudo_label_scoring", "nn")).lower()
     scorers = PseudoLabelScorerFactory.create(scoring, args, device, build_faiss_index_fn)
@@ -794,7 +935,9 @@ def precompute_pseudo_labels_multiclass_residual(
     values = distance_map.astype(np.float32)
     gt_mask_bool = gt_patch_masks.astype(bool)
 
-    pred_normal = values < float(args.threshold)
+    # 使用传入的 threshold（两阶段），fallback 到 args.threshold（兼容旧脚本）
+    effective_threshold = float(threshold if threshold is not None else getattr(args, 'threshold', 0.5))
+    pred_normal = values < effective_threshold
     pred_anomaly = values > float(args.noise_threshold)
     pred_uncertain = np.logical_not(np.logical_or(pred_normal, pred_anomaly))
 
@@ -885,6 +1028,9 @@ def precompute_pseudo_labels_multiclass_residual(
         distance_values=values,
         gt_patch_masks=gt_patch_masks,
         epoch=epoch,
+        class_stack=class_stack,
+        num_classes=num_classes,
+        class_names=getattr(args, "class_names", None),
     )
 
     pseudo_label_time = time.perf_counter() - pseudo_start

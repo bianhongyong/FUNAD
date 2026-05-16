@@ -97,7 +97,9 @@ def parse_args():
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("-b", "--batch_size", type=int, default=16)
     parser.add_argument("-r", "--random", type=float, default=0.15)
-    parser.add_argument("-t", "--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold_stage1", type=float, default=0.5, help="Pseudo label threshold for early stage (before threshold_epoch_split)")
+    parser.add_argument("--threshold_stage2", type=float, default=0.5, help="Pseudo label threshold for late stage (from threshold_epoch_split onward)")
+    parser.add_argument("--threshold_epoch_split", type=int, default=0, help="Epoch at which to switch from stage1 to stage2 threshold. 0 means always use stage1.")
     parser.add_argument("-n", "--noise_threshold", type=float, default=0.995)
     parser.add_argument(
         "--noise",
@@ -296,6 +298,14 @@ def parse_args():
         "E.g., 0.3 means top 30% lowest-scoring images are considered normal candidates. "
         "Only used when --normal_sample_selection=quantile.",
     )
+    parser.add_argument(
+        "--memory_bank_freeze_start_epoch",
+        type=int,
+        default=10,
+        help="0-based epoch index from which Phase 1/2 memory bank is frozen and only Phase 3 "
+        "reruns each epoch. -1 disables. Snapshot is written after Phase 1/2 when "
+        "epoch == freeze_start - 1. Must be >= 1 when enabled.",
+    )
 
     return parser.parse_args()
 
@@ -439,11 +449,12 @@ def train_one_epoch(
     num_classes,
     reference_memory_by_class,
     reference_index_by_class,
+    memory_bank_snapshot,
     moe_expert_vis_ctx=None,
     compute_residual_fn=common_utils.compute_residual_feature_batch,
 ):
     total_batch = len(local_loader)
-    threshold = args.threshold
+    threshold = args.threshold_stage1 if epoch < args.threshold_epoch_split else args.threshold_stage2
 
     local_loss = 0
     oto_loss = 0
@@ -491,6 +502,8 @@ def train_one_epoch(
             print_confusion_matrix_fn=print_full_dataset_confusion_matrix_by_raw_score,
             epoch=epoch,
             pseudo_label_scorer=None,
+            memory_bank_snapshot=memory_bank_snapshot,
+            threshold=threshold,
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
@@ -553,7 +566,7 @@ def train_one_epoch(
         if args.beta:
             local_label = torch.zeros((args.batch_size + 1, 784))
             distance_bin = np.zeros_like(distance)
-            if args.threshold <= 1:
+            if threshold <= 1:
                 distance_bin[distance > threshold_map] = 1
             local_label[:-1] = torch.as_tensor(distance_bin, dtype=torch.float32)
 
@@ -564,7 +577,7 @@ def train_one_epoch(
 
             if syn_anomaly is not None:
                 local_label[-1] = 1
-                if (args.threshold <= 1) and args.gaussian:
+                if (threshold <= 1) and args.gaussian:
                     _copy = torch.cat([_copy, syn_anomaly], dim=0)
                 else:
                     x = torch.cat([x, syn_anomaly.to(device, non_blocking=True)], dim=0)
@@ -573,7 +586,7 @@ def train_one_epoch(
                 local_label = local_label[:-1]
         else:
             local_label = torch.zeros((args.batch_size, 784))
-            if args.threshold <= 1:
+            if threshold <= 1:
                 distance_mask = torch.as_tensor(
                     distance > threshold_map, dtype=torch.bool
                 )
@@ -951,17 +964,47 @@ def main():
     iteration = 0
     best_mean = -1.0
     best_result_by_class = {}
+    memory_bank_snapshot: dict = {}
 
     if resume_path:
         if not os.path.isfile(resume_path):
             raise FileNotFoundError(f"--resume path not found: {resume_path}")
         print(f"[resume] loading training checkpoint: {resume_path}")
-        last_done, iteration, best_mean, best_result_by_class = common_utils.load_train_checkpoint(
+        (
+            last_done,
+            iteration,
+            best_mean,
+            best_result_by_class,
+            ckpt_mb_freeze,
+            ckpt_mb_snapshot,
+        ) = common_utils.load_train_checkpoint(
             resume_path,
             localnet,
             localnet_optimizer,
             onetoone_optimizer,
         )
+        ckpt_mb_freeze = int(ckpt_mb_freeze)
+        arg_mb_freeze = int(getattr(args, "memory_bank_freeze_start_epoch", -1))
+        if arg_mb_freeze != ckpt_mb_freeze:
+            print(
+                "[resume] memory_bank_freeze_start_epoch mismatch "
+                f"(checkpoint {ckpt_mb_freeze} vs args {arg_mb_freeze}); "
+                "not loading memory bank snapshot from checkpoint"
+            )
+        elif ckpt_mb_snapshot and ckpt_mb_snapshot.get("reduced_features_by_class"):
+            ds_n = len(mini_loader.dataset)
+            cs = ckpt_mb_snapshot.get("class_stack")
+            if cs is not None and len(cs) == ds_n:
+                snap = common_utils.clone_memory_bank_snapshot_for_checkpoint(ckpt_mb_snapshot)
+                memory_bank_snapshot.clear()
+                memory_bank_snapshot.update(snap)
+                print("[resume] restored memory_bank_snapshot from checkpoint")
+            else:
+                print(
+                    "[resume] memory_bank_snapshot in checkpoint incompatible with current "
+                    f"dataset (class_stack len {0 if cs is None else len(cs)} vs {ds_n}); not loading"
+                )
+
         start_epoch = last_done + 1
         if start_epoch >= args.epoch:
             print(
@@ -1006,6 +1049,7 @@ def main():
             num_classes=len(class_names),
             reference_memory_by_class=reference_memory_by_class,
             reference_index_by_class=reference_index_by_class,
+            memory_bank_snapshot=memory_bank_snapshot,
             moe_expert_vis_ctx=moe_expert_vis_ctx,
             compute_residual_fn=compute_residual_fn,
         )
@@ -1032,21 +1076,11 @@ def main():
             eval_rows = []
             mean_img_list = []
             mean_pixel_list = []
-            mean_ap_sp_list = []
-            mean_f1_sp_list = []
-            mean_ap_px_list = []
-            mean_f1_px_list = []
-            mean_aupro_px_list = []
             for class_idx_eval, class_name in enumerate(class_names):
                 test_loader = build_test_loader(args, class_name)
                 (
                     auroc,
-                    ap_sp,
-                    f1_sp,
                     pixel_auroc,
-                    ap_px,
-                    f1_px,
-                    aupro_px,
                 ) = evaluate_epoch(
                     localnet,
                     feature_extractor,
@@ -1058,39 +1092,20 @@ def main():
                     compute_residual_fn=compute_residual_fn,
                 )
                 eval_rows.append(
-                    [class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px]
+                    [class_name, auroc, pixel_auroc]
                 )
                 mean_img_list.append(auroc)
                 mean_pixel_list.append(pixel_auroc)
-                mean_ap_sp_list.append(ap_sp)
-                mean_f1_sp_list.append(f1_sp)
-                mean_ap_px_list.append(ap_px)
-                mean_f1_px_list.append(f1_px)
-                mean_aupro_px_list.append(aupro_px)
                 print(
-                    (
-                        f"epoch {epoch + 1} | {class_name} | auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, "
-                        f"f1_sp: {f1_sp:.5f}, pixel auroc: {pixel_auroc:.5f}, ap_px: {ap_px:.5f}, "
-                        f"f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}"
-                    )
+                    f"epoch {epoch + 1} | {class_name} | I-AUROC: {auroc:.5f}, P-AUROC: {pixel_auroc:.5f}"
                 )
                 del test_loader
 
             epoch_mean_img = float(np.mean(mean_img_list))
             epoch_mean_pixel = float(np.mean(mean_pixel_list))
-            epoch_mean_ap_sp = float(np.mean(mean_ap_sp_list))
-            epoch_mean_f1_sp = float(np.mean(mean_f1_sp_list))
-            epoch_mean_ap_px = float(np.mean(mean_ap_px_list))
-            epoch_mean_f1_px = float(np.mean(mean_f1_px_list))
-            epoch_mean_aupro_px = float(np.mean(mean_aupro_px_list))
             epoch_mean = (epoch_mean_img + epoch_mean_pixel) / 2
-            print(f"epoch {epoch + 1} | multiclass img mean: {epoch_mean_img:.5f}")
-            print(f"epoch {epoch + 1} | multiclass pixel mean: {epoch_mean_pixel:.5f}")
-            print(f"epoch {epoch + 1} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f}")
-            print(f"epoch {epoch + 1} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f}")
-            print(f"epoch {epoch + 1} | multiclass ap_px mean: {epoch_mean_ap_px:.5f}")
-            print(f"epoch {epoch + 1} | multiclass f1_px mean: {epoch_mean_f1_px:.5f}")
-            print(f"epoch {epoch + 1} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}")
+            print(f"epoch {epoch + 1} | multiclass I-AUROC mean: {epoch_mean_img:.5f}")
+            print(f"epoch {epoch + 1} | multiclass P-AUROC mean: {epoch_mean_pixel:.5f}")
 
             if epoch_mean > best_mean:
                 best_mean = epoch_mean
@@ -1107,7 +1122,7 @@ def main():
             if args.save_log:
                 with open(os.path.join(saved_dir, "log.txt"), "a") as file:
                     file.write(
-                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | gate aux loss: {gate_aux_loss_value:.6f} | gate aux weight: {args.gate_aux_weight:.6f} | multiclass img mean: {epoch_mean_img:.5f} | multiclass pixel mean: {epoch_mean_pixel:.5f} | multiclass ap_sp mean: {epoch_mean_ap_sp:.5f} | multiclass f1_sp mean: {epoch_mean_f1_sp:.5f} | multiclass ap_px mean: {epoch_mean_ap_px:.5f} | multiclass f1_px mean: {epoch_mean_f1_px:.5f} | multiclass aupro_px mean: {epoch_mean_aupro_px:.5f}\n"
+                        f"epoch {epoch + 1} | total loss: {local_loss_value:.6f} | bce loss: {bce_loss_value:.6f} | one-to-one loss: {oto_loss_value:.6f} | gate aux loss: {gate_aux_loss_value:.6f} | gate aux weight: {args.gate_aux_weight:.6f} | multiclass I-AUROC mean: {epoch_mean_img:.5f} | multiclass P-AUROC mean: {epoch_mean_pixel:.5f}\n"
                     )
 
         ckpt_path = common_utils.default_train_checkpoint_path(saved_dir, run_name)
@@ -1120,6 +1135,10 @@ def main():
             onetoone_optimizer=onetoone_optimizer,
             best_mean=best_mean,
             best_result_by_class=best_result_by_class,
+            memory_bank_freeze_start_epoch=int(
+                getattr(args, "memory_bank_freeze_start_epoch", -1)
+            ),
+            memory_bank_snapshot=memory_bank_snapshot,
         )
         print(f"[checkpoint] saved training state -> {ckpt_path}")
 
@@ -1128,14 +1147,10 @@ def main():
 
     results = []
     for class_name in class_names:
-        auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px = best_result_by_class[class_name]
-        results.append([class_name, auroc, ap_sp, f1_sp, pixel_auroc, ap_px, f1_px, aupro_px])
+        auroc, pixel_auroc = best_result_by_class[class_name]
+        results.append([class_name, auroc, pixel_auroc])
         print(
-            (
-                f"best | {class_name} | img_auroc: {auroc:.5f} | ap_sp: {ap_sp:.5f} "
-                f"| f1_sp: {f1_sp:.5f} | pixel_auroc: {pixel_auroc:.5f} "
-                f"| ap_px: {ap_px:.5f} | f1_px: {f1_px:.5f} | aupro_px: {aupro_px:.5f}"
-            )
+            f"best | {class_name} | I-AUROC: {auroc:.5f} | P-AUROC: {pixel_auroc:.5f}"
         )
 
     df = pd.DataFrame(
@@ -1143,12 +1158,7 @@ def main():
         columns=[
             "class",
             "auroc_sp",
-            "ap_sp",
-            "f1_sp",
             "auroc_px",
-            "ap_px",
-            "f1_px",
-            "aupro_px",
         ],
     )
     result_path = os.path.join(

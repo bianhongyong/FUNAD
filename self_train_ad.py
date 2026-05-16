@@ -835,22 +835,12 @@ def main():
             if (epoch) % args.eval_interval == 0:
                 (
                     auroc,
-                    ap_sp,
-                    f1_sp,
                     pixel_auroc,
-                    ap_px,
-                    f1_px,
-                    aupro_px,
                 ) = evaluate_epoch(localnet, test_loader)
                 num_epoch = epoch + 1
 
                 print(
-                    "epoch %d |" % num_epoch,
-                    (
-                        f"auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, f1_sp: {f1_sp:.5f}, "
-                        f"pixel auroc: {pixel_auroc:.5f}, ap_px: {ap_px:.5f}, "
-                        f"f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}"
-                    ),
+                    f"epoch {num_epoch} | I-AUROC: {auroc:.5f}, P-AUROC: {pixel_auroc:.5f}"
                 )
 
                 if args.wandb:
@@ -860,12 +850,7 @@ def main():
                             "one-to-one loss": oto_loss_value,
                             "bce loss": bce_loss_value,
                             "image AUC": auroc,
-                            "image AP": ap_sp,
-                            "image F1-max": f1_sp,
                             "pixel AUC": pixel_auroc,
-                            "pixel AP": ap_px,
-                            "pixel F1-max": f1_px,
-                            "pixel AUPRO": aupro_px,
                         }
                     )
 
@@ -874,22 +859,12 @@ def main():
                 if epoch == 0:
                     best = mean
                     fix_auroc = auroc
-                    fix_ap_sp = ap_sp
-                    fix_f1_sp = f1_sp
                     fix_pauroc = pixel_auroc
-                    fix_ap_px = ap_px
-                    fix_f1_px = f1_px
-                    fix_aupro_px = aupro_px
                 else:
                     if mean > best:
                         best = mean
                         fix_auroc = auroc
-                        fix_ap_sp = ap_sp
-                        fix_f1_sp = f1_sp
                         fix_pauroc = pixel_auroc
-                        fix_ap_px = ap_px
-                        fix_f1_px = f1_px
-                        fix_aupro_px = aupro_px
                         print(f"class: {class_name}, data_noise: {args.noise}")
                         print("curr_best_auc: ", fix_auroc)
                         print("curr_best_pauc: ", fix_pauroc)
@@ -922,33 +897,19 @@ def main():
 
                     with open(file_path, "a") as file:
                         file.write(
-                            (
-                                f"epoch {num_epoch} | auroc: {auroc:.5f}, ap_sp: {ap_sp:.5f}, "
-                                f"f1_sp: {f1_sp:.5f}, pixel auroc: {pixel_auroc:.5f}, "
-                                f"ap_px: {ap_px:.5f}, f1_px: {f1_px:.5f}, aupro_px: {aupro_px:.5f}\n"
-                            )
+                            f"epoch {num_epoch} | I-AUROC: {auroc:.5f}, P-AUROC: {pixel_auroc:.5f}\n"
                         )
                 ##
 
     print("class:", class_name)
     print("fix_img_auroc:", fix_auroc)
-    print("fix_img_ap:", fix_ap_sp)
-    print("fix_img_f1:", fix_f1_sp)
     print("fix_pauroc:", fix_pauroc)
-    print("fix_px_ap:", fix_ap_px)
-    print("fix_px_f1:", fix_f1_px)
-    print("fix_px_aupro:", fix_aupro_px)
 
     results.append(
         [
             class_name,
             fix_auroc,
-            fix_ap_sp,
-            fix_f1_sp,
             fix_pauroc,
-            fix_ap_px,
-            fix_f1_px,
-            fix_aupro_px,
         ]
     )
     df = pd.DataFrame(
@@ -956,12 +917,7 @@ def main():
         columns=[
             "class",
             "auroc_sp",
-            "ap_sp",
-            "f1_sp",
             "auroc_px",
-            "ap_px",
-            "f1_px",
-            "aupro_px",
         ],
     )
     result_path = os.path.join(args.save_path, "results", args.subdataset)

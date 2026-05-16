@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import warnings
+from typing import Optional
 
 import faiss
 import numpy as np
@@ -161,6 +162,19 @@ def _torch_load_train_checkpoint(path: str):
         return torch.load(path, map_location="cpu")
 
 
+def clone_memory_bank_snapshot_for_checkpoint(snapshot: dict) -> dict:
+    """Deep-copy numpy arrays for checkpoint I/O (CPU)."""
+    rf_in = snapshot.get("reduced_features_by_class") or {}
+    return {
+        "reduced_features_by_class": {
+            int(k): np.asarray(v, dtype=np.float32).copy() for k, v in rf_in.items()
+        },
+        "class_stack": np.asarray(snapshot["class_stack"], dtype=np.int64).copy(),
+        "gt_patch_masks": np.asarray(snapshot["gt_patch_masks"], dtype=np.uint8).copy(),
+        "global_dim": int(snapshot["global_dim"]),
+    }
+
+
 def save_train_checkpoint(
     path: str,
     epoch_completed: int,
@@ -170,8 +184,12 @@ def save_train_checkpoint(
     onetoone_optimizer,
     best_mean: float,
     best_result_by_class: dict,
+    memory_bank_freeze_start_epoch: int = -1,
+    memory_bank_snapshot: Optional[dict] = None,
 ):
     """epoch_completed: last finished epoch index (0-based)."""
+    if memory_bank_snapshot is None:
+        memory_bank_snapshot = {}
     payload = {
         "epoch": int(epoch_completed),
         "iteration": int(iteration),
@@ -183,6 +201,12 @@ def save_train_checkpoint(
         "best_mean": float(best_mean),
         "best_result_by_class": best_result_by_class,
         "rng_state": collect_rng_state(),
+        "memory_bank_freeze_start_epoch": int(memory_bank_freeze_start_epoch),
+        "memory_bank_snapshot": (
+            clone_memory_bank_snapshot_for_checkpoint(memory_bank_snapshot)
+            if memory_bank_snapshot.get("reduced_features_by_class")
+            else None
+        ),
     }
     tmp = path + ".tmp"
     torch.save(payload, tmp)
@@ -215,6 +239,8 @@ def load_train_checkpoint(
         int(ckpt["iteration"]),
         float(ckpt.get("best_mean", -1.0)),
         ckpt.get("best_result_by_class") or {},
+        int(ckpt.get("memory_bank_freeze_start_epoch", -1)),
+        ckpt.get("memory_bank_snapshot"),
     )
 
 

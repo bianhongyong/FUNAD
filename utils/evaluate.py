@@ -140,15 +140,9 @@ def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
     y_score_px_flat = pr_px.ravel()
 
     auroc_sp = _safe_roc_auc(y_true_img, y_score_img)
-    ap_sp = _safe_average_precision(y_true_img, y_score_img)
-    f1_sp = f1_score_max(y_true_img, y_score_img)
-
     auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
-    ap_px = _safe_average_precision(y_true_px_flat, y_score_px_flat)
-    f1_px = f1_score_max(y_true_px_flat, y_score_px_flat)
-    aupro_px = compute_pro(gt_px, pr_px)
 
-    return auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px
+    return auroc_sp, auroc_px
 
 
 def evaluate_multiclass_epoch(

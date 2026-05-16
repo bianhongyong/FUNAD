@@ -559,7 +559,7 @@ class localnet(nn.Module):
             )
         else:
             local_score = self.discriminator(adapted_features)
-        return adapted_features, local_score.squeeze()
+        return adapted_features, local_score.squeeze(-1)
 
 class globalnet(nn.Module):
     def __init__(self, len_feature):

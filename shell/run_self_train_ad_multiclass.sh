@@ -12,13 +12,13 @@ conda activate "$CONDA_ENV"
 export MPLBACKEND=Agg
 
 # ===== User-configurable =====
-DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy20"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_moe_discriminator_cls_token_nn"
+DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitb16_moe_discriminator_hard_gate/pca"
 DATASET="mvtec"         # mvtec | visa
-NOISE="20%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
+NOISE="10%"         # 0% | 1% | 2% | 3% | 5% | 10% | 20%
 EPOCH=200
-BATCH_SIZE=8
-LR=2e-5
+BATCH_SIZE=16
+LR=1e-4
 SEED=0
 NUM_WORKERS=4
 FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vitl16 | dinov3_vitl16plus | dinov3_vith16plus | dinov3_vit7b16
@@ -46,11 +46,15 @@ FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vi
 #   --normal_sample_selection quantile   (uses top N% lowest scores, set via --normal_sample_quantile)
 # Example: EXTRA_ARGS+=(--normal_sample_selection quantile --normal_sample_quantile 0.3)
 
-EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.15 --noise_threshold 0.85
-      --use_moe_discriminator --moe_num_expert 16 --gate_aux_weight 0.05 --moe_top_k 1 --moe_use_cls_token
-      --eval_interval 1                
+EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold_stage1 0.1 --threshold_stage2 0.1 --threshold_epoch_split 5 --noise_threshold 0.8
+      --use_moe_discriminator --moe_hard_class_gate --moe_use_cls_token
+      --eval_interval 1 --greedy_keep_images 10
       --moe_expert_vis_enable
-      --normal_sample_selection quantile --normal_sample_quantile 0.3
+      --normal_sample_selection quantile --normal_sample_quantile 0.2
+      --memory_bank_freeze_start_epoch -1
+      --pseudo_label_scoring pca
+      --dino_layer_indices -1
+      #--resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vits16plus_moe_discriminator_cls_token_nn/global_memory/mvtec/20%/gaussian_True_noise_20%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
 )
 python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \
