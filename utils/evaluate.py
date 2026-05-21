@@ -199,7 +199,13 @@ def evaluate_residual_multiclass_epoch(
             images = images.to(device)
             y = y.detach().numpy()
             mask = mask.detach().numpy()
-            features = extract_feature_batch_fn(images, feature_extractor, args)
+            class_indices_eval = torch.full(
+                (images.shape[0],), int(class_idx_eval),
+                dtype=torch.long, device=device,
+            )
+            features = extract_feature_batch_fn(
+                images, feature_extractor, args, class_indices=class_indices_eval,
+            )
             class_idx_batch = torch.full(
                 (features.shape[0],),
                 int(class_idx_eval),
@@ -215,7 +221,8 @@ def evaluate_residual_multiclass_epoch(
             patch_class_idx = None
             if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
                 patch_class_idx = _build_patch_class_idx(class_idx_batch, residual_features)
-            _, score = localnet(residual_features, patch_class_idx=patch_class_idx)
+            _, score = localnet(residual_features, patch_class_idx=patch_class_idx,
+                                 class_idx=class_idx_batch)
             score = score.detach().cpu().numpy()
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
             score = score.reshape(-1, 28, 28)

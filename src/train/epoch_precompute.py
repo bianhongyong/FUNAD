@@ -75,11 +75,12 @@ def _normalize_distance_map_global(
 
 
 def _extract_features_with_optional_cls_token(
-    extract_feature_batch_fn, images, feature_extractor, args
+    extract_feature_batch_fn, images, feature_extractor, args, class_indices=None
 ):
     try:
         features, cls_token = extract_feature_batch_fn(
-            images, feature_extractor, args, return_cls_token=True
+            images, feature_extractor, args, return_cls_token=True,
+            class_indices=class_indices,
         )
         return features, cls_token
     except TypeError:
@@ -102,6 +103,7 @@ def _build_patch_class_idx(class_idx: torch.Tensor, patch_features: torch.Tensor
 def _plot_distance_distribution_normal_vs_anomaly(
     args, distance_values, gt_patch_masks, epoch=None,
     class_stack=None, num_classes=None, class_names=None,
+    save_dir=None,
 ):
     values = np.asarray(distance_values, dtype=np.float32).reshape(-1)
     labels = np.asarray(gt_patch_masks, dtype=np.uint8).reshape(-1) > 0
@@ -157,7 +159,8 @@ def _plot_distance_distribution_normal_vs_anomaly(
         print(f"[PseudoLabel-Plot] saved: {save_path}")
         return True
 
-    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
     # Put epoch plots in a subfolder
     if epoch is not None:
         save_dir = os.path.join(save_dir, f"epoch_{int(epoch) + 1:03d}")
@@ -170,8 +173,12 @@ def _plot_distance_distribution_normal_vs_anomaly(
     save_path = os.path.join(save_dir, filename)
     _plot_single_hist(values, labels, save_path)
 
-    # Per-class plots
-    if class_stack is not None and num_classes is not None:
+    # Per-class plots (skipped in global memory bank mode)
+    if (
+        not getattr(args, "global_memory_bank", False)
+        and class_stack is not None
+        and num_classes is not None
+    ):
         cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
         if cls_arr.shape[0] == values.shape[0]:
             name_list = list(class_names) if class_names is not None else []
@@ -193,9 +200,101 @@ def _plot_distance_distribution_normal_vs_anomaly(
                 )
 
 
+def _plot_image_raw_score_distribution_normal_vs_anomaly(
+    args, image_raw_scores, gt_patch_masks, epoch=None,
+    class_stack=None, num_classes=None, class_names=None,
+    save_dir=None,
+):
+    scores = np.asarray(image_raw_scores, dtype=np.float32).reshape(-1)
+    patch_masks = np.asarray(gt_patch_masks, dtype=np.uint8)
+    if scores.size == 0 or patch_masks.ndim != 2 or patch_masks.shape[0] != scores.size:
+        return
+
+    image_is_anomaly = patch_masks.reshape(patch_masks.shape[0], -1).sum(axis=1) > 0
+
+    def _plot_single_hist(scores, image_is_anomaly, save_path, title_suffix=""):
+        normal_scores = scores[~image_is_anomaly]
+        anomaly_scores = scores[image_is_anomaly]
+        if normal_scores.size == 0 and anomaly_scores.size == 0:
+            return False
+
+        plt.figure(figsize=(10, 6))
+        bins = np.linspace(0.0, 1.0, 51)
+        if normal_scores.size > 0:
+            plt.hist(
+                normal_scores,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:blue",
+                label=f"normal ({normal_scores.size})",
+            )
+        if anomaly_scores.size > 0:
+            plt.hist(
+                anomaly_scores,
+                bins=bins,
+                density=True,
+                alpha=0.55,
+                color="tab:red",
+                label=f"anomaly ({anomaly_scores.size})",
+            )
+
+        plt.xlabel("Image raw score")
+        plt.ylabel("Density")
+        plt.title(f"Image Raw Score Distribution: Normal vs Anomaly Images{title_suffix}")
+        plt.xlim(0.0, 1.0)
+        plt.grid(alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+        print(f"[PseudoLabel-Plot] saved: {save_path}")
+        return True
+
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if epoch is not None:
+        save_dir = os.path.join(save_dir, f"epoch_{int(epoch) + 1:03d}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    if epoch is None:
+        filename = "image_raw_scores_distribution_normal_vs_anomaly.png"
+    else:
+        filename = "image_raw_scores_distribution_normal_vs_anomaly.png"
+    save_path = os.path.join(save_dir, filename)
+    _plot_single_hist(scores, image_is_anomaly, save_path)
+
+    # Per-class plots (skipped in global memory bank mode)
+    if (
+        not getattr(args, "global_memory_bank", False)
+        and class_stack is not None
+        and num_classes is not None
+    ):
+        cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+        if cls_arr.shape[0] == scores.shape[0]:
+            name_list = list(class_names) if class_names is not None else []
+            if len(name_list) != int(num_classes):
+                name_list = [f"cls_{i}" for i in range(int(num_classes))]
+
+            for cls in range(int(num_classes)):
+                cls_idx = np.where(cls_arr == cls)[0]
+                if cls_idx.size == 0:
+                    continue
+                cls_scores = scores[cls_idx]
+                cls_anomaly = image_is_anomaly[cls_idx]
+                cls_save_path = os.path.join(
+                    save_dir, f"image_raw_scores_distribution_{name_list[cls]}.png"
+                )
+                _plot_single_hist(
+                    cls_scores, cls_anomaly, cls_save_path,
+                    title_suffix=f" — {name_list[cls]}",
+                )
+
+
 def _plot_image_norm_score_distribution_normal_vs_anomaly(
     args, image_norm_scores, gt_patch_masks, epoch=None,
     class_stack=None, num_classes=None, class_names=None,
+    save_dir=None,
 ):
     scores = np.asarray(image_norm_scores, dtype=np.float32).reshape(-1)
     patch_masks = np.asarray(gt_patch_masks, dtype=np.uint8)
@@ -244,7 +343,8 @@ def _plot_image_norm_score_distribution_normal_vs_anomaly(
         print(f"[PseudoLabel-Plot] saved: {save_path}")
         return True
 
-    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
     if epoch is not None:
         save_dir = os.path.join(save_dir, f"epoch_{int(epoch) + 1:03d}")
     os.makedirs(save_dir, exist_ok=True)
@@ -256,8 +356,12 @@ def _plot_image_norm_score_distribution_normal_vs_anomaly(
     save_path = os.path.join(save_dir, filename)
     _plot_single_hist(scores, image_is_anomaly, save_path)
 
-    # Per-class plots
-    if class_stack is not None and num_classes is not None:
+    # Per-class plots (skipped in global memory bank mode)
+    if (
+        not getattr(args, "global_memory_bank", False)
+        and class_stack is not None
+        and num_classes is not None
+    ):
         cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
         if cls_arr.shape[0] == scores.shape[0]:
             name_list = list(class_names) if class_names is not None else []
@@ -284,6 +388,7 @@ def _plot_classwise_feature_l2_by_distance_regions(
     class_names,
     region_gt_means,
     epoch=None,
+    save_dir=None,
 ):
     means = np.asarray(region_gt_means, dtype=np.float32)
     if means.ndim != 3 or means.shape[1:] != (3, 2):
@@ -291,7 +396,8 @@ def _plot_classwise_feature_l2_by_distance_regions(
     if means.shape[0] == 0:
         return
 
-    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
     os.makedirs(save_dir, exist_ok=True)
     if epoch is None:
         filename = "classwise_feature_l2_by_distance_regions.png"
@@ -334,6 +440,231 @@ def _plot_classwise_feature_l2_by_distance_regions(
     print(f"[PseudoLabel-Plot] saved: {save_path}")
 
 
+def _parse_mad_k_per_class(
+    mad_k_per_class_str: str,
+    class_names: list,
+    default_k: float,
+) -> dict:
+    """Parse '--mad_k_per_class' string into {class_idx: k_value} dict.
+
+    Example: 'bottle:4.0,cable:6.0' → {0: 4.0, 3: 6.0} (idx depends on class_names order)
+    Classes not listed use default_k.
+    """
+    k_map = {}
+    if not mad_k_per_class_str or not mad_k_per_class_str.strip():
+        return k_map
+    if class_names is None:
+        return k_map
+    name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    for part in mad_k_per_class_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            print(f"[MAD-Threshold] WARNING: malformed entry '{part}', expected 'class_name:k_value'")
+            continue
+        cls_name, k_str = part.split(":", 1)
+        cls_name = cls_name.strip()
+        try:
+            k_val = float(k_str.strip())
+        except ValueError:
+            print(f"[MAD-Threshold] WARNING: invalid k value '{k_str.strip()}' for class '{cls_name}'")
+            continue
+        if cls_name not in name_to_idx:
+            print(f"[MAD-Threshold] WARNING: unknown class '{cls_name}', available: {list(name_to_idx.keys())}")
+            continue
+        k_map[name_to_idx[cls_name]] = {"k": k_val, "name": cls_name}
+    return k_map
+
+
+def _compute_mad_threshold_global(
+    raw_distance_map: np.ndarray,
+    k: float = 4.0,
+) -> dict:
+    """Compute a single MAD-based threshold on all raw distance values."""
+    values = np.asarray(raw_distance_map, dtype=np.float32).reshape(-1)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    thr = median + k * 1.4826 * mad
+    return {0: {"median": median, "mad": mad, "threshold": thr, "k": float(k)}}
+
+
+def _compute_mad_thresholds_per_class(
+    raw_distance_map: np.ndarray,
+    class_stack: np.ndarray,
+    num_classes: int,
+    k: float = 4.0,
+    class_k_map: dict = None,
+    class_names: list = None,
+):
+    """Compute per-class MAD-based threshold on raw distance values.
+
+    For each class, threshold = median + k * 1.4826 * MAD.
+    MAD = median(|x_i - median|) — robust to sparse tail outliers.
+
+    If class_k_map is provided, each class uses its own k value; otherwise uses the global k.
+    """
+    if class_k_map is None:
+        class_k_map = {}
+    values = np.asarray(raw_distance_map, dtype=np.float32)
+    cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+    thresholds = {}
+    for cls in range(int(num_classes)):
+        cls_idx = np.where(cls_arr == cls)[0]
+        if cls_idx.size == 0:
+            continue
+        cls_k = float(class_k_map.get(int(cls), {}).get("k", k))
+        cls_vals = values[cls_idx].reshape(-1)
+        median = float(np.median(cls_vals))
+        mad = float(np.median(np.abs(cls_vals - median)))
+        thr = median + cls_k * 1.4826 * mad
+        thresholds[int(cls)] = {"median": median, "mad": mad, "threshold": thr, "k": cls_k}
+    return thresholds
+
+
+def _plot_classwise_distance_with_mad_threshold(
+    args,
+    raw_distance_map: np.ndarray,
+    class_stack: np.ndarray,
+    mad_thresholds: dict,
+    num_classes: int,
+    class_names=None,
+    epoch=None,
+    save_dir=None,
+):
+    """Plot per-class histogram of raw distance values with MAD threshold line."""
+    import matplotlib.ticker as mticker
+
+    values = np.asarray(raw_distance_map, dtype=np.float32)
+    cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+    if values.ndim != 2:
+        return
+    if cls_arr.shape[0] != values.shape[0] or int(num_classes) <= 0:
+        return
+
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    os.makedirs(save_dir, exist_ok=True)
+    if epoch is None:
+        filename = "classwise_distance_mad_threshold.png"
+    else:
+        filename = f"classwise_distance_mad_threshold_epoch_{int(epoch) + 1:03d}.png"
+    save_path = os.path.join(save_dir, filename)
+
+    labels = list(class_names) if class_names is not None else []
+    if len(labels) != int(num_classes):
+        labels = [f"cls_{i}" for i in range(int(num_classes))]
+
+    ncols = min(4, int(num_classes))
+    nrows = int(np.ceil(int(num_classes) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.2), squeeze=False)
+    max_points_per_class = 50000
+
+    for cls in range(int(num_classes)):
+        ax = axes[cls // ncols][cls % ncols]
+        cls_idx = np.where(cls_arr == cls)[0]
+        if cls_idx.size == 0:
+            ax.set_title(f"{labels[cls]}\n(no data)", fontsize=9)
+            ax.axis("off")
+            continue
+        cls_vals = values[cls_idx].reshape(-1)
+        if cls_vals.size > max_points_per_class:
+            cls_vals = np.random.choice(cls_vals, size=max_points_per_class, replace=False)
+
+        ax.hist(cls_vals, bins=80, color="steelblue", edgecolor="white", alpha=0.75,
+                density=True, linewidth=0.3)
+        ax.set_xlabel("distance (raw)", fontsize=7)
+        ax.set_ylabel("density", fontsize=7)
+        ax.tick_params(labelsize=6)
+
+        cls_info = mad_thresholds.get(cls)
+        if cls_info is not None:
+            thr = cls_info["threshold"]
+            norm_thr = cls_info.get("norm_threshold", None)
+            median = cls_info["median"]
+            if norm_thr is not None:
+                thr_label = f"MAD raw={thr:.4f}  norm={norm_thr:.4f}"
+            else:
+                thr_label = f"MAD thr={thr:.4f}"
+            ax.axvline(x=thr, color="red", linestyle="--", linewidth=1.5, label=thr_label)
+            ax.axvline(x=median, color="gray", linestyle=":", linewidth=1.0,
+                       label=f"median={median:.4f}")
+            ax.legend(fontsize=5.0, loc="upper right", framealpha=0.7)
+
+        ax.set_title(labels[cls], fontsize=9)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3g"))
+
+    # Hide unused subplots
+    for idx in range(int(num_classes), nrows * ncols):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.axis("off")
+
+    fig.suptitle("Per-Class Raw Distance Distribution + MAD Threshold", fontsize=11, y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[MAD-Threshold-Plot] saved: {save_path}")
+
+
+def _plot_global_distance_with_mad_threshold(
+    args,
+    raw_distance_map: np.ndarray,
+    mad_threshold_info: dict,
+    epoch=None,
+    save_dir=None,
+):
+    """Plot global histogram of raw distance values with a single MAD threshold line."""
+    import matplotlib.ticker as mticker
+
+    values = np.asarray(raw_distance_map, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return
+
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    os.makedirs(save_dir, exist_ok=True)
+    if epoch is None:
+        filename = "global_distance_mad_threshold.png"
+    else:
+        filename = f"global_distance_mad_threshold_epoch_{int(epoch) + 1:03d}.png"
+    save_path = os.path.join(save_dir, filename)
+
+    max_points = 200000
+    plot_vals = values
+    if plot_vals.size > max_points:
+        plot_vals = np.random.choice(plot_vals, size=max_points, replace=False)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(
+        plot_vals,
+        bins=80,
+        color="steelblue",
+        edgecolor="white",
+        alpha=0.75,
+        density=True,
+        linewidth=0.3,
+    )
+    thr = mad_threshold_info["threshold"]
+    median = mad_threshold_info["median"]
+    norm_thr = mad_threshold_info.get("norm_threshold")
+    if norm_thr is not None:
+        thr_label = f"MAD raw={thr:.4f}  norm={norm_thr:.4f}"
+    else:
+        thr_label = f"MAD thr={thr:.4f}"
+    ax.axvline(x=thr, color="red", linestyle="--", linewidth=1.5, label=thr_label)
+    ax.axvline(x=median, color="gray", linestyle=":", linewidth=1.0,
+               label=f"median={median:.4f}")
+    ax.set_xlabel("distance (raw)")
+    ax.set_ylabel("density")
+    ax.set_title("Global Raw Distance Distribution + MAD Threshold")
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.3g"))
+    ax.legend(fontsize=8.0, loc="upper right", framealpha=0.7)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"[MAD-Threshold-Plot] saved: {save_path}")
+
+
 def _plot_classwise_abs_distance_box_before_norm(
     args,
     class_stack: np.ndarray,
@@ -342,6 +673,7 @@ def _plot_classwise_abs_distance_box_before_norm(
     num_classes: int,
     class_names=None,
     epoch=None,
+    save_dir=None,
 ):
     values = np.abs(np.asarray(distance_map, dtype=np.float32))
     cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
@@ -351,7 +683,8 @@ def _plot_classwise_abs_distance_box_before_norm(
     if cls_arr.shape[0] != values.shape[0] or int(num_classes) <= 0:
         return
 
-    save_dir = os.path.join(args.save_path, args.dataset, args.noise)
+    if save_dir is None:
+        save_dir = os.path.join(args.save_path, args.dataset, args.noise)
     os.makedirs(save_dir, exist_ok=True)
     if epoch is None:
         filename = "classwise_abs_distance_box_before_norm.png"
@@ -484,6 +817,7 @@ def precompute_pseudo_labels_multiclass_residual(
     pseudo_label_scorer: Optional[PseudoLabelScorer] = None,
     memory_bank_snapshot: Optional[Dict[str, Any]] = None,
     threshold: Optional[float] = None,
+    save_dir=None,
 ):
     memory_bank_start = time.perf_counter()
 
@@ -543,7 +877,8 @@ def precompute_pseudo_labels_multiclass_residual(
                     mini_patch_mask = None
                 images = images.to(device)
                 image_features, cls_token = _extract_features_with_optional_cls_token(
-                    extract_feature_batch_fn, images, feature_extractor, args
+                    extract_feature_batch_fn, images, feature_extractor, args,
+                    class_indices=mini_class_idx,
                 )
                 residual_features = compute_residual_feature_batch_fn(
                     image_features,
@@ -552,10 +887,11 @@ def precompute_pseudo_labels_multiclass_residual(
                     reference_index_by_class,
                 )
                 patch_class_idx = None
-                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                if getattr(args, "use_moe_discriminator", False) and getattr(args, "moe_hard_class_gate", False):
                     patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
                 features, score = localnet(
-                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx,
+                    class_idx=mini_class_idx.to(device),
                 )
                 if features.shape[0] > args.batch_size:
                     features = features.unsqueeze(0)
@@ -580,16 +916,19 @@ def precompute_pseudo_labels_multiclass_residual(
                     gt_patch_masks[sample_idx_np] = (mask_np > 0).astype(np.uint8)
         image_norm_scores = np.zeros(dataset_size, dtype=np.float32)
         normalized_score = np.zeros_like(image_scores, dtype=np.float32)
-        #分类归一化
-        for cls in range(num_classes):
-            cls_mask = class_stack == cls
-            if not np.any(cls_mask):
-                continue
-            cls_scores = image_scores[cls_mask]
-            cls_norm = _minmax_normalize(cls_scores)
-            normalized_score[cls_mask] = cls_norm.astype(np.float32)
-
-        image_norm_scores[:] = normalized_score.astype(np.float32)
+        global_bank = bool(getattr(args, "global_memory_bank", False))
+        if global_bank:
+            normalized_score = _minmax_normalize(image_scores)
+            image_norm_scores[:] = normalized_score.astype(np.float32)
+        else:
+            for cls in range(num_classes):
+                cls_mask = class_stack == cls
+                if not np.any(cls_mask):
+                    continue
+                cls_scores = image_scores[cls_mask]
+                cls_norm = _minmax_normalize(cls_scores)
+                normalized_score[cls_mask] = cls_norm.astype(np.float32)
+            image_norm_scores[:] = normalized_score.astype(np.float32)
         _plot_image_norm_score_distribution_normal_vs_anomaly(
             args=args,
             image_norm_scores=image_norm_scores,
@@ -598,47 +937,74 @@ def precompute_pseudo_labels_multiclass_residual(
             class_stack=class_stack,
             num_classes=num_classes,
             class_names=getattr(args, "class_names", None),
+            save_dir=save_dir,
         )
-    
+        _plot_image_raw_score_distribution_normal_vs_anomaly(
+            args=args,
+            image_raw_scores=image_scores,
+            gt_patch_masks=gt_patch_masks,
+            epoch=epoch,
+            class_stack=class_stack,
+            num_classes=num_classes,
+            class_names=getattr(args, "class_names", None),
+            save_dir=save_dir,
+        )
+
         selected_local_list = []
         print("[Phase 2/3] Building memory bank from normal samples...")
-        #下采样选取
         select_mode = str(getattr(args, "normal_sample_selection", "threshold"))
         select_quantile = float(getattr(args, "normal_sample_quantile", 0.3))
-        for cls in range(num_classes):
-            cls_mask = class_stack == cls
-            if not np.any(cls_mask):
-                continue
-            cls_indices = np.where(cls_mask)[0].astype(np.int64)
-            cls_norm_scores = normalized_score[cls_indices]
-
+        if global_bank:
+            all_indices = np.arange(dataset_size, dtype=np.int64)
             if select_mode == "quantile":
-                # 取归一化分数最低的前 N% 图片作为正常候选
-                q = np.percentile(cls_norm_scores, select_quantile * 100.0)
-                cls_normal_local = np.where(cls_norm_scores <= q)[0]
+                q = np.percentile(normalized_score, select_quantile * 100.0)
+                normal_local = np.where(normalized_score <= q)[0]
             else:
-                # 默认：取分数 < 0.5 的图片作为正常候选
-                cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
+                normal_local = np.where(normalized_score < 0.5)[0]
 
-            if cls_normal_local.shape[0] == 0:
-                cls_selected = cls_indices
+            if normal_local.shape[0] == 0:
+                selected_indices = all_indices
             elif select_mode == "quantile":
-                # quantile 模式下已选出前 N% 图片，无需再随机下采样
-                cls_selected = cls_indices[cls_normal_local]
+                selected_indices = normal_local.astype(np.int64)
             elif args.random < 1:
-                cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
-                pick_local = np.random.choice(
-                    cls_normal_local, size=cls_sample_num, replace=False
-                )
-                cls_selected = cls_indices[pick_local]
+                sample_num = max(1, int(normal_local.shape[0] * args.random))
+                selected_indices = np.random.choice(
+                    normal_local, size=sample_num, replace=False
+                ).astype(np.int64)
             else:
-                cls_selected = cls_indices[cls_normal_local]
-            selected_local_list.append(cls_selected)
-
-        if len(selected_local_list) == 0:
-            selected_indices = np.arange(dataset_size, dtype=np.int64)
+                selected_indices = normal_local.astype(np.int64)
         else:
-            selected_indices = np.concatenate(selected_local_list, axis=0).astype(np.int64)
+            for cls in range(num_classes):
+                cls_mask = class_stack == cls
+                if not np.any(cls_mask):
+                    continue
+                cls_indices = np.where(cls_mask)[0].astype(np.int64)
+                cls_norm_scores = normalized_score[cls_indices]
+
+                if select_mode == "quantile":
+                    q = np.percentile(cls_norm_scores, select_quantile * 100.0)
+                    cls_normal_local = np.where(cls_norm_scores <= q)[0]
+                else:
+                    cls_normal_local = np.where(cls_norm_scores < 0.5)[0]
+
+                if cls_normal_local.shape[0] == 0:
+                    cls_selected = cls_indices
+                elif select_mode == "quantile":
+                    cls_selected = cls_indices[cls_normal_local]
+                elif args.random < 1:
+                    cls_sample_num = max(1, int(cls_normal_local.shape[0] * args.random))
+                    pick_local = np.random.choice(
+                        cls_normal_local, size=cls_sample_num, replace=False
+                    )
+                    cls_selected = cls_indices[pick_local]
+                else:
+                    cls_selected = cls_indices[cls_normal_local]
+                selected_local_list.append(cls_selected)
+
+            if len(selected_local_list) == 0:
+                selected_indices = np.arange(dataset_size, dtype=np.int64)
+            else:
+                selected_indices = np.concatenate(selected_local_list, axis=0).astype(np.int64)
         print_selected_score_distribution_fn(
             selected_indices=selected_indices,
             class_stack=class_stack,
@@ -654,7 +1020,7 @@ def precompute_pseudo_labels_multiclass_residual(
         confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
         if selected_indices.shape[0] == 0:
             pseudo_label_time = time.perf_counter() - memory_bank_start
-            return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time
+            return distance_map, confident_feature_bank, global_dim, 0.0, pseudo_label_time, None
 
         # 按类别记录被选中的图像索引
         selected_images_by_class = {}
@@ -683,7 +1049,8 @@ def precompute_pseudo_labels_multiclass_residual(
                     images, mini_class_idx, _mini_sample_idx = batch
                 images = images.to(device)
                 image_features, cls_token = _extract_features_with_optional_cls_token(
-                    extract_feature_batch_fn, images, feature_extractor, args
+                    extract_feature_batch_fn, images, feature_extractor, args,
+                    class_indices=mini_class_idx,
                 )
                 residual_features = compute_residual_feature_batch_fn(
                     image_features,
@@ -692,10 +1059,11 @@ def precompute_pseudo_labels_multiclass_residual(
                     reference_index_by_class,
                 )
                 patch_class_idx = None
-                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                if getattr(args, "use_moe_discriminator", False) and getattr(args, "moe_hard_class_gate", False):
                     patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
                 features, _ = localnet(
-                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+                    residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx,
+                    class_idx=mini_class_idx.to(device),
                 )
                 features_np = features.detach().cpu().numpy()
                 batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
@@ -836,7 +1204,8 @@ def precompute_pseudo_labels_multiclass_residual(
             sample_idx_np = mini_sample_idx.detach().cpu().numpy().astype(np.int64)
 
             image_features, cls_token = _extract_features_with_optional_cls_token(
-                extract_feature_batch_fn, images, feature_extractor, args
+                extract_feature_batch_fn, images, feature_extractor, args,
+                class_indices=mini_class_idx,
             )
             residual_features = compute_residual_feature_batch_fn(
                 image_features,
@@ -845,10 +1214,11 @@ def precompute_pseudo_labels_multiclass_residual(
                 reference_index_by_class,
             )
             patch_class_idx = None
-            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+            if getattr(args, "use_moe_discriminator", False) and getattr(args, "moe_hard_class_gate", False):
                 patch_class_idx = _build_patch_class_idx(mini_class_idx, residual_features)
             features, _ = localnet(
-                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx
+                residual_features, cls_token=cls_token, patch_class_idx=patch_class_idx,
+                class_idx=mini_class_idx.to(device),
             )
             features_np = features.detach().cpu().numpy()
             batch_class_np = mini_class_idx.detach().cpu().numpy().astype(np.int64)
@@ -901,6 +1271,12 @@ def precompute_pseudo_labels_multiclass_residual(
                         args.beta_number,
                     )
 
+    use_mad = bool(getattr(args, "use_mad_threshold", False))
+    mad_threshold_map = None
+
+    if use_mad:
+        _mad_raw = np.asarray(distance_map, dtype=np.float32).copy()
+
     if not getattr(args, "global_memory_bank", False):
         _plot_classwise_abs_distance_box_before_norm(
             args=args,
@@ -910,7 +1286,31 @@ def precompute_pseudo_labels_multiclass_residual(
             num_classes=num_classes,
             class_names=getattr(args, "class_names", None),
             epoch=epoch,
+            save_dir=save_dir,
         )
+
+    # ---- MAD-based threshold ----
+    if use_mad:
+        mad_k = float(getattr(args, "mad_k", 4.0))
+        global_bank = bool(getattr(args, "global_memory_bank", False))
+        if global_bank:
+            mad_thresholds = _compute_mad_threshold_global(
+                raw_distance_map=_mad_raw,
+                k=mad_k,
+            )
+        else:
+            mad_k_per_class_str = str(getattr(args, "mad_k_per_class", ""))
+            class_names_for_k = getattr(args, "class_names", None)
+            class_k_map = _parse_mad_k_per_class(mad_k_per_class_str, class_names_for_k, mad_k)
+            mad_thresholds = _compute_mad_thresholds_per_class(
+                raw_distance_map=_mad_raw,
+                class_stack=class_stack,
+                num_classes=num_classes,
+                k=mad_k,
+                class_k_map=class_k_map,
+                class_names=class_names_for_k,
+            )
+    # ---------------------------------------
 
     if getattr(args, "global_memory_bank", False):
         distance_map = _normalize_distance_map_global(
@@ -925,6 +1325,99 @@ def precompute_pseudo_labels_multiclass_residual(
             args=args,
         )
 
+    # Build MAD threshold_map in normalized space
+    if use_mad and mad_thresholds:
+        normalized = np.asarray(distance_map, dtype=np.float32)
+        mad_threshold_map = np.zeros_like(normalized, dtype=np.float32)
+        global_bank = bool(getattr(args, "global_memory_bank", False))
+        if global_bank:
+            info = mad_thresholds[0]
+            raw_thr = info["threshold"]
+            raw_all = _mad_raw.reshape(-1)
+            vmin = float(raw_all.min())
+            vmax = float(raw_all.max())
+            if vmax > vmin:
+                norm_thr = (raw_thr - vmin) / (vmax - vmin)
+            else:
+                norm_thr = 0.0
+            norm_thr = min(norm_thr, 0.65)
+            info["norm_threshold"] = float(norm_thr)
+            mad_threshold_map[:] = norm_thr
+
+            print("[MAD-Threshold] Global threshold (k={:.1f}):".format(mad_k))
+            print(
+                "  k={:.1f}  median(raw)={:.6f}  MAD(raw)={:.6f}  "
+                "thr(raw)={:.6f}  thr(norm)={:.6f}".format(
+                    info["k"],
+                    info["median"],
+                    info["mad"],
+                    info["threshold"],
+                    info["norm_threshold"],
+                )
+            )
+            _plot_global_distance_with_mad_threshold(
+                args=args,
+                raw_distance_map=_mad_raw,
+                mad_threshold_info=info,
+                epoch=epoch,
+                save_dir=save_dir,
+            )
+        else:
+            cls_arr = np.asarray(class_stack, dtype=np.int64).reshape(-1)
+            for cls, info in mad_thresholds.items():
+                cls_mask_flat = cls_arr == int(cls)
+                if not np.any(cls_mask_flat):
+                    continue
+                raw_thr = info["threshold"]
+                cls_raw = _mad_raw[cls_mask_flat]
+                vmin = float(cls_raw.min())
+                vmax = float(cls_raw.max())
+                if vmax > vmin:
+                    norm_thr = (raw_thr - vmin) / (vmax - vmin)
+                else:
+                    norm_thr = 0.0
+                norm_thr = min(norm_thr, 0.65)
+                info["norm_threshold"] = float(norm_thr)
+                mad_threshold_map[cls_mask_flat] = norm_thr
+
+            mad_k_default = float(getattr(args, "mad_k", 4.0))
+            print("[MAD-Threshold] Per-class thresholds (default k={:.1f}):".format(mad_k_default))
+            print("  {:20s}  {:>6s}  {:>10s}  {:>10s}  {:>10s}  {:>10s}".format(
+                "class", "k", "median(raw)", "MAD(raw)", "thr(raw)", "thr(norm)"))
+            class_names_mad = getattr(args, "class_names", None)
+            for cls in sorted(mad_thresholds.keys()):
+                info = mad_thresholds[cls]
+                cls_k = info.get("k", mad_k_default)
+                custom_mark = "*" if abs(cls_k - mad_k_default) > 1e-6 else " "
+                cls_name = (
+                    class_names_mad[cls]
+                    if isinstance(class_names_mad, (list, tuple)) and cls < len(class_names_mad)
+                    else f"cls_{cls}"
+                )
+                print(
+                    "  {:20s}  {:>5.1f}{}  {:10.6f}  {:10.6f}  {:10.6f}  {:10.6f}".format(
+                        cls_name,
+                        cls_k,
+                        custom_mark,
+                        info["median"],
+                        info["mad"],
+                        info["threshold"],
+                        info["norm_threshold"],
+                    )
+                )
+
+            _plot_classwise_distance_with_mad_threshold(
+                args=args,
+                raw_distance_map=_mad_raw,
+                class_stack=class_stack,
+                mad_thresholds=mad_thresholds,
+                num_classes=num_classes,
+                class_names=getattr(args, "class_names", None),
+                epoch=epoch,
+                save_dir=save_dir,
+            )
+    # ---------------------------------------
+
     if args.beta:
         if top_feat_global is None or top_feat_global.shape[0] == 0:
             confident_feature_bank = torch.zeros((0, global_dim), dtype=torch.float32)
@@ -934,12 +1427,19 @@ def precompute_pseudo_labels_multiclass_residual(
     # 统计伪标签分配准确率（基于真实 patch mask）
     values = distance_map.astype(np.float32)
     gt_mask_bool = gt_patch_masks.astype(bool)
+    noise_thr = float(args.noise_threshold)
 
-    # 使用传入的 threshold（两阶段），fallback 到 args.threshold（兼容旧脚本）
-    effective_threshold = float(threshold if threshold is not None else getattr(args, 'threshold', 0.5))
-    pred_normal = values < effective_threshold
-    pred_anomaly = values > float(args.noise_threshold)
-    pred_uncertain = np.logical_not(np.logical_or(pred_normal, pred_anomaly))
+    if use_mad and mad_threshold_map is not None:
+        # Per-patch MAD threshold
+        pred_normal = values < mad_threshold_map
+        pred_anomaly = values > noise_thr
+        pred_uncertain = np.logical_not(np.logical_or(pred_normal, pred_anomaly))
+        effective_threshold = None  # not a single scalar
+    else:
+        effective_threshold = float(threshold if threshold is not None else getattr(args, 'threshold', 0.5))
+        pred_normal = values < effective_threshold
+        pred_anomaly = values > noise_thr
+        pred_uncertain = np.logical_not(np.logical_or(pred_normal, pred_anomaly))
 
     pred_normal_count = int(pred_normal.sum())
     pred_anomaly_count = int(pred_anomaly.sum())
@@ -956,21 +1456,53 @@ def precompute_pseudo_labels_multiclass_residual(
         if pred_anomaly_count > 0
         else 0.0
     )
+    if use_mad and mad_threshold_map is not None:
+        thr_label = "MAD_thr"
+    else:
+        thr_label = f"thr={effective_threshold:.3f}"
     print(
         "[PseudoLabel-Stats] "
-        f"distance<threshold normal-precision: {normal_precision:.4f} "
+        f"distance<{thr_label} normal-precision: {normal_precision:.4f} "
         f"({pred_normal_correct}/{pred_normal_count}) | "
         f"distance>noise_threshold anomaly-precision: {anomaly_precision:.4f} "
         f"({pred_anomaly_correct}/{pred_anomaly_count})"
     )
 
-    if not getattr(args, "global_memory_bank", False):
+    if getattr(args, "global_memory_bank", False):
+        region_masks = (pred_normal, pred_uncertain, pred_anomaly)
+        region_names = (
+            f"distance<{thr_label}",
+            f"{thr_label}<=distance<=noise_threshold",
+            "distance>noise_threshold",
+        )
+        gt_names = ("gt_normal", "gt_anomaly")
+        stat_parts = []
+        for ridx, rmask in enumerate(region_masks):
+            for gidx, gt_sel in enumerate((np.logical_not(gt_mask_bool), gt_mask_bool)):
+                sel = np.logical_and(rmask, gt_sel)
+                cnt = int(sel.sum())
+                if cnt > 0:
+                    selected_vals = patch_feature_l2_map[sel].astype(np.float32)
+                    stat_parts.append(
+                        f"{region_names[ridx]}/{gt_names[gidx]}: "
+                        f"mean={float(selected_vals.mean()):.4f}, "
+                        f"std={float(selected_vals.std()):.4f}, "
+                        f"median={float(np.median(selected_vals)):.4f} (n={cnt})"
+                    )
+                else:
+                    stat_parts.append(f"{region_names[ridx]}/{gt_names[gidx]}: NA (n=0)")
+        print("[PseudoLabel-L2Norm] global | " + " | ".join(stat_parts))
+    else:
         classwise_region_gt_means = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
         classwise_region_gt_stds = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
         classwise_region_gt_medians = np.full((num_classes, 3, 2), np.nan, dtype=np.float32)
         classwise_region_gt_counts = np.zeros((num_classes, 3, 2), dtype=np.int64)
         region_masks = (pred_normal, pred_uncertain, pred_anomaly)
-        region_names = ("distance<threshold", "threshold<=distance<=noise_threshold", "distance>noise_threshold")
+        region_names = (
+            f"distance<{thr_label}",
+            f"{thr_label}<=distance<=noise_threshold",
+            "distance>noise_threshold",
+        )
         gt_names = ("gt_normal", "gt_anomaly")
 
         for cls in range(num_classes):
@@ -1021,6 +1553,7 @@ def precompute_pseudo_labels_multiclass_residual(
             class_names=class_names,
             region_gt_means=classwise_region_gt_means,
             epoch=epoch,
+            save_dir=save_dir,
         )
 
     _plot_distance_distribution_normal_vs_anomaly(
@@ -1031,7 +1564,8 @@ def precompute_pseudo_labels_multiclass_residual(
         class_stack=class_stack,
         num_classes=num_classes,
         class_names=getattr(args, "class_names", None),
+        save_dir=save_dir,
     )
 
     pseudo_label_time = time.perf_counter() - pseudo_start
-    return distance_map, confident_feature_bank, global_dim, memory_bank_time, pseudo_label_time
+    return distance_map, confident_feature_bank, global_dim, memory_bank_time, pseudo_label_time, mad_threshold_map

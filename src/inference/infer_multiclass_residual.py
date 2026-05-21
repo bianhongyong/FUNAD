@@ -3,6 +3,11 @@ import os
 import sys
 from typing import Dict, List, Tuple
 
+# Ensure project root is on sys.path (script lives at src/inference/infer_multiclass_residual.py)
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import cv2
 import numpy as np
 import pandas as pd
@@ -17,18 +22,26 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 
-import AnomalyCLIP_lib
 from dataset import dataset_extract
+from dataset.feature_extract import (
+    _FEATURE_MODEL_CHOICES,
+    DINOV3_FEATURE_MODEL_REGISTRY,
+    build_dinov3_feature_extractor,
+    extract_dinov3_feature_batch,
+    infer_dinov3_feature_dim,
+)
 from src.model import model
 import utils.train_utils as common_utils
 from utils.evaluate import _cv2_resize_dsize_from_mask
-from dataset.multiclass_feature_dataset import get_all_class_names
+from dataset.multiclass_feature_dataset import get_all_class_names, DINO_CLASS_LAYER_INDICES
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+# Per-class DINOv3 layer indices, shared via multiclass_feature_dataset.
+# Defined in dataset/multiclass_feature_dataset.py: DINO_CLASS_LAYER_INDICES.
 
 
 def str2bool(value):
@@ -43,8 +56,8 @@ def parse_args():
         default="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10",
     )
     parser.add_argument("--dataset", type=str, default="mvtec", choices=["mvtec", "visa"])
-    parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--checkpoint_path", type=str, default="/media/honeywell/E/bhy/FUNAD/save_results/ablation_study/residual+cross_attention+multi_memorybank+moe_hard_gate/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_localnet.pt")
+    parser.add_argument("--output_dir", type=str, default="./output_10")
     parser.add_argument(
         "--class_names",
         type=str,
@@ -93,7 +106,13 @@ def parse_args():
         default=False,
         help="Whether MoE discriminator gate uses cls_token as routing input.",
     )
-    parser.add_argument("--feature_model", type=str, choices=["dino", "clip"], default="dino")
+    parser.add_argument(
+        "--feature_model",
+        type=str,
+        choices=_FEATURE_MODEL_CHOICES,
+        default="dinov3_vitl16",
+        help="DINOv3 variant (torch.hub entry), e.g. dinov3_vitb16.",
+    )
     parser.add_argument(
         "--dinov3_hub",
         type=str,
@@ -112,109 +131,139 @@ def parse_args():
         default=448,
         help="与 DINOv3 训练一致：CenterCrop 边长。",
     )
-    parser.add_argument("--clip_model_name", type=str, default="ViT-L/14@336px")
-    parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24])
-    parser.add_argument("--dpam_layer", type=int, default=24)
-    parser.add_argument("--depth", type=int, default=9)
-    parser.add_argument("--n_ctx", type=int, default=12)
-    parser.add_argument("--t_n_ctx", type=int, default=4)
+    parser.add_argument(
+        "--residual",
+        type=str2bool,
+        default=None,
+        help="Enable residual features (feat - nearest_class_reference). "
+        "Default: auto-detect from checkpoint (non-empty reference_memory or _no_residual tag).",
+    )
+    # MoE discriminator args (mirror training script)
+    parser.add_argument(
+        "--use_moe_discriminator",
+        type=str2bool,
+        default=None,
+        help="Use MoE discriminator. Default: auto-detect from checkpoint.",
+    )
+    parser.add_argument(
+        "--moe_num_expert",
+        type=int,
+        default=None,
+        help="Number of experts. Default: auto-detect from checkpoint.",
+    )
+    parser.add_argument(
+        "--moe_top_k",
+        type=int,
+        default=None,
+        help="Top-k experts per token. Default: auto-detect (1 for hard_class_gate, else 2).",
+    )
+    parser.add_argument(
+        "--moe_hard_class_gate",
+        type=str2bool,
+        default=None,
+        help="Use hard class->expert routing. Default: auto-detect from checkpoint.",
+    )
+
     return parser.parse_args()
 
 
-def _convert_imagenet_norm_to_clip_norm(input_tensor):
-    mean_imagenet = torch.tensor(
-        IMAGENET_MEAN, device=input_tensor.device, dtype=input_tensor.dtype
-    ).view(1, 3, 1, 1)
-    std_imagenet = torch.tensor(
-        IMAGENET_STD, device=input_tensor.device, dtype=input_tensor.dtype
-    ).view(1, 3, 1, 1)
-    mean_clip = torch.tensor(
-        CLIP_MEAN, device=input_tensor.device, dtype=input_tensor.dtype
-    ).view(1, 3, 1, 1)
-    std_clip = torch.tensor(
-        CLIP_STD, device=input_tensor.device, dtype=input_tensor.dtype
-    ).view(1, 3, 1, 1)
+def infer_model_params_from_checkpoint(state_dict_keys: set, args):
+    """Detect MoE / adapter params from checkpoint state_dict, with CLI overrides.
 
-    rgb_01 = input_tensor * std_imagenet + mean_imagenet
-    rgb_01 = torch.clamp(rgb_01, 0.0, 1.0)
-    clip_tensor = (rgb_01 - mean_clip) / std_clip
-    return clip_tensor
+    Returns a dict with keys: use_moe_discriminator, moe_num_expert, moe_top_k,
+    moe_hard_class_gate, class_conditioned_adapter.
+    """
+    import re
+
+    has_class_adapter = any(
+        k.startswith("adaptor.class_embed") or k.startswith("adaptor.cross_attn")
+        for k in state_dict_keys
+    )
+
+    use_moe = any(k.startswith("discriminator.moe_layer.") for k in state_dict_keys)
+    if args.use_moe_discriminator is not None:
+        use_moe = bool(args.use_moe_discriminator)
+
+    hard_class = False
+    num_expert = 4
+    top_k = 2
+
+    if use_moe:
+        # Count experts from state dict
+        expert_indices = set()
+        for k in state_dict_keys:
+            m = re.search(r'discriminator\.moe_layer\.experts\.(\d+)', k)
+            if m:
+                expert_indices.add(int(m.group(1)))
+        inferred_num_expert = max(expert_indices) + 1 if expert_indices else 4
+
+        # Detect hard class gate: MoE present but no gate.weight → ClassHardGate
+        has_gate_weight = any(
+            k.startswith("discriminator.moe_layer.gate.") and "weight" in k
+            for k in state_dict_keys
+        )
+        inferred_hard = not has_gate_weight
+
+        hard_class = args.moe_hard_class_gate if args.moe_hard_class_gate is not None else inferred_hard
+        num_expert = args.moe_num_expert if args.moe_num_expert is not None else inferred_num_expert
+        top_k = args.moe_top_k if args.moe_top_k is not None else (1 if hard_class else 2)
+
+    return {
+        "use_moe_discriminator": use_moe,
+        "moe_num_expert": num_expert,
+        "moe_top_k": top_k,
+        "moe_hard_class_gate": hard_class,
+        "class_conditioned_adapter": has_class_adapter,
+    }
+
+
+def infer_use_residual(checkpoint: dict, checkpoint_path: str, args) -> bool:
+    """Detect whether to compute residual features, with CLI override."""
+    if args.residual is not None:
+        return bool(args.residual)
+
+    ref_raw = checkpoint.get("reference_memory_by_class", {})
+    has_ref = any(np.asarray(mem).size > 0 for mem in ref_raw.values())
+    if has_ref:
+        return True
+
+    basename = os.path.basename(checkpoint_path)
+    if "_no_residual_" in basename or basename.endswith("_no_residual_localnet.pt"):
+        return False
+    return False
+
+
+def _set_dinov3_hub_env(hub_path: str):
+    """Temporarily override DINOV3_HUB_DIR env var; returns a cleanup callable."""
+    if not hub_path:
+        return None
+    old_val = os.environ.get("DINOV3_HUB_DIR")
+    os.environ["DINOV3_HUB_DIR"] = hub_path
+    def restore():
+        if old_val is None:
+            os.environ.pop("DINOV3_HUB_DIR", None)
+        else:
+            os.environ["DINOV3_HUB_DIR"] = old_val
+    return restore
 
 
 def build_feature_extractor(args, device):
-    if args.feature_model == "clip":
-        anomalyclip_parameters = {
-            "Prompt_length": args.n_ctx,
-            "learnabel_text_embedding_depth": args.depth,
-            "learnabel_text_embedding_length": args.t_n_ctx,
-        }
-        feature_extractor, _ = AnomalyCLIP_lib.load(
-            args.clip_model_name,
-            device=device,
-            design_details=anomalyclip_parameters,
-        )
-        feature_extractor.eval()
-        feature_extractor.visual.DAPM_replace(DPAM_layer=args.dpam_layer)
-        return feature_extractor
-
-    # DINOv3 hub 会 `import utils`，与工程内 `utils` 包冲突；与 self_train_ad_multiclass_dinov3 一致地临时解除。
-    local_utils_module = sys.modules.get("utils")
-    should_restore_utils = (
-        local_utils_module is not None
-        and os.path.abspath(getattr(local_utils_module, "__file__", "")).endswith(
-            os.path.join("FUNAD", "utils.py")
-        )
-    )
-    if should_restore_utils:
-        del sys.modules["utils"]
+    restore_hub = _set_dinov3_hub_env(args.dinov3_hub)
     try:
-        repo_dir = args.dinov3_hub or os.path.join(
-            torch.hub.get_dir(), "facebookresearch_dinov3_main"
-        )
-        feature_extractor = torch.hub.load(
-            repo_dir,
-            "dinov3_vitb16",
-            source="local",
-            pretrained=True,
-        )
+        return build_dinov3_feature_extractor(args.feature_model, device)
     finally:
-        if should_restore_utils:
-            sys.modules["utils"] = local_utils_module
-
-    feature_extractor = feature_extractor.to(device)
-    feature_extractor.eval()
-    return feature_extractor
+        if restore_hub is not None:
+            restore_hub()
 
 
-def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False):
-    with torch.no_grad():
-        feature_extractor.eval()
-        cls_token = None
-        if args.feature_model == "clip":
-            clip_input = _convert_imagenet_norm_to_clip_norm(input_tensor)
-            image_features, _, _, patch_projections = feature_extractor.encode_image(
-                clip_input,
-                args.features_list,
-                DPAM_layer=args.dpam_layer,
-            )
-            x_norm = image_features
-            x_prenorm = patch_projections[-1]
-            cls_token = x_norm
-        else:
-            # DINOv3：默认返回已去掉 CLS/register 的 patch；需 return_class_token=True 取最后一层 CLS
-            patch_tokens, cls_tok = feature_extractor.get_intermediate_layers(
-                input_tensor, return_class_token=True
-            )[0]
-            x_norm = cls_tok
-            x_prenorm = patch_tokens
-            cls_token = cls_tok
-
-    if args.use_cls_token:
-        x_norm = torch.repeat_interleave(x_norm.unsqueeze(1), x_prenorm.shape[1], dim=1)
-        x_prenorm = torch.cat([x_norm, x_prenorm], dim=-1)
-    if return_cls_token:
-        return x_prenorm, cls_token
-    return x_prenorm
+def extract_feature_batch(input_tensor, feature_extractor, args, return_cls_token=False, class_indices=None, class_layer_indices=None):
+    return extract_dinov3_feature_batch(
+        input_tensor, feature_extractor,
+        dino_layer_indices=class_layer_indices,
+        class_indices=class_indices,
+        use_cls_token=args.use_cls_token,
+        return_cls_token=return_cls_token,
+    )
 
 
 def compute_residual_feature_batch(
@@ -297,8 +346,13 @@ def make_triplet_panel(
 
 
 def find_feature_dim_and_patches(
-    args, feature_extractor, device, class_names: List[str]
+    args, feature_extractor, device, class_names: List[str], class_to_idx: dict,
+    class_layer_indices=None,
 ) -> Tuple[int, int]:
+    # Compute union of all layer indices (flat list) — same approach as training
+    _all_layer_values = sorted(set(
+        idx for lst in class_layer_indices.values() for idx in lst
+    ))
     for class_name in class_names:
         test_set = dataset_extract.MyDataset(
             dataset_path=args.data_path,
@@ -310,10 +364,24 @@ def find_feature_dim_and_patches(
         )
         if len(test_set) == 0:
             continue
-        x, _, _ = test_set[0]
-        x = x.unsqueeze(0).to(device)
-        feat = extract_feature_batch(x, feature_extractor, args)
-        return int(feat.shape[-1]), int(feat.shape[1])
+        from torch.utils.data import DataLoader
+        dummy_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=0)
+        # Pass flat layer list; infer_dinov3_feature_dim doesn't need per-class routing.
+        feature_dim = infer_dinov3_feature_dim(
+            feature_extractor, dummy_loader, _all_layer_values,
+            args.use_cls_token, device,
+        )
+        from PIL import Image
+        img_tensor, _, _ = test_set[0]
+        image = img_tensor.unsqueeze(0).to(device, non_blocking=True)
+        # Need class_indices when class_layer_indices is a dict
+        class_idx_tensor = torch.full((1,), int(class_to_idx[class_name]), dtype=torch.long, device=device)
+        features = extract_dinov3_feature_batch(
+            image, feature_extractor, class_layer_indices,
+            class_indices=class_idx_tensor,
+            use_cls_token=args.use_cls_token,
+        )
+        return feature_dim, int(features.shape[1])
     raise RuntimeError("测试集为空，无法推断特征维度与 patch 数。")
 
 
@@ -322,6 +390,8 @@ def build_reference_index(
     use_cuda: bool,
     use_cpu_index: bool,
     gpu_temp_mem_mb: int,
+    *,
+    allow_empty: bool = False,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, object]]:
     memory_np_by_class = {}
     index_by_class = {}
@@ -337,7 +407,7 @@ def build_reference_index(
             use_cpu_index=use_cpu_index,
             gpu_temp_mem_mb=gpu_temp_mem_mb,
         )
-    if len(index_by_class) == 0:
+    if len(index_by_class) == 0 and not allow_empty:
         raise RuntimeError("checkpoint 中未找到可用 reference_memory_by_class。")
     return memory_np_by_class, index_by_class
 
@@ -354,67 +424,106 @@ def f1_score_max(y_true, y_score):
     return float(np.max(f1s[:-1]))
 
 
+import numpy as np
+from skimage import measure
+from sklearn.metrics import auc
+
 def compute_pro(masks, amaps, num_th=200):
+    """
+    计算MVTec AD官方标准的PRO-AUC（FPR 0-0.3范围内的曲线下面积）
+    
+    Args:
+        masks: 真实掩码，形状为[N, H, W]或[N, 1, H, W]，0=正常，1=异常
+        amaps: 异常分数图，形状与masks相同，值越高越异常
+        num_th: 阈值数量
+    
+    Returns:
+        pro_auc: PRO-AUC值
+    """
     masks = np.asarray(masks).astype(np.uint8)
     amaps = np.asarray(amaps).astype(np.float32)
+    
+    # 处理4维输入
     if masks.ndim == 4 and masks.shape[1] == 1:
         masks = masks[:, 0]
     if amaps.ndim == 4 and amaps.shape[1] == 1:
         amaps = amaps[:, 0]
+    
+    # 输入验证
     if masks.shape != amaps.shape or masks.ndim != 3:
-        raise ValueError("masks and amaps must be [N,H,W] with the same shape")
+        raise ValueError(f"masks和amaps形状必须相同且为[N,H,W]，当前masks={masks.shape}, amaps={amaps.shape}")
     if num_th <= 0:
         return 0.0
-
+    
     min_th = float(amaps.min())
     max_th = float(amaps.max())
     if max_th <= min_th:
         return 0.0
-
-    thresholds = np.linspace(min_th, max_th, num=num_th, endpoint=False, dtype=np.float32)
+    
+    # 生成阈值（修正：包含最大值）
+    thresholds = np.linspace(min_th, max_th, num=num_th, endpoint=True, dtype=np.float32)
+    
     inverse_masks = 1 - masks
     inverse_sum = float(inverse_masks.sum())
     if inverse_sum <= 0:
-        return 0.0
-
+        return 0.0  # 所有样本都是异常，无法计算FPR
+    
     pro_list = []
     fpr_list = []
+    
     for th in thresholds:
         binary_amaps = (amaps > th).astype(np.uint8)
         per_region_overlaps = []
+        
         for pred, mask in zip(binary_amaps, masks):
-            labeled = measure.label(mask, connectivity=1)
+            # 修正：使用8连通（MVTec官方标准）
+            labeled = measure.label(mask, connectivity=2)
             for region in measure.regionprops(labeled):
                 coords = region.coords
                 tp_pixels = pred[coords[:, 0], coords[:, 1]].sum()
-                per_region_overlaps.append(float(tp_pixels) / float(region.area))
+                overlap = float(tp_pixels) / float(region.area)
+                per_region_overlaps.append(overlap)
+        
+        # 处理预测全黑的情况
         if not per_region_overlaps:
-            continue
+            pro = 0.0
+        else:
+            pro = float(np.mean(per_region_overlaps))
+        
         fpr = float(np.logical_and(inverse_masks, binary_amaps).sum()) / inverse_sum
-        pro_list.append(float(np.mean(per_region_overlaps)))
+        
+        pro_list.append(pro)
         fpr_list.append(fpr)
-
-    if not pro_list:
-        return 0.0
-
+    
+    # 转换为数组
     fpr_arr = np.asarray(fpr_list, dtype=np.float32)
     pro_arr = np.asarray(pro_list, dtype=np.float32)
-    valid = np.isfinite(fpr_arr) & np.isfinite(pro_arr) & (fpr_arr < 0.3)
+    
+    # 只保留FPR < 0.3的有效点（工业标准）
+    valid = np.isfinite(fpr_arr) & np.isfinite(pro_arr) & (fpr_arr <= 0.3)
     if not np.any(valid):
         return 0.0
+    
     fpr_arr = fpr_arr[valid]
     pro_arr = pro_arr[valid]
+    
     if fpr_arr.size < 2:
         return 0.0
+    
+    # 按FPR排序
     order = np.argsort(fpr_arr)
     fpr_arr = fpr_arr[order]
     pro_arr = pro_arr[order]
-
+    
+    # 计算FPR 0-0.3范围内的AUC
     fpr_max = float(fpr_arr.max())
     if fpr_max <= 0:
         return 0.0
-    fpr_arr = fpr_arr / fpr_max
-    return float(auc(fpr_arr, pro_arr))
+    
+    # 归一化FPR到[0,1]区间
+    fpr_normalized = fpr_arr / fpr_max
+    
+    return float(auc(fpr_normalized, pro_arr))
 
 
 def _safe_roc_auc(y_true, y_score):
@@ -496,9 +605,21 @@ def main():
     if "reference_memory_by_class" not in checkpoint:
         raise KeyError("checkpoint 缺少 'reference_memory_by_class' 键。")
 
+    use_residual = infer_use_residual(checkpoint, args.checkpoint_path, args)
+    print(f"[model] use_residual={use_residual}")
+
     feature_extractor = build_feature_extractor(args, device)
+
+    # Build per-class layer indices (matches training DINO_CLASS_LAYER_INDICES)
+    # Must happen before find_feature_dim_and_patches which needs class_layer_indices.
+    args.class_layer_indices = {
+        i: DINO_CLASS_LAYER_INDICES.get(name, [-1])
+        for i, name in enumerate(all_class_names)
+    }
+
     feature_dim, num_patches = find_feature_dim_and_patches(
-        args, feature_extractor, device, target_class_names
+        args, feature_extractor, device, target_class_names, class_to_idx,
+        class_layer_indices=args.class_layer_indices,
     )
     patch_side = int(np.sqrt(num_patches))
     if patch_side * patch_side != num_patches:
@@ -506,9 +627,31 @@ def main():
             f"patch 数 {num_patches} 不是完全平方数，无法形成热力图网格。"
         )
 
+    state_dict_keys = set(checkpoint["net"].keys())
+
+    # Infer model params from checkpoint state dict (with CLI overrides)
+    model_params = infer_model_params_from_checkpoint(state_dict_keys, args)
+    has_class_adapter = model_params["class_conditioned_adapter"]
+    use_moe = model_params["use_moe_discriminator"]
+    moe_num_expert = model_params["moe_num_expert"]
+    moe_top_k = model_params["moe_top_k"]
+    moe_hard_class_gate = model_params["moe_hard_class_gate"]
+
+    print(f"[model] class_conditioned_adapter={has_class_adapter}, "
+          f"use_moe_discriminator={use_moe}")
+    if use_moe:
+        print(f"[model]   moe: num_expert={moe_num_expert}, top_k={moe_top_k}, "
+              f"hard_class_gate={moe_hard_class_gate}")
+
     localnet = model.localnet(
         len_feature=feature_dim,
+        use_moe_discriminator=use_moe,
+        moe_num_expert=moe_num_expert,
+        moe_top_k=moe_top_k,
         moe_use_cls_token=args.moe_use_cls_token,
+        moe_hard_class_gate=moe_hard_class_gate,
+        num_classes=len(all_class_names) if has_class_adapter else None,
+        class_conditioned_adapter=has_class_adapter,
     ).to(device)
     localnet.load_state_dict(checkpoint["net"], strict=True)
     localnet.eval()
@@ -519,7 +662,12 @@ def main():
         use_cuda=use_cuda,
         use_cpu_index=bool(args.faiss_cpu_index),
         gpu_temp_mem_mb=int(args.faiss_gpu_temp_mem_mb),
+        allow_empty=not use_residual,
     )
+    if use_residual and len(reference_index_by_class) == 0:
+        raise RuntimeError(
+            "use_residual=True 但 checkpoint 中 reference_memory_by_class 为空。"
+        )
 
     total_saved = 0
     metrics_rows = []
@@ -555,37 +703,43 @@ def main():
         with torch.no_grad():
             for images, y, mask in test_loader:
                 images = images.to(device)
-                features, cls_token = extract_feature_batch(
-                    images, feature_extractor, args, return_cls_token=True
-                )
                 class_idx_batch = torch.full(
-                    (features.shape[0],),
+                    (images.shape[0],),
                     int(class_idx),
                     dtype=torch.long,
                     device=device,
                 )
-                residual_features = compute_residual_feature_batch(
-                    features,
-                    class_idx_batch,
-                    reference_memory_by_class,
-                    reference_index_by_class,
-                    num_patches=num_patches,
+                features, cls_token = extract_feature_batch(
+                    images, feature_extractor, args, return_cls_token=True,
+                    class_indices=class_idx_batch,
+                    class_layer_indices=args.class_layer_indices,
                 )
+                if use_residual:
+                    model_features = compute_residual_feature_batch(
+                        features,
+                        class_idx_batch,
+                        reference_memory_by_class,
+                        reference_index_by_class,
+                        num_patches=num_patches,
+                    )
+                else:
+                    model_features = features
                 patch_class_idx = None
-                if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+                if use_moe and moe_hard_class_gate:
                     token_per_image = (
-                        int(residual_features.shape[1]) if residual_features.dim() >= 2 else 1
+                        int(model_features.shape[1]) if model_features.dim() >= 2 else 1
                     )
                     patch_class_idx = (
-                        class_idx_batch.to(device=residual_features.device, dtype=torch.long)
+                        class_idx_batch.to(device=model_features.device, dtype=torch.long)
                         .reshape(-1, 1, 1)
                         .expand(-1, token_per_image, 1)
                         .contiguous()
                     )
                 _, score = localnet(
-                    residual_features,
+                    model_features,
                     cls_token=cls_token,
                     patch_class_idx=patch_class_idx,
+                    class_idx=class_idx_batch,
                 )
                 score_np = score.detach().cpu().numpy().reshape(-1, patch_side, patch_side)
                 score_flat = score.detach().cpu().numpy().reshape(score_np.shape[0], -1)

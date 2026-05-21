@@ -291,7 +291,7 @@ def build_reference_memory_bank(
         for batch in reference_loader:
             images, class_idx = batch[0], batch[1]
             images = images.to(device, non_blocking=True)
-            base_features = extract_feature_fn(images)
+            base_features = extract_feature_fn(images, class_indices=class_idx)
             feat_np = base_features.detach().cpu().numpy()
             class_np = class_idx.detach().cpu().numpy().astype(np.int64)
             dim = int(base_features.shape[-1])
@@ -396,6 +396,13 @@ def select_reference_indices_by_class(train_dataset, num_classes, num_reference_
         sample_n = min(max(1, num_reference_images_per_class), len(cls_candidates))
         selected = rng.choice(np.array(cls_candidates), size=sample_n, replace=False)
         reference_indices_by_class[class_idx] = sorted(selected.tolist())
+
+        # print selected reference image paths
+        dataset_samples = train_dataset.samples
+        print(f"[Reference] class {class_idx} ({sample_n} images):")
+        for sel_idx in reference_indices_by_class[class_idx]:
+            sel_path = dataset_samples[sel_idx][0]
+            print(f"  {sel_path}")
 
     return reference_indices_by_class
 

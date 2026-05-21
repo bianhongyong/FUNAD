@@ -104,18 +104,50 @@ class PositionalEncoding(nn.Module):
         # [seq_len = 30, d_model = 512]
         # it will add with tok_emb : [128, 30, 512]     
 
-class feature_adaptor(nn.Module):
-    def __init__(self):
-        super(feature_adaptor, self).__init__()
 
-        self.adaptor = nn.Sequential(
-            nn.Linear(len_feature, len_feature), # feature adoptor
-            nn.LeakyReLU(.2),
+
+class ClassCrossAttentionAdapter(nn.Module):
+    """Class-conditioned cross-attention feature adapter.
+
+    Replaces the shared Linear+LeakyReLU adaptor with a per-class
+    attention mechanism.  Each class owns a learnable embedding;
+    patch features query that embedding via cross-attention to
+    obtain class-specific feature modulation.
+
+    Architecture:
+        x_normed = LayerNorm(x)
+        cls_emb   = class_embed[class_idx]            # [B, 1, C]
+        attn_out  = CrossAttn(Q=x_normed, K=cls_emb, V=cls_emb)
+        adapted   = LeakyReLU(x + attn_out)
+    """
+    def __init__(self, d_model, num_classes, num_heads=8):
+        super().__init__()
+        if d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            )
+
+        self.class_embed = nn.Embedding(num_classes, d_model)
+        nn.init.trunc_normal_(self.class_embed.weight, std=0.02)
+
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, num_heads=num_heads, batch_first=True,
         )
-    
-    def forward(self, x):
-        adapted_features = self.adaptor(x)
-        return adapted_features
+        self.norm = nn.LayerNorm(d_model)
+        self.act = nn.GELU()
+
+    def forward(self, x, class_idx):
+        """Args:
+            x: [B, P, C] residual patch features.
+            class_idx: [B] class index for each sample.
+        Returns:
+            adapted: [B, P, C] class-conditioned adapted features.
+        """
+        cls_emb = self.class_embed(class_idx).unsqueeze(1)  # [B, 1, C]
+        attn_out, _ = self.cross_attn(
+            query=self.norm(x), key=cls_emb, value=cls_emb,
+        )
+        return self.act(x + attn_out)
 
 class Conv1x1(nn.Module):
     def __init__(self, in_channels=768, out_channels=1536):
@@ -385,7 +417,7 @@ class MoEStack(nn.Module):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
-        activation = activation if activation is not None else nn.LeakyReLU(.2)
+        activation = activation if activation is not None else nn.GELU()
         d_hidden = d_input * 2
         d_output = d_input
         self.pre_lnorm = bool(pre_lnorm)
@@ -453,7 +485,7 @@ class MoEDiscriminator(nn.Module):
             d_input=d_input,
             d_hidden=d_input * 2,
             d_output=1,
-            activation=nn.LeakyReLU(.2),
+            activation=nn.GELU(),
             top_k=effective_top_k,
             world_size=1,
             **moe_kwargs,
@@ -506,15 +538,23 @@ class localnet(nn.Module):
         moe_top_k=2,
         moe_use_cls_token=False,
         moe_hard_class_gate=False,
+        num_classes=None,
+        class_conditioned_adapter=True,
     ):
         super(localnet, self).__init__()
-        
+
         # 论文中的 phi_adaptor(·):
         # 将预训练特征映射到当前异常检测任务的可学习特征空间。
-        self.adaptor = nn.Sequential(
-            nn.Linear(len_feature, len_feature), # feature adoptor
-            nn.LeakyReLU(.2),
-        )
+        if class_conditioned_adapter and num_classes is not None and num_classes > 1:
+            self.adaptor = ClassCrossAttentionAdapter(
+                d_model=len_feature,
+                num_classes=num_classes,
+            )
+        else:
+            self.adaptor = nn.Sequential(
+                nn.Linear(len_feature, len_feature), # feature adoptor
+                nn.GELU(),
+            )
 
         # 论文中的 phi_L(·):
         # patch-level anomaly probability predictor (Sigmoid 输出 [0, 1])。
@@ -531,9 +571,9 @@ class localnet(nn.Module):
         else:
             self.discriminator = nn.Sequential(
                 nn.Linear(len_feature, 1024),
-                nn.LeakyReLU(.2),
+                nn.GELU(),
                 nn.Linear(1024, 128),
-                nn.LeakyReLU(.2),
+                nn.GELU(),
                 nn.Linear(128, 1),
                 nn.Sigmoid(),
             )
@@ -543,12 +583,17 @@ class localnet(nn.Module):
         if feat_select:
             self.conv1x1_layer = Conv1x1(in_channels=512, out_channels=1536).cuda()
 
-    def forward(self, x, synthetic_feat=None, cls_token=None, patch_class_idx=None):
+    def forward(self, x, synthetic_feat=None, cls_token=None, patch_class_idx=None, class_idx=None):
         # 输入 x: [B, P, C]，常见 P=784, C=1536。
         # 返回:
         # - adapted_features: 适配后 patch 特征 (用于 memory bank / 距离度量)
         # - local_score: patch 异常分数 (用于伪标签监督与推理)
-        adapted_features = self.adaptor(x) 
+        if isinstance(self.adaptor, ClassCrossAttentionAdapter):
+            if class_idx is None:
+                raise ValueError("class_idx is required when using ClassCrossAttentionAdapter")
+            adapted_features = self.adaptor(x, class_idx=class_idx)
+        else:
+            adapted_features = self.adaptor(x)
         if self.use_moe_discriminator:
             gate_cls_token = cls_token if (self.moe_use_cls_token and not self.moe_hard_class_gate) else None
             route_patch_class = patch_class_idx if self.moe_hard_class_gate else None
@@ -568,14 +613,14 @@ class globalnet(nn.Module):
         # 与 localnet 类似的 image-level 分支定义，当前 FUN-AD 主训练脚本未使用。
         self.adaptor = nn.Sequential(
             nn.Linear(len_feature, len_feature), # feature adoptor
-            nn.LeakyReLU(.2),
+            nn.GELU(),
         )
 
         self.discriminator = nn.Sequential(
             nn.Linear(len_feature, 1024),
-            nn.LeakyReLU(.2),
+            nn.GELU(),
             nn.Linear(1024, 128),
-            nn.LeakyReLU(.2),
+            nn.GELU(),
             nn.Linear(128, 1),
             nn.Sigmoid(),
         )

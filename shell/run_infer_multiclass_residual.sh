@@ -16,12 +16,12 @@ conda activate "$CONDA_ENV"
 # ===== User-configurable（必填：CHECKPOINT_PATH、OUTPUT_DIR）=====
 DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
 DATASET="mvtec" # mvtec | visa
-CHECKPOINT_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3_kl/mvtec/20%/gaussian_True_noise_20%_balancing_True_oto_True_weight_2.5_multiclass_residual_localnet.pt"
-OUTPUT_DIR="./output_20"       # 例如: /path/to/infer_outputs/run1
+CHECKPOINT_PATH="/media/honeywell/E/bhy/FUNAD/save_results/ablation_study/residual+cross_attention+multi_memorybank+moe_hard_gate/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_localnet.pt"
+OUTPUT_DIR="./output_10"       # 例如: /path/to/infer_outputs/run1
 
 BATCH_SIZE=16
 NUM_WORKERS=4
-FEATURE_MODEL="dino" # dino | clip
+FEATURE_MODEL="dinov3_vitl16"
 SEED=0
 IMAGE_SIZE=512
 CROP_SIZE=448

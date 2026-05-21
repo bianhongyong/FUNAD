@@ -307,7 +307,7 @@ def resolve_dino_block_indices(feature_extractor, dino_layer_indices):
     for lid in requested_layers:
         if lid < 1 or lid > num_blocks:
             raise ValueError(
-                f"--dino_layer_indices {lid} (1-based) is out of range. "
+                f"dino_layer_indices {lid} (1-based) is out of range. "
                 f"Model has {num_blocks} blocks (1-based: 1..{num_blocks}). "
                 f"Received: {raw}"
             )
@@ -315,20 +315,59 @@ def resolve_dino_block_indices(feature_extractor, dino_layer_indices):
     return sorted({int(lid) - 1 for lid in requested_layers})
 
 
-def extract_dinov3_feature_batch(input_tensor, feature_extractor, dino_layer_indices, use_cls_token=False, return_cls_token=False):
-    """Extract DINOv3 patch features from a batch of images."""
+def extract_dinov3_feature_batch(input_tensor, feature_extractor, dino_layer_indices, class_indices=None, use_cls_token=False, return_cls_token=False):
+    """Extract DINOv3 patch features from a batch of images.
+
+    Args:
+        dino_layer_indices: list[int] (global, used for all samples),
+            or dict[int, list[int]] mapping class_idx -> layer_indices (per-class).
+        class_indices: Tensor[B], required when dino_layer_indices is a dict.
+    """
     with torch.no_grad():
         feature_extractor.eval()
-        selected_blocks = resolve_dino_block_indices(feature_extractor, dino_layer_indices)
-        selected_layers = feature_extractor.get_intermediate_layers(
-            input_tensor,
-            n=selected_blocks,
-            return_class_token=True,
-        )
-        patch_tokens_list = [layer_patch for layer_patch, _layer_cls in selected_layers]
-        cls_tokens_list = [_layer_cls for _layer_patch, _layer_cls in selected_layers]
-        x_prenorm = torch.stack(patch_tokens_list, dim=0).mean(dim=0)
-        cls_tok = torch.stack(cls_tokens_list, dim=0).mean(dim=0)
+
+        is_per_class = isinstance(dino_layer_indices, dict)
+        if is_per_class:
+            # Per-class mode: compute union of all needed layers, extract once,
+            # then per-sample select and average only its class's layers.
+            assert class_indices is not None, "class_indices required when dino_layer_indices is a dict"
+            all_unique = sorted({idx for lst in dino_layer_indices.values() for idx in lst})
+            selected_blocks = resolve_dino_block_indices(feature_extractor, all_unique)
+            selected_layers = feature_extractor.get_intermediate_layers(
+                input_tensor, n=selected_blocks, return_class_token=True,
+            )
+            # [L, B, N, C] and [L, B, C]
+            all_patches = torch.stack([p for p, _ in selected_layers], dim=0)
+            all_cls = torch.stack([c for _, c in selected_layers], dim=0)
+
+            cls_to_blocks = {
+                cls: set(resolve_dino_block_indices(feature_extractor, idxs))
+                for cls, idxs in dino_layer_indices.items()
+            }
+            batch_size = input_tensor.shape[0]
+            patch_list, cls_list = [], []
+            for i in range(batch_size):
+                cls = int(class_indices[i])
+                cls_blocks = cls_to_blocks[cls]
+                mask = torch.tensor(
+                    [b in cls_blocks for b in selected_blocks],
+                    device=input_tensor.device,
+                )
+                patch_list.append(all_patches[mask, i].mean(dim=0))
+                cls_list.append(all_cls[mask, i].mean(dim=0))
+            x_prenorm = torch.stack(patch_list, dim=0)
+            cls_tok = torch.stack(cls_list, dim=0)
+        else:
+            # Original mode: single global layer set for all samples
+            selected_blocks = resolve_dino_block_indices(feature_extractor, dino_layer_indices)
+            selected_layers = feature_extractor.get_intermediate_layers(
+                input_tensor, n=selected_blocks, return_class_token=True,
+            )
+            patch_tokens_list = [layer_patch for layer_patch, _layer_cls in selected_layers]
+            cls_tokens_list = [_layer_cls for _layer_patch, _layer_cls in selected_layers]
+            x_prenorm = torch.stack(patch_tokens_list, dim=0).mean(dim=0)
+            cls_tok = torch.stack(cls_tokens_list, dim=0).mean(dim=0)
+
         x_norm = cls_tok
         cls_token = cls_tok
 

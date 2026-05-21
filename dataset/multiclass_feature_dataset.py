@@ -21,7 +21,7 @@ MVTEC_CLASS_NAMES = [
      "leather",
      "metal_nut",
      "pill",
-    #  "screw",
+     "screw",
      "tile",
      "toothbrush",
      "transistor",
@@ -45,6 +45,55 @@ VISA_CLASS_NAMES = [
 ]
 
 
+# Per-class DINOv3 layer indices (1-based). -1 means last layer.
+# Shared by training (self_train_ad_multiclass_dinov3.py) and inference
+# (infer_multiclass_residual.py). Modify here to keep both in sync.
+DINO_CLASS_LAYER_INDICES = {
+    # MVTec
+    "bottle": [11,12,13,14,15,16], "cable": [11,12,13,14,15,16], "capsule": [11,12,13,14,15,16], "carpet": [11,12,13,14,15,16],
+    "grid": [11,12,13,14,15,16], "hazelnut": [11,12,13,14,15,16], "leather": [11,12,13,14,15,16], "metal_nut": [11,12,13,14,15,16],
+    "pill": [11,12,13,14,15,16], "screw": [11,12,13,22,23,24], "tile": [11,12,13,14,15,16], "toothbrush": [11,12,13,14,15,16],
+    "transistor": [11,12,13,14,15,16], "wood": [11,12,13,14,15,16], "zipper": [11,12,13,14,15,16],
+    # VISA
+    "candle": [11,12,13,22,23,24],
+    "capsules": [11,12,13,22,23,24],
+    "cashew": [11,12,13,22,23,24],
+    "chewinggum": [11,12,13,22,23,24],
+    "fryum": [11,12,13,22,23,24],
+    "macaroni1": [11,12,13,22,23,24],
+    "macaroni2": [11,12,13,22,23,24],
+    "pipe_fryum": [11,12,13,22,23,24],
+    "pcb1": [11,12,13,22,23,24],
+    "pcb2": [11,12,13,22,23,24],
+    "pcb3": [11,12,13,22,23,24],
+    "pcb4": [11,12,13,22,23,24]
+}
+
+# Mid / tail layer groups for adaptive_rpn_fusionv2_CA (1-based indices, -1 = last block).
+# Used when --use_dino_layer_fusion is enabled instead of DINO_CLASS_LAYER_INDICES.
+DINO_LAYER_FUSION_INDICES = {
+    "dinov3_vitl16": {
+        "mid": [9, 10, 11, 12, 13, 14, 15],
+        "tail": [22, 23, -1],
+    },
+    "dinov3_vitl16plus": {
+        "mid": [9, 10, 11, 12, 13, 14, 15],
+        "tail": [22, 23, -1],
+    },
+}
+
+
+def get_dino_layer_fusion_indices(feature_model: str):
+    if feature_model not in DINO_LAYER_FUSION_INDICES:
+        supported = ", ".join(sorted(DINO_LAYER_FUSION_INDICES))
+        raise ValueError(
+            f"feature_model={feature_model!r} has no DINO_LAYER_FUSION_INDICES entry. "
+            f"Supported: {supported}"
+        )
+    cfg = DINO_LAYER_FUSION_INDICES[feature_model]
+    return list(cfg["mid"]), list(cfg["tail"])
+
+
 def get_all_class_names(dataset_name: str):
     if dataset_name == "mvtec":
         return MVTEC_CLASS_NAMES
@@ -61,10 +110,14 @@ class MultiClassFeatureDataset(Dataset):
         patch_mask_size: int = 28,
         seed: int = 0,
         shuffle: bool = True,
+        class_names_override: list = None,
     ):
         super().__init__()
 
-        self.class_names = get_all_class_names(dataset_name)
+        if class_names_override is not None:
+            self.class_names = list(class_names_override)
+        else:
+            self.class_names = get_all_class_names(dataset_name)
         self.class_to_idx = {name: idx for idx, name in enumerate(self.class_names)}
         self.data_path = data_path
 
