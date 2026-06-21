@@ -140,9 +140,15 @@ def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
     y_score_px_flat = pr_px.ravel()
 
     auroc_sp = _safe_roc_auc(y_true_img, y_score_img)
-    auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
+    ap_sp = _safe_average_precision(y_true_img, y_score_img)
+    f1_sp = f1_score_max(y_true_img, y_score_img)
 
-    return auroc_sp, auroc_px
+    auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
+    ap_px = _safe_average_precision(y_true_px_flat, y_score_px_flat)
+    f1_px = f1_score_max(y_true_px_flat, y_score_px_flat)
+    aupro_px = compute_pro(gt_px, pr_px)
+
+    return auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px
 
 
 def evaluate_multiclass_epoch(
@@ -219,7 +225,11 @@ def evaluate_residual_multiclass_epoch(
                 reference_index_by_class,
             )
             patch_class_idx = None
-            if args.use_moe_discriminator and getattr(args, "moe_hard_class_gate", False):
+            moe_on = (
+                getattr(args, "use_moe_discriminator", False)
+                or getattr(args, "use_hard_gate", False)
+            )
+            if moe_on and getattr(args, "moe_hard_class_gate", False):
                 patch_class_idx = _build_patch_class_idx(class_idx_batch, residual_features)
             _, score = localnet(residual_features, patch_class_idx=patch_class_idx,
                                  class_idx=class_idx_batch)

@@ -88,6 +88,8 @@ def parse_args():
         help="热力图固定映射上限（不做单图拉伸）。",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no_plot", action="store_true",
+                        help="禁用所有可视化输出（heatmap/panel/overlay 绘图和保存），仅计算指标。")
     parser.add_argument("--save_overlay", action="store_true")
     parser.add_argument(
         "--overlay_alpha",
@@ -756,37 +758,38 @@ def main():
                     one_score = gaussian_filter(one_score, sigma=args.gaussian_sigma)
                     class_seg_maps.append(one_score)
                     class_mask_gt.append(mask_np[i])
-                    heatmap_bgr = colorize_heatmap(
-                        one_score,
-                        score_min=args.heatmap_score_min,
-                        score_max=args.heatmap_score_max,
-                    )
+                    if not args.no_plot:
+                        heatmap_bgr = colorize_heatmap(
+                            one_score,
+                            score_min=args.heatmap_score_min,
+                            score_max=args.heatmap_score_max,
+                        )
 
-                    rgb_u8 = denormalize_imagenet(image_np[i])
-                    if args.max_images_per_class <= 0 or class_saved < args.max_images_per_class:
-                        panel = make_triplet_panel(rgb_u8, mask_np[i], heatmap_bgr)
+                        rgb_u8 = denormalize_imagenet(image_np[i])
+                        if args.max_images_per_class <= 0 or class_saved < args.max_images_per_class:
+                            panel = make_triplet_panel(rgb_u8, mask_np[i], heatmap_bgr)
 
-                        src_path = test_set.x[sample_offset + i]
-                        stem = os.path.splitext(os.path.basename(src_path))[0]
-                        tag = "anomaly" if int(y_np[i]) == 1 else "good"
-                        save_name = f"{class_name}_{sample_offset + i:05d}_{tag}_{stem}.png"
-                        save_path = os.path.join(class_out_dir, save_name)
-                        cv2.imwrite(save_path, panel)
+                            src_path = test_set.x[sample_offset + i]
+                            stem = os.path.splitext(os.path.basename(src_path))[0]
+                            tag = "anomaly" if int(y_np[i]) == 1 else "good"
+                            save_name = f"{class_name}_{sample_offset + i:05d}_{tag}_{stem}.png"
+                            save_path = os.path.join(class_out_dir, save_name)
+                            cv2.imwrite(save_path, panel)
 
-                        if args.save_overlay:
-                            orig_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
-                            overlay = cv2.addWeighted(
-                                orig_bgr,
-                                1.0 - float(args.overlay_alpha),
-                                heatmap_bgr,
-                                float(args.overlay_alpha),
-                                0.0,
-                            )
-                            overlay_name = save_name.replace(".png", "_overlay.png")
-                            cv2.imwrite(os.path.join(class_out_dir, overlay_name), overlay)
+                            if args.save_overlay:
+                                orig_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+                                overlay = cv2.addWeighted(
+                                    orig_bgr,
+                                    1.0 - float(args.overlay_alpha),
+                                    heatmap_bgr,
+                                    float(args.overlay_alpha),
+                                    0.0,
+                                )
+                                overlay_name = save_name.replace(".png", "_overlay.png")
+                                cv2.imwrite(os.path.join(class_out_dir, overlay_name), overlay)
 
-                        class_saved += 1
-                        total_saved += 1
+                            class_saved += 1
+                            total_saved += 1
 
                 class_img_scores.append(
                     common_utils.aggregate_image_scores(
@@ -830,7 +833,10 @@ def main():
     print("Metrics saved:", metrics_csv_path)
     if len(metrics_df) > 0:
         print(metrics_df.to_string(index=False))
-    print("Done. Total saved panels:", total_saved)
+    if args.no_plot:
+        print("Done. (plotting disabled, no panels saved).")
+    else:
+        print("Done. Total saved panels:", total_saved)
     print("Output dir:", args.output_dir)
 
 

@@ -111,7 +111,7 @@ def parse_args():
     parser.add_argument("-n", "--noise_threshold", type=float, default=0.8)
     parser.add_argument("--use_mad_threshold", action="store_true",
                         help="Use MAD-based per-class dynamic threshold instead of a single global threshold.")
-    parser.add_argument("--mad_k", type=float, default=4,
+    parser.add_argument("--mad_k", type=float, default=3,
                         help="Default k multiplier for MAD threshold. "
                         "Larger k means stricter normal definition. "
                         "Can be overridden per-class via --mad_k_per_class.")
@@ -269,7 +269,19 @@ def parse_args():
         "--greedy_keep_images",
         type=int,
         default=2,
-        help="Greedy coreset keeps feature points equivalent to this many images per class.",
+        help="Deprecated — no longer used (ensemble PCA replaces GreedyCoreset). Kept for backward compat.",
+    )
+    parser.add_argument(
+        "--ensemble_size",
+        type=int,
+        default=20,
+        help="Number of PCA models in the ensemble for memory bank scoring.",
+    )
+    parser.add_argument(
+        "--memory_sampling_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of selected normal patches sampled per ensemble PCA iteration.",
     )
     parser.add_argument(
         "--resume",
@@ -316,6 +328,23 @@ def parse_args():
         help="0-based epoch index from which Phase 1/2 memory bank is frozen and only Phase 3 "
         "reruns each epoch. -1 disables. Snapshot is written after Phase 1/2 when "
         "epoch == freeze_start - 1. Must be >= 1 when enabled.",
+    )
+    parser.add_argument(
+        "--memory_score_beta_end",
+        type=float,
+        default=0.5,
+        help="Controls image-level score fusion decay: "
+        "alpha = max(1 - epoch/(total_epochs*beta_end), 0). "
+        "At early epochs the memory-bank score dominates; "
+        "beta_end=0.5 means alpha=0 (pure model) at 50 percent of training.",
+    )
+    parser.add_argument(
+        "--memory_score_path",
+        type=str,
+        default="/media/honeywell/D/bhy/my_research/FUNAD/memory_scores/memory_scores.pth",
+        help="Path to pre-computed memory_scores.pth (from memory_score_generation). "
+        "When provided, used as the stable first-stage score in image-level fusion. "
+        "Empty string disables fusion.",
     )
 
     return parser.parse_args()
@@ -517,6 +546,7 @@ def train_one_epoch(
             pseudo_label_scorer=None,
             memory_bank_snapshot=memory_bank_snapshot,
             threshold=threshold,
+            memory_score_path=args.memory_score_path if args.memory_score_path else None,
         )
         memory_bank_time += mb_time
         pseudo_label_time += pl_time
@@ -841,7 +871,7 @@ def train_one_epoch(
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
+    torch.autograd.set_detect_anomaly(False)
     args = parse_args()
     global _FAISS_USE_CPU_INDEX, _FAISS_GPU_TEMP_MEM_MB
     _FAISS_USE_CPU_INDEX = bool(args.faiss_cpu_index)
@@ -1034,7 +1064,10 @@ def main():
                 f"(checkpoint {ckpt_mb_freeze} vs args {arg_mb_freeze}); "
                 "not loading memory bank snapshot from checkpoint"
             )
-        elif ckpt_mb_snapshot and ckpt_mb_snapshot.get("reduced_features_by_class"):
+        elif ckpt_mb_snapshot and (
+            ckpt_mb_snapshot.get("ensemble_pca_by_class")
+            or ckpt_mb_snapshot.get("reduced_features_by_class")
+        ):
             ds_n = len(mini_loader.dataset)
             cs = ckpt_mb_snapshot.get("class_stack")
             if cs is not None and len(cs) == ds_n:
@@ -1122,8 +1155,7 @@ def main():
             for class_idx_eval, class_name in enumerate(class_names):
                 test_loader = build_test_loader(args, class_name)
                 (
-                    auroc,
-                    pixel_auroc,
+                    auroc, _, _, pixel_auroc, _, _, _,
                 ) = evaluate_epoch(
                     localnet,
                     feature_extractor,

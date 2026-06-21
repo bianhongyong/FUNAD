@@ -163,16 +163,28 @@ def _torch_load_train_checkpoint(path: str):
 
 
 def clone_memory_bank_snapshot_for_checkpoint(snapshot: dict) -> dict:
-    """Deep-copy numpy arrays for checkpoint I/O (CPU)."""
-    rf_in = snapshot.get("reduced_features_by_class") or {}
-    return {
-        "reduced_features_by_class": {
-            int(k): np.asarray(v, dtype=np.float32).copy() for k, v in rf_in.items()
-        },
+    """Deep-copy memory bank snapshot for checkpoint I/O (CPU).
+
+    Supports both legacy ``reduced_features_by_class`` (GreedyCoreset + FAISS)
+    and current ``ensemble_pca_by_class`` (list of (mean, components) tuples).
+    """
+    result = {
         "class_stack": np.asarray(snapshot["class_stack"], dtype=np.int64).copy(),
         "gt_patch_masks": np.asarray(snapshot["gt_patch_masks"], dtype=np.uint8).copy(),
         "global_dim": int(snapshot["global_dim"]),
     }
+    ep = snapshot.get("ensemble_pca_by_class")
+    if ep is not None:
+        result["ensemble_pca_by_class"] = {
+            int(k): [(mean.copy(), comp.copy()) for (mean, comp) in models]
+            for k, models in ep.items()
+        }
+    rf = snapshot.get("reduced_features_by_class")
+    if rf is not None:
+        result["reduced_features_by_class"] = {
+            int(k): np.asarray(v, dtype=np.float32).copy() for k, v in rf.items()
+        }
+    return result
 
 
 def save_train_checkpoint(
@@ -204,7 +216,10 @@ def save_train_checkpoint(
         "memory_bank_freeze_start_epoch": int(memory_bank_freeze_start_epoch),
         "memory_bank_snapshot": (
             clone_memory_bank_snapshot_for_checkpoint(memory_bank_snapshot)
-            if memory_bank_snapshot.get("reduced_features_by_class")
+            if (
+                memory_bank_snapshot.get("ensemble_pca_by_class")
+                or memory_bank_snapshot.get("reduced_features_by_class")
+            )
             else None
         ),
     }

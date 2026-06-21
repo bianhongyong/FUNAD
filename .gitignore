@@ -3,3 +3,5 @@ __pycache__/
 *.py[cod]
 /docs/
 /log/
+/output_10
+/memory_scores

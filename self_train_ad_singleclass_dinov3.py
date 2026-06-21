@@ -165,7 +165,12 @@ def parse_args():
     )
     parser.add_argument("--pseudo_label_distance_norm_eps", type=float, default=1e-6)
     parser.add_argument("--pseudo_label_distance_norm_percentile", type=float, default=99.0)
-    parser.add_argument("--greedy_keep_images", type=int, default=2)
+    parser.add_argument("--greedy_keep_images", type=int, default=2,
+                        help="Deprecated — no longer used (ensemble PCA replaces GreedyCoreset).")
+    parser.add_argument("--ensemble_size", type=int, default=100,
+                        help="Number of PCA models in the ensemble for memory bank scoring.")
+    parser.add_argument("--memory_sampling_ratio", type=float, default=0.1,
+                        help="Fraction of selected normal patches sampled per ensemble PCA iteration.")
     parser.add_argument(
         "--residual",
         type=str2bool,
@@ -786,7 +791,7 @@ def train_single_class(args, class_name, feature_extractor):
 
         if (epoch + 1) % args.eval_interval == 0:
             test_loader = build_test_loader(args, class_name)
-            auroc, pixel_auroc = evaluate_epoch(
+            auroc, _, _, pixel_auroc, _, _, _ = evaluate_epoch(
                 localnet_model,
                 feature_extractor,
                 test_loader,

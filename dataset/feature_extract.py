@@ -218,6 +218,7 @@ def main():
 # ---------------------------------------------------------------------------
 
 DINOV3_FEATURE_MODEL_REGISTRY = {
+    # ---- DINOv3 (patch 16) ----
     "dinov3_vits16": {"hub_entry": "dinov3_vits16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
     "dinov3_vits16plus": {"hub_entry": "dinov3_vits16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
     "dinov3_vitb16": {"hub_entry": "dinov3_vitb16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
@@ -225,6 +226,15 @@ DINOV3_FEATURE_MODEL_REGISTRY = {
     "dinov3_vitl16plus": {"hub_entry": "dinov3_vitl16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
     "dinov3_vith16plus": {"hub_entry": "dinov3_vith16plus", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
     "dinov3_vit7b16": {"hub_entry": "dinov3_vit7b16", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov3_main"},
+    # ---- DINOv2 (patch 14, 来自 facebookresearch/dinov2) ----
+    "dinov2_vits14":     {"hub_entry": "dinov2_vits14",     "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitb14":     {"hub_entry": "dinov2_vitb14",     "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitl14":     {"hub_entry": "dinov2_vitl14",     "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitg14":     {"hub_entry": "dinov2_vitg14",     "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vits14_reg": {"hub_entry": "dinov2_vits14_reg", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitb14_reg": {"hub_entry": "dinov2_vitb14_reg", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitl14_reg": {"hub_entry": "dinov2_vitl14_reg", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
+    "dinov2_vitg14_reg": {"hub_entry": "dinov2_vitg14_reg", "hub_repo_dir": "/home/honeywell/.cache/torch/hub/facebookresearch_dinov2_main"},
 }
 
 _FEATURE_MODEL_CHOICES = tuple(DINOV3_FEATURE_MODEL_REGISTRY.keys())
@@ -232,6 +242,11 @@ _FEATURE_MODEL_CHOICES = tuple(DINOV3_FEATURE_MODEL_REGISTRY.keys())
 
 def _is_valid_local_torch_hub_dir(path: str) -> bool:
     return bool(path) and os.path.isdir(path) and os.path.isfile(os.path.join(path, "hubconf.py"))
+
+
+def _is_dinov2_model(feature_model: str) -> bool:
+    """Check if the model key belongs to DINOv2 family."""
+    return feature_model.startswith("dinov2_")
 
 
 def resolve_dinov3_local_hub_dir(feature_model: str):
@@ -243,25 +258,35 @@ def resolve_dinov3_local_hub_dir(feature_model: str):
         p = os.path.expanduser(str(explicit))
         if _is_valid_local_torch_hub_dir(p):
             return p
-    env_dir = os.environ.get("DINOV3_HUB_DIR")
+    env_var = "DINOV2_HUB_DIR" if _is_dinov2_model(feature_model) else "DINOV3_HUB_DIR"
+    env_dir = os.environ.get(env_var)
     if env_dir:
         p = os.path.expanduser(env_dir)
         if _is_valid_local_torch_hub_dir(p):
             return p
-    default_dir = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov3_main")
+    repo_dir_name = "facebookresearch_dinov2_main" if _is_dinov2_model(feature_model) else "facebookresearch_dinov3_main"
+    default_dir = os.path.join(torch.hub.get_dir(), repo_dir_name)
     if _is_valid_local_torch_hub_dir(default_dir):
         return default_dir
-    legacy = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov3_main")
+    legacy = os.path.expanduser(f"~/.cache/torch/hub/{repo_dir_name}")
     if _is_valid_local_torch_hub_dir(legacy):
         return legacy
     return None
 
 
 def build_dinov3_feature_extractor(feature_model: str, device: torch.device):
-    """Build a DINOv3 feature extractor from torch.hub."""
+    """Build a DINOv2/DINOv3 feature extractor from torch.hub.
+
+    Supports both ``dinov3_*`` and ``dinov2_*`` model keys registered
+    in *DINOV3_FEATURE_MODEL_REGISTRY*.
+    """
     entry = DINOV3_FEATURE_MODEL_REGISTRY[feature_model]
     hub_entry = entry["hub_entry"]
     repo_dir = resolve_dinov3_local_hub_dir(feature_model)
+
+    is_dinov2 = _is_dinov2_model(feature_model)
+    model_family = "DINOv2" if is_dinov2 else "DINOv3"
+    gh_repo = "facebookresearch/dinov2" if is_dinov2 else "facebookresearch/dinov3"
 
     # DINO imports `trunc_normal_` via `from utils import ...`.
     # This project also has `utils.py`, so temporarily unshadow it.
@@ -276,7 +301,7 @@ def build_dinov3_feature_extractor(feature_model: str, device: torch.device):
         del sys.modules["utils"]
     try:
         if repo_dir is not None:
-            print(f"[DINOv3] load {hub_entry} from local hub: {repo_dir}")
+            print(f"[{model_family}] load {hub_entry} from local hub: {repo_dir}")
             feature_extractor = torch.hub.load(
                 repo_dir,
                 hub_entry,
@@ -284,9 +309,9 @@ def build_dinov3_feature_extractor(feature_model: str, device: torch.device):
                 pretrained=True,
             )
         else:
-            print(f"[DINOv3] load {hub_entry} from GitHub: facebookresearch/dinov3")
+            print(f"[{model_family}] load {hub_entry} from GitHub: {gh_repo}")
             feature_extractor = torch.hub.load(
-                "facebookresearch/dinov3",
+                gh_repo,
                 hub_entry,
                 pretrained=True,
             )

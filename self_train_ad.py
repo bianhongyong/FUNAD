@@ -834,8 +834,7 @@ def main():
 
             if (epoch) % args.eval_interval == 0:
                 (
-                    auroc,
-                    pixel_auroc,
+                    auroc, _, _, pixel_auroc, _, _, _,
                 ) = evaluate_epoch(localnet, test_loader)
                 num_epoch = epoch + 1
 

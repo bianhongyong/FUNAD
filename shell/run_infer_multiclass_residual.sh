@@ -14,9 +14,9 @@ source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
 # ===== User-configurable（必填：CHECKPOINT_PATH、OUTPUT_DIR）=====
-DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10"
+DATA_PATH="/media/honeywell/D/bhy/dataset/MVTec_no_overlap/MVTec_noisy10"
 DATASET="mvtec" # mvtec | visa
-CHECKPOINT_PATH="/media/honeywell/E/bhy/FUNAD/save_results/ablation_study/residual+cross_attention+multi_memorybank+moe_hard_gate/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_localnet.pt"
+CHECKPOINT_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/adaptive_threshold_best/mvtec/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_localnet.pt"
 OUTPUT_DIR="./output_10"       # 例如: /path/to/infer_outputs/run1
 
 BATCH_SIZE=16
@@ -62,4 +62,5 @@ python src/inference/infer_multiclass_residual.py \
   --crop_size "$CROP_SIZE" \
   --max_images_per_class "$MAX_IMAGES_PER_CLASS" \
   "${CLASS_ARG[@]}" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" \
+  --no_plot

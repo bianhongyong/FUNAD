@@ -47,6 +47,29 @@ class PercentileNormalizer(PseudoLabelNormalizer):
         return ((clipped - vmin) / (vmax - vmin)).astype(np.float32)
 
 
+class TopPercentNormalizer(PseudoLabelNormalizer):
+    """取最高的 top_ratio 比例的分数做 min-max 归一化。
+
+    1. 从 values 中取出最高的 top_ratio 个分数作为子集
+    2. 用这个子集的最小值和最大值对所有 values 做 min-max
+    3. 低于子集最小值的 clamp 到 0
+    """
+
+    def __init__(self, top_ratio: float = 0.01, eps: float = 1e-6):
+        super().__init__(eps=eps)
+        self.top_ratio = top_ratio
+
+    def normalize(self, values: np.ndarray) -> np.ndarray:
+        n_top = max(1, int(values.size * self.top_ratio))
+        top_subset = np.sort(values)[-n_top:]
+        vmin = float(top_subset.min())
+        vmax = float(top_subset.max())
+        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
+            return np.zeros_like(values, dtype=np.float32)
+        normalized = (values - vmin) / (vmax - vmin)
+        return np.clip(normalized, 0.0, 1.0).astype(np.float32)
+
+
 class PseudoLabelNormalizerFactory:
     """根据配置创建对应的归一化器。"""
 
@@ -62,5 +85,10 @@ class PseudoLabelNormalizerFactory:
                 getattr(args, "pseudo_label_distance_norm_percentile", 99.0)
             )
             return PercentileNormalizer(percentile_range=percentile_range, eps=eps)
+        elif mode == "top_percent":
+            top_ratio = float(
+                getattr(args, "pseudo_label_distance_norm_top_ratio", 0.01)
+            )
+            return TopPercentNormalizer(top_ratio=top_ratio, eps=eps)
         else:
             raise ValueError(f"Unsupported normalization mode: {mode}")

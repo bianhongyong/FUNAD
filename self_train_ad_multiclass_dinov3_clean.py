@@ -166,6 +166,27 @@ def parse_args():
         action="store_true",
         help="Use balanced BCE loss (separate pos/neg normalization).",
     )
+    parser.add_argument(
+        "--ensemble_size",
+        type=int,
+        default=100,
+        help="Number of PCA models in the ensemble for memory bank scoring. "
+        "(Not used in clean training, kept for parameter consistency.)",
+    )
+    parser.add_argument(
+        "--memory_sampling_ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of selected normal patches sampled per ensemble PCA iteration. "
+        "(Not used in clean training, kept for parameter consistency.)",
+    )
+    parser.add_argument(
+        "--memory_score_beta_end",
+        type=float,
+        default=0.5,
+        help="Controls image-level score fusion decay. "
+        "(Not used in clean training, kept for parameter consistency.)",
+    )
 
     return parser.parse_args()
 
@@ -616,8 +637,7 @@ def main():
             for class_idx_eval, class_name in enumerate(class_names):
                 test_loader = build_test_loader(args, class_name)
                 (
-                    auroc,
-                    pixel_auroc,
+                    auroc, _, _, pixel_auroc, _, _, _,
                 ) = evaluate_epoch(
                     localnet,
                     feature_extractor,

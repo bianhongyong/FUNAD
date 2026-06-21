@@ -16,10 +16,10 @@ export MPLBACKEND=Agg
 
 # ===== User-configurable =====
 NOISE="${NOISE:-10%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
-DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/VisA_overlap/VisA_noisy10}"
+DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10}"
 SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/"  
-DATASET="visa"         # mvtec | visa
-EPOCH=30
+DATASET="mvtec"         # mvtec | visa
+EPOCH=20
 BATCH_SIZE=16
 LR=2e-5
 SEED=0
@@ -31,10 +31,11 @@ FEATURE_MODEL="dinov3_vitl16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vi
 # EXTRA_ARGS+=(--faiss_cpu_index)
 # - Uncomment to enable class adaptive threshold:
 # EXTRA_ARGS+=(--use_class_adaptive_threshold --adaptive_threshold_quantile 0.7)
-# - Uncomment to enable per-class PCA pseudo-label scorer:
-# EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_ev 0.99)
-# - Or set fixed PCA dimension instead of explained variance:
-# EXTRA_ARGS+=(--pseudo_label_scoring pca --pseudo_label_pca_dim 128)
+# - Ensemble PCA memory bank (replaces GreedyCoreset + pseudo_label_scoring):
+#   --ensemble_size 100  (default: 100 PCA models)
+#   --memory_sampling_ratio 0.1  (default: 0.1 fraction per iteration)
+# - Deprecated (ignored, kept for backward compat):
+#   --pseudo_label_scoring, --greedy_keep_images, --k_number
 
 
 # EXTRA_ARGS=(--save_log --kl --weight 2.5 --threshold 0.4 --noise_threshold 0.8
@@ -50,12 +51,12 @@ FEATURE_MODEL="dinov3_vitl16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vi
 # Example: EXTRA_ARGS+=(--normal_sample_selection quantile --normal_sample_quantile 0.3)
 
 EXTRA_ARGS=(--save_log --kl --weight 2.5 --use_mad_threshold --noise_threshold 0.8
-      --eval_interval 1 --greedy_keep_images 10 --use_moe_discriminator --moe_hard_class_gate --moe_use_cls_token
+      --eval_interval 3 --use_moe_discriminator --moe_hard_class_gate --moe_use_cls_token
       --moe_expert_vis_enable
-      --normal_sample_selection quantile --normal_sample_quantile 0.2
+      --normal_sample_selection quantile --normal_sample_quantile 0.1
       --memory_bank_freeze_start_epoch -1
       --pseudo_label_scoring pca
-      --resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/visa/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
+      #--resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/visa/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
 )
 python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \
