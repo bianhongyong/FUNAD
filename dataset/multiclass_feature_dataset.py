@@ -45,29 +45,118 @@ VISA_CLASS_NAMES = [
 ]
 
 
-# Per-class DINOv3 layer indices (1-based). -1 means last layer.
-# Shared by training (self_train_ad_multiclass_dinov3.py) and inference
-# (infer_multiclass_residual.py). Modify here to keep both in sync.
-DINO_CLASS_LAYER_INDICES = {
-    # MVTec
-    "bottle": [11,12,13,14,15,16], "cable": [11,12,13,14,15,16], "capsule": [11,12,13,14,15,16], "carpet": [11,12,13,14,15,16],
-    "grid": [11,12,13,14,15,16], "hazelnut": [11,12,13,14,15,16], "leather": [11,12,13,14,15,16], "metal_nut": [11,12,13,14,15,16],
-    "pill": [11,12,13,14,15,16], "screw": [11,12,13,22,23,24], "tile": [11,12,13,14,15,16], "toothbrush": [11,12,13,14,15,16],
-    "transistor": [11,12,13,14,15,16], "wood": [11,12,13,14,15,16], "zipper": [11,12,13,14,15,16],
-    # VISA
-    "candle": [11,12,13,22,23,24],
-    "capsules": [11,12,13,22,23,24],
-    "cashew": [11,12,13,22,23,24],
-    "chewinggum": [11,12,13,22,23,24],
-    "fryum": [11,12,13,22,23,24],
-    "macaroni1": [11,12,13,22,23,24],
-    "macaroni2": [11,12,13,22,23,24],
-    "pipe_fryum": [11,12,13,22,23,24],
-    "pcb1": [11,12,13,22,23,24],
-    "pcb2": [11,12,13,22,23,24],
-    "pcb3": [11,12,13,22,23,24],
-    "pcb4": [11,12,13,22,23,24]
+# DINOv3 backbone -> Transformer block 数（不含 patch embed）。
+# 层下标表的范围以此为准；新增 backbone 时这里要同步补上。
+DINO_BACKBONE_DEPTHS = {
+    "dinov3_vits16": 12,
+    "dinov3_vits16plus": 12,
+    "dinov3_vitb16": 12,
+    "dinov3_vitl16": 24,
+    "dinov3_vitl16plus": 24,
+    "dinov3_vith16plus": 32,
+    "dinov3_vit7b16": 40,
 }
+
+_ALL_CLASS_NAMES = MVTEC_CLASS_NAMES + VISA_CLASS_NAMES
+
+# 取「层带前段 + 末尾三层」这组的类：screw 与全部 VisA 类，其余类统一用 band。
+_TAIL_MIX_CLASSES = ("screw",) + tuple(VISA_CLASS_NAMES)
+
+
+def _class_layer_table(band, band_tail):
+    """把两组层下标展开成 {类名: [层下标]}，每个类都显式列出以便单独微调。
+
+    band      - 主体类使用的层带
+    band_tail - _TAIL_MIX_CLASSES 使用的「层带前段 + 末尾三层」
+    """
+    table = {name: list(band) for name in _ALL_CLASS_NAMES}
+    for name in _TAIL_MIX_CLASSES:
+        table[name] = list(band_tail)
+    return table
+
+
+# 按 backbone 分档的 {类名: 层下标}（1-based，-1 = 最后一层）。
+# 不同尺寸的 block 数不同，同一组下标不能跨尺寸复用：
+#   vits16 / vits16plus / vitb16 : 12 blocks
+#   vitl16 / vitl16plus          : 24 blocks
+#   vith16plus                   : 32 blocks
+#   vit7b16                      : 40 blocks
+# 注意：只有 vitl16 这套是既有实验调出来的；其余按相对深度位置等比推导，
+# 未做消融验证，换 backbone 时请按需自行微调。
+DINO_CLASS_LAYER_INDICES = {
+    # ── 24 blocks：主力配置，沿用既有实验数值，勿随意改动 ──
+    "dinov3_vitl16": _class_layer_table(
+        band=[11, 12, 13, 14, 15, 16],
+        band_tail=[11, 12, 13, 22, 23, 24],
+    ),
+    "dinov3_vitl16plus": _class_layer_table(
+        band=[11, 12, 13, 14, 15, 16],
+        band_tail=[11, 12, 13, 22, 23, 24],
+    ),
+    # ── 12 blocks（旧 vitb16 实验用的是末尾三层 [10, 11, 12]，如需复现请改这里）──
+    "dinov3_vits16": _class_layer_table(
+        band=[6, 7, 8],
+        band_tail=[6, 7, 8, 10, 11, 12],
+    ),
+    "dinov3_vits16plus": _class_layer_table(
+        band=[6, 7, 8],
+        band_tail=[6, 7, 8, 10, 11, 12],
+    ),
+    "dinov3_vitb16": _class_layer_table(
+        band=[6, 7, 8],
+        band_tail=[6, 7, 8, 10, 11, 12],
+    ),
+    # ── 32 blocks ──
+    "dinov3_vith16plus": _class_layer_table(
+        band=[15, 16, 17, 18, 19, 20, 21],
+        band_tail=[15, 16, 17, 30, 31, 32],
+    ),
+    # ── 40 blocks ──
+    "dinov3_vit7b16": _class_layer_table(
+        band=[18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+        band_tail=[18, 19, 20, 38, 39, 40],
+    ),
+}
+
+
+def get_class_layer_indices(feature_model: str):
+    """取某个 DINOv3 backbone 的 {类名: [1-based 层下标]} 表。
+
+    训练（self_train_ad_*_dinov3.py）与推理（infer_*_residual.py）共用同一份表，
+    换 backbone 只需改 DINO_CLASS_LAYER_INDICES 一处即可保持两边同步。
+    """
+    if feature_model not in DINO_CLASS_LAYER_INDICES:
+        supported = ", ".join(sorted(DINO_CLASS_LAYER_INDICES))
+        raise ValueError(
+            f"feature_model={feature_model!r} 没有对应的 DINO_CLASS_LAYER_INDICES 条目。"
+            f"已支持: {supported}"
+        )
+    return DINO_CLASS_LAYER_INDICES[feature_model]
+
+
+def _validate_layer_tables():
+    """导入时自检：每个下标都要落在对应 backbone 的 block 数内（-1 除外）。
+
+    表是硬编码的，写错就是 bug——与其等加载完 backbone 再在训练里炸，
+    不如在 import 阶段直接报出来。
+    """
+    for model, table in DINO_CLASS_LAYER_INDICES.items():
+        depth = DINO_BACKBONE_DEPTHS.get(model)
+        if depth is None:
+            raise ValueError(f"{model} 在 DINO_BACKBONE_DEPTHS 里没有登记 block 数。")
+        for class_name, layers in table.items():
+            for layer in layers:
+                if layer == -1:
+                    continue
+                if not 1 <= layer <= depth:
+                    raise ValueError(
+                        f"{model} 的 {class_name} 层下标 {layer} 越界："
+                        f"该 backbone 只有 {depth} 个 block（1-based: 1..{depth}）。"
+                    )
+
+
+_validate_layer_tables()
+
 
 # Mid / tail layer groups for adaptive_rpn_fusionv2_CA (1-based indices, -1 = last block).
 # Used when --use_dino_layer_fusion is enabled instead of DINO_CLASS_LAYER_INDICES.

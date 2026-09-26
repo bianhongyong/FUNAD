@@ -29,7 +29,7 @@ from dataset.feature_extract import (
     infer_dinov3_feature_dim,
     resolve_dino_block_indices,
 )
-from dataset.multiclass_feature_dataset import DINO_CLASS_LAYER_INDICES, get_all_class_names
+from dataset.multiclass_feature_dataset import get_class_layer_indices, get_all_class_names
 from src.model import model
 import utils.train_utils as common_utils
 from utils.evaluate import _cv2_resize_dsize_from_mask
@@ -280,7 +280,8 @@ def infer_single_class(args, class_name, feature_extractor, device, use_cuda):
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # ── 5. 确定层索引 & 特征维度 & patch 数 ────────────────
-    class_layer_indices = DINO_CLASS_LAYER_INDICES.get(class_name, [-1])
+    # 层表按 backbone 分档，必须用 args.feature_model 去取对应尺寸的那张。
+    class_layer_indices = get_class_layer_indices(args.feature_model).get(class_name, [-1])
     all_layer_values = sorted(set(class_layer_indices))
 
     test_set_for_dim = dataset_extract.MyDataset(

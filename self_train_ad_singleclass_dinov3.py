@@ -29,7 +29,7 @@ from dataset.feature_extract import (
 from dataset.multiclass_feature_dataset import (
     MultiClassFeatureDataset,
     get_all_class_names,
-    DINO_CLASS_LAYER_INDICES,
+    get_class_layer_indices,
 )
 from src.model import model
 from src.train.epoch_precompute import precompute_pseudo_labels_multiclass_residual
@@ -570,7 +570,8 @@ def train_single_class(args, class_name, feature_extractor):
 
     fix_seed(args.seed)
 
-    class_layer_indices = DINO_CLASS_LAYER_INDICES.get(class_name, [-1])
+    # 层表按 backbone 分档，必须用 args.feature_model 去取对应尺寸的那张。
+    class_layer_indices = get_class_layer_indices(args.feature_model).get(class_name, [-1])
     args.class_layer_indices = {0: class_layer_indices}
     _all_layer_values = sorted(set(class_layer_indices))
 

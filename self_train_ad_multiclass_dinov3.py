@@ -29,7 +29,7 @@ from dataset.feature_extract import (
 from dataset.multiclass_feature_dataset import (
     MultiClassFeatureDataset,
     get_all_class_names,
-    DINO_CLASS_LAYER_INDICES,
+    get_class_layer_indices,
 )
 from src.model import model
 from src.train.epoch_precompute import precompute_pseudo_labels_multiclass_residual
@@ -65,7 +65,8 @@ _FAISS_USE_CPU_INDEX = False
 _FAISS_GPU_TEMP_MEM_MB = 256
 
 # Per-class DINOv3 layer indices, shared via multiclass_feature_dataset.
-# Defined in dataset/multiclass_feature_dataset.py: DINO_CLASS_LAYER_INDICES.
+# Per-backbone tables live in dataset/multiclass_feature_dataset.py;
+# look them up with get_class_layer_indices(feature_model).
 
 
 def _adapt_extract_fn(images, feature_extractor, args, return_cls_token=False, class_indices=None):
@@ -830,8 +831,10 @@ def main():
     num_classes_runtime = len(class_names)
 
     # Build per-class layer indices dict (class_idx -> list[int])
+    # 层表按 backbone 分档，必须用 args.feature_model 去取对应尺寸的那张。
+    class_layer_table = get_class_layer_indices(args.feature_model)
     args.class_layer_indices = {
-        i: DINO_CLASS_LAYER_INDICES.get(name, [-1])
+        i: class_layer_table.get(name, [-1])
         for i, name in enumerate(class_names)
     }
     _all_layer_values = sorted(set(
@@ -856,7 +859,7 @@ def main():
     _selected_blocks = resolve_dino_block_indices(feature_extractor, _all_layer_values)
     _display = [b + 1 for b in _selected_blocks]
     print(f"[DINOv3] aggregating layers {_display} (0-based blocks {_selected_blocks})")
-    for cls_name, cls_layers in DINO_CLASS_LAYER_INDICES.items():
+    for cls_name, cls_layers in class_layer_table.items():
         if cls_name in class_names:
             _cls_blocks = resolve_dino_block_indices(feature_extractor, cls_layers)
             if set(_cls_blocks) != set(_selected_blocks):

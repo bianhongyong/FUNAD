@@ -33,7 +33,7 @@ from dataset.feature_extract import (
 from src.model import model
 import utils.train_utils as common_utils
 from utils.evaluate import _cv2_resize_dsize_from_mask
-from dataset.multiclass_feature_dataset import get_all_class_names, DINO_CLASS_LAYER_INDICES
+from dataset.multiclass_feature_dataset import get_all_class_names, get_class_layer_indices
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -41,7 +41,8 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 # Per-class DINOv3 layer indices, shared via multiclass_feature_dataset.
-# Defined in dataset/multiclass_feature_dataset.py: DINO_CLASS_LAYER_INDICES.
+# Per-backbone tables live in dataset/multiclass_feature_dataset.py;
+# look them up with get_class_layer_indices(feature_model).
 
 
 def str2bool(value):
@@ -610,10 +611,11 @@ def main():
 
     feature_extractor = build_feature_extractor(args, device)
 
-    # Build per-class layer indices (matches training DINO_CLASS_LAYER_INDICES)
+    # Build per-class layer indices (matches training's per-backbone table).
     # Must happen before find_feature_dim_and_patches which needs class_layer_indices.
+    class_layer_table = get_class_layer_indices(args.feature_model)
     args.class_layer_indices = {
-        i: DINO_CLASS_LAYER_INDICES.get(name, [-1])
+        i: class_layer_table.get(name, [-1])
         for i, name in enumerate(all_class_names)
     }
 

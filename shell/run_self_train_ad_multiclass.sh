@@ -16,15 +16,15 @@ export MPLBACKEND=Agg
 
 # ===== User-configurable =====
 NOISE="${NOISE:-10%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
-DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/VisA_overlap/VisA_noisy10}"
+DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10}"
 SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/codex"
-DATASET="visa"         # mvtec | visa
-EPOCH=30
+DATASET="mvtec"         # mvtec | visa
+EPOCH=20
 BATCH_SIZE=16
 LR=2e-5
 SEED=0
 NUM_WORKERS=4
-FEATURE_MODEL="dinov3_vitl16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vitl16 | dinov3_vitl16plus | dinov3_vith16plus | dinov3_vit7b16
+FEATURE_MODEL="dinov3_vitb16"    # dinov3_vits16plus | dinov3_vitb16 | dinov3_vitl16 | dinov3_vitl16plus | dinov3_vith16plus | dinov3_vit7b16
 
 # Optional switches:
 # - Uncomment to force CPU FAISS index:
