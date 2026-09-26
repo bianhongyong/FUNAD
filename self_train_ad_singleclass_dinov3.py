@@ -38,7 +38,6 @@ from utils.logging import enable_print_logging
 from utils.loss import (
     build_adaptive_threshold_map,
     compute_balanced_bce_loss,
-    compute_origin_regularizer,
     compute_oto_loss_multiclass,
 )
 from utils.print import (
@@ -134,9 +133,6 @@ def parse_args():
     parser.add_argument("--strict_clean_reference", action="store_true")
     parser.add_argument("--use_class_adaptive_threshold", action="store_true")
     parser.add_argument("--adaptive_threshold_quantile", type=float, default=0.7)
-    parser.add_argument("--use_origin_regularizer", action="store_true")
-    parser.add_argument("--origin_normal_weight", type=float, default=0.001)
-    parser.add_argument("--origin_anomaly_weight", type=float, default=0.001)
     parser.add_argument(
         "--img_score_topk_ratio",
         type=float,
@@ -333,7 +329,6 @@ def train_one_epoch(
     local_loss = 0
     oto_loss = 0
     bce_loss = 0
-    origin_loss = 0
     memory_bank_time = 0.0
     pseudo_label_time = 0.0
     kl_loss_time = 0.0
@@ -477,8 +472,6 @@ def train_one_epoch(
         local_label = local_label.to(device, non_blocking=True)
 
         batch_feature, local_pred = localnet(x)
-        origin_input_feature = x
-        origin_output_feature = batch_feature
 
         pred_for_loss = local_pred
         if use_pseudo_label and args.gaussian:
@@ -522,33 +515,7 @@ def train_one_epoch(
         else:
             _l_loss = torch.tensor(0.0, device=local_pred.device)
 
-        if args.use_origin_regularizer:
-            normal_mask_np = distance < threshold_map
-            anomaly_mask_np = distance > args.noise_threshold
-            normal_mask_t = torch.as_tensor(
-                normal_mask_np.reshape(-1),
-                dtype=torch.bool,
-                device=origin_output_feature.device,
-            )
-            anomaly_mask_t = torch.as_tensor(
-                anomaly_mask_np.reshape(-1),
-                dtype=torch.bool,
-                device=origin_output_feature.device,
-            )
-            origin_input_main = origin_input_feature[:batch]
-            origin_output_main = origin_output_feature[:batch]
-            _origin_loss = compute_origin_regularizer(
-                args=args,
-                input_feature=origin_input_main,
-                output_feature=origin_output_main,
-                normal_mask=normal_mask_t,
-                anomaly_mask=anomaly_mask_t,
-            )
-        else:
-            _origin_loss = torch.tensor(0.0, device=local_pred.device)
-
         _local_loss = _loss if args.alternative else (_loss + args.weight * _l_loss)
-        _local_loss = _local_loss + _origin_loss
 
         _local_loss.backward()
         localnet_optimizer.step()
@@ -560,7 +527,6 @@ def train_one_epoch(
         local_loss += _local_loss / total_batch
         bce_loss += _loss / total_batch
         oto_loss += _l_loss / total_batch
-        origin_loss += _origin_loss / total_batch
         iteration += 1
 
     local_loss_value = (
@@ -568,9 +534,6 @@ def train_one_epoch(
     )
     bce_loss_value = bce_loss.item() if torch.is_tensor(bce_loss) else float(bce_loss)
     oto_loss_value = oto_loss.item() if torch.is_tensor(oto_loss) else float(oto_loss)
-    origin_loss_value = (
-        origin_loss.item() if torch.is_tensor(origin_loss) else float(origin_loss)
-    )
     pseudo_normal_acc = (
         float(pseudo_normal_correct) / float(pseudo_normal_total)
         if pseudo_normal_total > 0
@@ -586,7 +549,6 @@ def train_one_epoch(
         local_loss_value,
         bce_loss_value,
         oto_loss_value,
-        origin_loss_value,
         iteration,
         memory_bank_time,
         pseudo_label_time,
@@ -737,7 +699,6 @@ def train_single_class(args, class_name, feature_extractor):
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
-            origin_loss_value,
             iteration,
             memory_bank_time,
             pseudo_label_time,
@@ -772,7 +733,6 @@ def train_single_class(args, class_name, feature_extractor):
             local_loss_value,
             bce_loss_value,
             oto_loss_value,
-            origin_loss=origin_loss_value,
         )
         print_epoch_times(epoch, memory_bank_time, pseudo_label_time, kl_loss_time)
         print(

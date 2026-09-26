@@ -3,28 +3,16 @@ import os
 import numpy as np
 
 
-def print_epoch_losses(epoch, loss, bce_loss, oto_loss, origin_loss=None, gate_aux_loss=None):
-    if origin_loss is None and gate_aux_loss is None:
+def print_epoch_losses(epoch, loss, bce_loss, oto_loss, gate_aux_loss=None):
+    if gate_aux_loss is None:
         print(
             "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f"
             % (epoch + 1, loss, bce_loss, oto_loss)
         )
         return
-    if origin_loss is None:
-        print(
-            "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, gate aux loss: %.6f"
-            % (epoch + 1, loss, bce_loss, oto_loss, gate_aux_loss)
-        )
-        return
-    if gate_aux_loss is None:
-        print(
-            "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, origin loss: %.6f"
-            % (epoch + 1, loss, bce_loss, oto_loss, origin_loss)
-        )
-        return
     print(
-        "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, origin loss: %.6f, gate aux loss: %.6f"
-        % (epoch + 1, loss, bce_loss, oto_loss, origin_loss, gate_aux_loss)
+        "epoch %d | loss: %.6f, bce loss: %.6f, one-to-one loss: %.6f, gate aux loss: %.6f"
+        % (epoch + 1, loss, bce_loss, oto_loss, gate_aux_loss)
     )
 
 

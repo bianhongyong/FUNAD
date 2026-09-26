@@ -17,7 +17,7 @@ export MPLBACKEND=Agg
 # ===== User-configurable =====
 NOISE="${NOISE:-10%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
 DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/VisA_overlap/VisA_noisy10}"
-SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/"  
+SAVE_PATH="/media/honeywell/E/bhy/FUNAD/save_results/codex"
 DATASET="visa"         # mvtec | visa
 EPOCH=30
 BATCH_SIZE=16
@@ -55,7 +55,7 @@ EXTRA_ARGS=(--save_log --kl --weight 2.5 --use_mad_threshold --noise_threshold 0
       --normal_sample_selection quantile --normal_sample_quantile 0.2
       --memory_bank_freeze_start_epoch -1
       --pseudo_label_scoring pca
-      --resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/visa/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
+      #--resume /media/honeywell/E/bhy/FUNAD/save_results/muti_class_residual_correst_dinov3vitl16_moe_discriminator_hard_gate/0617/visa/10%/gaussian_True_noise_10%_balancing_True_oto_True_weight_2.5_multiclass_residual_train_checkpoint.pt
 )
 python self_train_ad_multiclass_dinov3.py \
   --data_path "$DATA_PATH" \

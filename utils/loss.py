@@ -90,33 +90,6 @@ def compute_oto_loss_single(
     )
 
 
-def compute_origin_regularizer(
-    args,
-    input_feature,
-    output_feature,
-    normal_mask,
-    anomaly_mask,
-):
-    input_2d = input_feature.reshape(-1, input_feature.shape[-1])
-    output_2d = output_feature.reshape(-1, output_feature.shape[-1])
-
-    normal_loss = torch.tensor(0.0, device=output_feature.device)
-    if normal_mask.any().item():
-        normal_feat = output_2d[normal_mask]
-        normal_loss = (normal_feat.pow(2).sum(dim=-1)).mean()
-
-    anomaly_loss = torch.tensor(0.0, device=output_feature.device)
-    if anomaly_mask.any().item():
-        anomaly_in = input_2d[anomaly_mask]
-        anomaly_out = output_2d[anomaly_mask]
-        anomaly_loss = torch.mean((anomaly_out - anomaly_in) ** 2)
-
-    return (
-        args.origin_normal_weight * normal_loss
-        + args.origin_anomaly_weight * anomaly_loss
-    )
-
-
 def build_adaptive_threshold_map(distance, class_idx_np, default_threshold, quantile):
     threshold_map = np.full_like(distance, fill_value=default_threshold, dtype=np.float32)
     safe_q = min(max(float(quantile), 0.0), 1.0)
