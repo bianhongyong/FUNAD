@@ -6,6 +6,13 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 FUNAD (WACV 2025) 的全无监督异常检测复现 + 扩展。核心思路：在无标签且含噪的训练数据中，通过**迭代重构记忆库 (IRMB)** 生成伪标签，配合**互平滑损失 (mutual smoothness loss)** 进行自训练。主要扩展了多类别残差特征 + 混合专家 (MoE) 判别器分支。
 
+## 分支与 PR 工作流
+
+- `codex/main` 是本项目后续开发的主线，远端对应 `origin/codex/main`。
+- 开始新开发前，先获取远端更新，以最新的 `origin/codex/main` 为基线新建开发分支（默认命名为 `codex/<主题>`）。
+- 在开发分支上提交和推送改动，创建以 `codex/main` 为目标分支的 PR；通过 PR 合并回主线。
+- 不直接在 `codex/main` 上提交功能改动；同步主线时保留现有工作区改动。
+
 ## 训练入口
 
 | 脚本 | 说明 |
