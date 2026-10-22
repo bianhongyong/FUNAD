@@ -174,6 +174,56 @@ res_p = z_q[p] - z_m[j*]
 - 允许周期性冻结用于 NN 检索的融合参考**缓存快照**（theta_refresh 的版本），但必须记录滞后；**计算最终残差时**对选中的 raw_reference 使用 theta_current 重新融合，保留梯度。缓存旧版本可能选错最近邻，不能声称检索结果始终精确。
 - 注意：若损失仅鼓励最小残差，可能导致融合权重偏向“天然容易匹配、但不擅长检测缺陷”的层；应观察层权重塌缩并通过最终 anomaly loss 与严格消融检验。
 
+### 5.1.1 反向传播审计：已有 FUNAD 主训练存在阻断 BCE → Fusion 梯度的路径（2026-10-22）
+
+> 这是**在当前 codex/main 源码中已确认的现有训练行为**，不是新增模块已经写入代码、已通过集成测试。实现 learned_class 时必须修正，否则“参数被 optimizer 管理”不代表“参数被有效监督”。
+
+**源码复核路径**：
+
+1. [self_train_ad_multiclass_dinov3.py:95–98](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L95-L98)：\`--gaussian\` 使用 \`action="store_false"\`，所以不传时 **args.gaussian 默认 True**；当前 shell 没有传该 flag。
+2. [同文件:563–580](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L563-L580)：\`_copy = x.detach().clone()\` 用于 Gaussian 数据扰动。它在构造 _copy 时已**切断** \`x\` 的 autograd 历史；添加的噪声不改变这个事实。
+3. [同文件:668–698](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L668-L698)：当 gaussian 为 True，\`pred_for_loss = gaussian_pred = localnet(_copy)\`；所以 BCE loss 不会通过 \`_copy\` 回到 residual / Fusion(theta)。
+4. [同文件:712–749](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L712-L749)：当 \`--kl\` 启用且找到有效的配对，OTO 一致性损失由**原始** \`x\` 的 \`local_pred\` 计算，可能继续传递到 Fusion，但若没有配对、权重为零或实现变更，不能依赖它保证梯度。Hard Class Gate 的固定路由本身不应被当作 Fusion 的学习信号。
+5. [同文件:937–938](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L937-L938)：当前 optimizer 仅接收 \`localnet.parameters()\`。如果 Fusion 独立定义在 localnet 外，必须显式将其参数加入 optimizer（若放进 localnet 的 registered submodule，则确认确实被包含），同时处理第二个 onetoone_optimizer（\`--alternative\`）及其 state_dict 的一致性。
+
+**强制修复策略**：新增 learned_class 时，Gaussian 分支中的扰动必须与被扰动的特征保持可微连接。推荐让扰动本身视为常量（不对噪声采样、std、mask 求导），使用：
+
+~~~python
+# x 是当前 theta 计算得到的有梯度 residual [B,P,C]。
+with torch.no_grad():
+    noise = make_gaussian_noise_like(x, uncertain_mask, std_from=x.detach())
+x_perturbed = x + noise.detach()    # 而不是 x.detach().clone() + noise
+_, gaussian_pred = localnet(x_perturbed, class_idx=class_idx, ...)
+loss_bce = criterion(gaussian_pred, pseudo_labels.detach())
+~~~
+
+上述是**接口思路伪代码**，需保留实际模型所用 Gaussian 掩码、hard-class routing、标签与特征形状。若经实验证实有必要刻意不让 Gaussian BCE 回传到 Fusion，则必须**显式引入另一个在原始 x 上可微的 Fusion 训练目标**并分离记录，不允许一面 detach 一面假设 BCE 正在优化 Fusion。
+
+**共享融合权重不会必然造成梯度抵消**：固定最近邻索引 j* 时，
+\`R = sum_l alpha_l*(Q_l - M_l[j*])\`，
+因此对于 softmax logits theta_k，\`dR/dtheta_k = alpha_k/tau * (Delta_k - sum_l alpha_l*Delta_l)\`，其中 Delta_l=Q_l-M_l[j*]。只有当各层 Delta 几乎一样、下游目标近似常量/饱和或已出现特征/权重退化时，相关梯度才可能接近零。**需要实测**而不是假设“有梯度 = 学到有意义的层”。
+
+**动态缓存的两处梯度概念**：
+
+- 缓存 \`cached_fused_ref\` 在 no_grad 下生成，供查找 j*；**最近邻索引不可微**，而且周期性刷新版本滞后可造成 NN 误匹配。
+- 最终残差应通过 \`Fusion(theta_current)(Q) - Fusion(theta_current)(raw_ref[j*])\` 计算，选中参考一侧也需要对 theta 求导。若直接 \`Z_q - cached_fused_ref[j*]\`，仍可能获得 theta 的**查询端偏梯度**，但缺少参考端的梯度，优化目标的局部导数不正确。
+
+**最小 PyTorch autograd sanity-check（独立于真实训练）**：
+同一输入与 NN 匹配、使用线性 head + BCEWithLogitsLoss 的示例中：
+- 重新融合选中参考：\`theta.grad = [-0.490545, +0.490545]\`；
+- 直接减 detach 的融合参考缓存：\`theta.grad = [-0.408787, +0.408787]\`（有梯度，但缺少参考端贡献）；
+- 将计算出的 residual 整体 detach：\`theta.grad is None\`（head 参数依然正常有梯度）。
+数值只展示机制，不可替代真实 FUNAD 全链路测试。
+
+**实现前的验收门禁**：
+- [ ] \`--kl\` **关闭**、Gaussian **开启**时，单独 BCE.backward() 后 \`fusion.theta.grad\` 非 None、全部 finite、至少部分非零；theta 确实经 optimizer.step 更新。这是排除“只靠 OTO 训练”的必要测试。
+- [ ] Gaussian 关闭时的原始 x 分支也可回传 Fusion；检查 \`--gaussian\` 为 store_false 的真实语义和分支组合。
+- [ ] Gaussian 开启 + KL 开启时，分别记录 BCE 和 OTO 对 theta 的梯度范数与方向；避免出现相互抵消、某条路径恒零。
+- [ ] 验证 \`Fusion(theta_current)(raw_query)\` 与 \`Fusion(theta_current)(selected_raw_ref)\` 这两条 autograd 路径；检验直接减缓存的错误梯度。
+- [ ] 所有类别 theta 行至少在对应类别真实参加训练时获得有效更新；监测 softmax 梯度尺度、entropy 和更新幅度。
+- [ ] 对 \`optimizer.zero_grad()\`、\`loss.backward()\`、\`optimizer.step()\`、模型保存与恢复做逐项集成测试；不允许通过 \`.detach()\`、\`.cpu().numpy()\` 或 \`torch.no_grad()\` 意外切断主训练链路。
+- [ ] Pseudo-label Phase1/2/3 本身位于 \`torch.no_grad()\` 是正确的：它是生成监督目标/离线拟合；不能将其整个逻辑复制进需要训练 Fusion 的路径。
+
 ### 5.2 缓存一致性
 
 **架构硬约束**：Raw Reference Bank 固定；Fused Reference Cache 与其 NN Index **周期性动态刷新**；theta 和后端可训练参数则在每个训练优化步骤**持续更新**。三者生命周期不同，不能混作一个静态记忆库。
@@ -220,7 +270,7 @@ res_p = z_q[p] - z_m[j*]
 - [ ] raw reference memory 格式、构建、序列化、metadata 校验；
 - [ ] shared fusion：查询/参考严格同一参数与候选层；
 - [ ] 融合后 NN，再融合残差；不能误做逐层 NN；
-- [ ] Theta 有非零、有限梯度且 optimizer 实际更新；
+- [ ] Theta 在 Gaussian 开启且关闭 OTO 时也能由 BCE 传入有效梯度；修复旧 x.detach() 截断并明确添加到 optimizer；见 §5.1.1；
 - [ ] 具备 **Raw Bank 固定、Fused Cache/NN 动态周期刷新、theta 每步更新** 的完整闭环；刷新频率可配置并带版本戳；
 - [ ] 周期刷新（默认每 Epoch）与每步严格刷新可切换；可测缓存版本滞后、最近邻误匹配和耗时；
 - [ ] 选中参考 Patch 根据 theta_current 重新融合并可回传梯度；评估/推理前必重新构建准确索引；
@@ -260,6 +310,7 @@ res_p = z_q[p] - z_m[j*]
 
 | 风险 | 原因 | 缓解 |
 | --- | --- | --- |
+| Gaussian BCE 无法训练 Fusion | 旧训练代码 _copy=x.detach().clone()，且 gaussian 默认 True；BCE 仅作用于 gaussian_pred | 新模式用 x+noise.detach() 等保留 x 的计算图；单独 BCE grad test，OTO 仅作辅助 |
 | NN 特征空间过期 | theta 持续更新，周期刷新间隔内 NN 索引是旧版本 | Raw Bank 固定；Fused Cache 每 Epoch/每 N Step 重建；版本戳及误匹配消融；最终评估强制刷新 |
 | 伪标签不稳定 | theta 改变 Adapter 特征分布，PCA/coreset 基础变化 | 分阶段训练，定期全量 Phase 1/2/3 |
 | 注意力退化 / 忽略敏感层 | 训练信号倾向容易重建的层 | 记录权重熵和逐类指标，考虑约束但先不预设正则 |
