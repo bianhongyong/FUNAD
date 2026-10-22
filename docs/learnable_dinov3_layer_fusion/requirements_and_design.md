@@ -16,7 +16,37 @@
 
 **不采用**「逐层各找最近邻 → 逐层计算残差 → 最后才融合残差」作为主方案；那是可选的对比实验，不是本需求。
 
-参考记忆库**持久化原始、同位置对齐的逐层 Patch 特征**，不提前 Mean，不保存会随融合器训练而过期的唯一固定融合表示。检索时仍需按**当前**融合器参数生成融合参考表示，否则查询和参考不在相同空间。
+参考记忆库**持久化原始、同位置对齐的逐层 Patch 特征**，不提前 Mean，不保存会随融合器训练而过期的唯一固定融合表示。**正式工程方案采用「原始库固定 + 融合缓存周期性动态刷新 + 融合参数持续更新」**。缓存刷新时用当时最新的融合参数；两次刷新之间可能存在受控的“索引版本滞后”，不得误认为它与实时精确最近邻完全等价。
+
+### 0.1 已确认的训练 Pipeline：双层参考库 + 持续学习
+
+~~~text
+开始训练/首次启动
+  ├─ 冻结 DINOv3；提取各类别的逐层参考 Patch 特征 [N_c,L,C]
+  ├─ 持久化 Raw Reference Bank（只建一次、训练中不随 theta 更新）
+  ├─ 初始化可学习层融合器 Fusion(theta)
+  └─ 使用当前 theta 融合 Raw Bank，建立 Fused Reference Cache + NN Index
+
+每个训练 Epoch / Batch
+  ├─ 当前查询图像 → 冻结 DINOv3 → raw_query[B,P,L,C]
+  ├─ raw_query → Fusion(theta_current) → fused_query[B,P,C]
+  ├─ 在“最近一次刷新的” Fused Reference Cache 中执行按类别 NN
+  ├─ 通过最近邻 id 从固定 Raw Reference Bank 取出对应 raw_reference
+  ├─ 以 theta_current 重新融合选中的 raw_reference（保留梯度）
+  ├─ residual = fused_query(theta_current) - selected_fused_ref(theta_current)
+  ├─ residual → Class Adapter → MoE → 现有异常检测/自训练损失
+  └─ backward + optimizer.step()：持续更新 theta 和后端可训练参数
+
+每当触发刷新条件（默认每 Epoch 开始；可配置每 N 个 Step）
+  ├─ 使用 theta_refresh 对固定 Raw Reference Bank 重新执行轻量融合
+  ├─ 为受影响的类别重建 NN Index / 切换新缓存
+  └─ 记录 cache_fusion_step、刷新时间与版本/漂移日志
+
+验证、最终推理
+  └─ 从 checkpoint 恢复 theta → 精确刷新一次 Fused Cache/NN Index → 固定参数完成推理
+~~~
+
+**刷新不是重新运行 DINOv3**：Raw Bank 的骨干特征完全不变，只更新派生的 Fused Cache / NN Index。训练中 theta 持续更新；周期性刷新是计算成本与检索精度之间的明确权衡。独立的伪标签记忆库仍按原有 Phase 1/2/3 更新，不与 Fused Reference Cache 混同。
 
 ## 1. 研究动机、假设与边界
 
@@ -141,18 +171,24 @@ res_p = z_q[p] - z_m[j*]
 - DINOv3 仍处于 torch.no_grad；融合器前向**不得**包在 torch.no_grad 里。
 - argmin / FAISS 选出的**索引**本身不具备可微梯度；索引切换是离散的。
 - 推荐在当前 theta 下检索索引，然后从 raw_m 以 j* 取回原始多层参考特征，用同一 fusion_theta **在有梯度上下文中**重新融合选中参考，计算 res = z_q - z_m[j*]。这样损失可经 residual 的两端回传至 theta，但**不能声称梯度穿过了 argmin 的选择决策**。
-- 如果为省显存，在索引构建/候选搜索阶段用 no_grad 缓存融合向量，仍须保证**当前** theta 的版本，并在最终残差计算处有上面描述的梯度路径。
+- 允许周期性冻结用于 NN 检索的融合参考**缓存快照**（theta_refresh 的版本），但必须记录滞后；**计算最终残差时**对选中的 raw_reference 使用 theta_current 重新融合，保留梯度。缓存旧版本可能选错最近邻，不能声称检索结果始终精确。
 - 注意：若损失仅鼓励最小残差，可能导致融合权重偏向“天然容易匹配、但不擅长检测缺陷”的层；应观察层权重塌缩并通过最终 anomaly loss 与严格消融检验。
 
 ### 5.2 缓存一致性
 
-**硬约束**：原始参考库与冻结 DINOv3 相关，可以跨 epoch 固定；**融合参考特征及其 NN 索引与 theta 相关**，不能固定不变。
+**架构硬约束**：Raw Reference Bank 固定；Fused Reference Cache 与其 NN Index **周期性动态刷新**；theta 和后端可训练参数则在每个训练优化步骤**持续更新**。三者生命周期不同，不能混作一个静态记忆库。
 
-推荐实现分档：
-- P0 正确性模式：每次 optimizer 更新后的新 batch、仅对所需类别，用当前 theta 对原始参考库重新融合并检索（必要时分块算距离）；最容易验证一致性，但开销高。
-- P1 加速模式：精确记录 fusion 参数版本 / refresh_step，重建对应版本的 FAISS 索引；明确 staleness/更新间隔和对结果的影响，不可无声使用旧索引。
-- 推理模式：fusion.eval() 加载 checkpoint 后只需融合 raw_m 一次并构建索引；保持测试全程参数冻结。
-- 对照模式：固定权重、相同层集时，融合结果与原 Mean 数值近似一致，才能认为回归测试通过。
+**正式实现默认**：
+- P0 主训练采用**周期性刷新模式**：`--reference_refresh_unit epoch --reference_refresh_interval 1`（建议初值：每个 Epoch 开始刷新一次）。可切换为每 N 个 optimizer Step 刷新，例如每 100 步；N 是待消融超参。
+- 训练启动时先构建 Raw Bank，再用初始 theta 构建 Fused Cache；检查是否需要刷新，按类别批量融合原始库、重建对应 NN Index，然后原子地切换为完整的新版本。
+- 缓存元数据保存 `cache_fusion_step` / `cache_fusion_version`、创建时的模型参数签名或版本、`last_refresh_epoch`、候选层与类别。查询在当前 theta 下融合，检索使用最新可用缓存；当缓存未刷新时，这是**近似 NN**。
+- 对选中的参考 Patch 从 Raw Bank 取回多层原始特征，以**当前** theta 再次融合后计算 residual，防止训练梯度被缓存阻断。即便这样仍无法修复过期缓存导致的 NN 选错；必须通过误匹配率、融合空间漂移或指标消融评估容忍度。
+- **严格精确对照模式**：`--reference_refresh_unit step --reference_refresh_interval 1`，每次参数更新后于下一次检索前重建当前融合库/索引；结果用来核验周期性缓存的数值误差/准确率，而**不是正式方案中唯一允许的运行方式**。
+- **推理和评估**：加载确定的 fusion checkpoint（或者隔离的 eval 模型快照）后，必须先按此版本准确重建 Fused Cache/NN Index，再冻结模型并执行评估。不得直接将训练时过期的近似索引用于最终报告。
+- **checkpoint 恢复**：Raw Bank 和 fusion 权重/优化器状态必须还原；派生 Fused Cache/NN Index 可从 Raw Bank 重新生成，不强制永久保存旧派生索引。旧的静态参考库 checkpoint 则走兼容模式。
+- **对照模式**：固定权重、同层集时新路径输出与原 Mean 数值近似一致，才能认为基线回归测试通过。
+
+注意：周期性参考刷新和 `--memory_bank_freeze_start_epoch` **不是同一个概念**；后者控制现有伪标签库冻结，不得复用为融合参考刷新开关。
 
 ### 5.3 存储与精度成本
 
@@ -185,7 +221,9 @@ res_p = z_q[p] - z_m[j*]
 - [ ] shared fusion：查询/参考严格同一参数与候选层；
 - [ ] 融合后 NN，再融合残差；不能误做逐层 NN；
 - [ ] Theta 有非零、有限梯度且 optimizer 实际更新；
-- [ ] 当前 theta 的参考索引一致性可自动检验；
+- [ ] 具备 **Raw Bank 固定、Fused Cache/NN 动态周期刷新、theta 每步更新** 的完整闭环；刷新频率可配置并带版本戳；
+- [ ] 周期刷新（默认每 Epoch）与每步严格刷新可切换；可测缓存版本滞后、最近邻误匹配和耗时；
+- [ ] 选中参考 Patch 根据 theta_current 重新融合并可回传梯度；评估/推理前必重新构建准确索引；
 - [ ] 训练、epoch_precompute 的三阶段、评估、独立推理全部可调用新路径；
 - [ ] checkpoint 同时保存 localnet、fusion 参数、候选层、参考 raw 库、版本、preprocess/backbone；
 - [ ] 旧 checkpoint 仍能以原 fixed_mean 路径读取或明确报出可操作的兼容诊断；
@@ -222,7 +260,7 @@ res_p = z_q[p] - z_m[j*]
 
 | 风险 | 原因 | 缓解 |
 | --- | --- | --- |
-| NN 特征空间过期 | theta 每步更新，索引仍是旧融合表示 | P0 重算，后续带版本号刷新 |
+| NN 特征空间过期 | theta 持续更新，周期刷新间隔内 NN 索引是旧版本 | Raw Bank 固定；Fused Cache 每 Epoch/每 N Step 重建；版本戳及误匹配消融；最终评估强制刷新 |
 | 伪标签不稳定 | theta 改变 Adapter 特征分布，PCA/coreset 基础变化 | 分阶段训练，定期全量 Phase 1/2/3 |
 | 注意力退化 / 忽略敏感层 | 训练信号倾向容易重建的层 | 记录权重熵和逐类指标，考虑约束但先不预设正则 |
 | 检索不是端到端可微 | argmin/FAISS 离散 | 选中参考重新融合以回传梯度；可微近邻仅做 P2 |
@@ -234,9 +272,9 @@ res_p = z_q[p] - z_m[j*]
 
 本设计文件是待实现的**需求确认版**，不代表已经在新分支完成代码变更或实验证明。
 
-暂定默认：首版类别特定 softmax 层加权，先融合、再类别 NN、再残差；缓存原始逐层参考特征；用旧后端与旧损失；先验收 old-mode 和 gradient，再运行正式消融。
+已对齐的实施基线：首版类别特定 softmax 层加权，**Raw Bank 固定、Fused Cache/NN 按 Epoch（默认）或 N Step 动态刷新、theta 在每次训练 step 持续学习**；严格每步刷新保留为精确参照；先融合、再类别 NN、再残差；后端与主损失保持不变。
 
-实施前需最终确认：候选层数 L 与模型型号；每类 reference 原始缓存预算；是否将 train optimizer 每步准确重算作为验收基准；PCA 伪标签是否先冻结几轮；是否同时支持训练恢复和独立推理。
+实施前仍需确认：候选层数 L 与模型型号、每类 raw reference 的内存预算、选择每 Epoch 还是每 N Step 刷新的消融范围、PCA 伪标签是否先冻结几轮。每步精确刷新是必须支持的对照模式，而不是最终默认实现。
 
 ## 11. 文献与论证边界
 
