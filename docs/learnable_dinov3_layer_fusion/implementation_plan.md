@@ -80,6 +80,18 @@
    - raw reference 一般可存文件/外部 sidecar，checkpoint 需保存可移植引用/哈希；不能简单依赖训练机器绝对路径。
    - Test：相同 checkpoint、同一张图的训练内评估与独立推理残差/异常图一致；加载错误元数据应立即报错。
 
+## 必须优先修复：Fusion 梯度接入（P0 阻断项）
+
+源码审核发现 [self_train_ad_multiclass_dinov3.py](https://github.com/bianhongyong/FUNAD/blob/codex/main/self_train_ad_multiclass_dinov3.py#L563-L698) 的 Gaussian 分支使用 `_copy = x.detach().clone()`，同时 BCE 使用 `gaussian_pred = localnet(_copy)`，所以 BCE 不能经 `x` 反传到拟新增的融合模块。命令行 `--gaussian` 使用 `store_false`，不传时反而是 True；当前 shell 启用 `--kl`，OTO 可能经另一路提供部分梯度，但**不应以 OTO 代替 BCE 的可微链路检查**。详细审计见 [requirements_and_design.md §5.1.1](./requirements_and_design.md#511-反向传播审计已有-funad-主训练存在阻断-bce--fusion-梯度的路径2026-10-22)。
+
+实施顺序：
+1. 保留噪声生成的 mask/std/采样逻辑，但使 Gaussian 输入为 `x_perturbed = x + noise.detach()`（其中 noise 根据 x.detach() 等统计生成），**不得 detach 整个 x**；修正实现时需验证维度、mask 和 Hard Class Gate 行为。
+2. 在 Fusion 独立于 localnet 定义时，将其参数显式加入所有负责训练上游特征的 optimizer，并更新 checkpoint 保存/恢复；若嵌入 localnet，检查 parameters() 实际包含 theta。
+3. 伪标签预计算的 no_grad 保持不变；主训练的 DINOv3 可冻结但融合器不能放入 no_grad。
+4. NN 搜索用 detached 缓存选 j*，从 Raw Bank 索引 j* 后**重新以当前 theta 有梯度地融合选中参考**；不能直接用 cached_fused[j*] 算最终 residual（会失去参考端梯度）。
+5. 增加严格门禁：关闭 KL 单测仅 BCE 的 theta.grad（Gaussian 开/关）；启用 KL 后分别记录 BCE/OTO 对 theta 的贡献；对比有梯度的选中参考与 detached cache；验证 optimizer.step 确实更新 theta、部分类别缺席批次不会虚构梯度。
+6. 小型 autograd sanity test 已验证：完全重融合参考 theta 梯度与直接减缓存 theta 梯度不同；若 residual 整体 detach，theta.grad 为 None。因此“loss.backward() 调用成功”不是足够的验收条件。
+
 ## 第二阶段：训练策略和算力优化（P1）
 
 - 初次训练：推荐保留现有 train loss、类别 MoE、PCA pseudo-label 配置，alpha 从近似均匀初始化；可先固定伪标签让融合层学到非零梯度，再打开全量自训练。
