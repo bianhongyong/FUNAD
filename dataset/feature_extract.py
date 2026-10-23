@@ -379,6 +379,101 @@ def extract_dinov3_feature_batch(input_tensor, feature_extractor, dino_layer_ind
     return x_prenorm
 
 
+def extract_dinov3_multilayer_feature_batch(
+    input_tensor,
+    feature_extractor,
+    candidate_layers,
+    use_cls_token=False,
+    return_cls_token=False,
+):
+    """Extract raw per-layer DINOv3 patch features without any fusion.
+
+    This is the multi-layer counterpart of ``extract_dinov3_feature_batch`` and
+    deliberately does **not** average layers.  The legacy function keeps its
+    original behaviour/shape so existing fixed-mean runs stay reproducible.
+
+    Args:
+        input_tensor: [B, 3, H, W] normalized images.
+        feature_extractor: frozen DINOv3 backbone (``get_intermediate_layers``).
+        candidate_layers: 1-based Transformer block indices shared by all
+            classes.  ``-1`` means the last block.  Indices are deduplicated and
+            sorted ascending, so the returned L axis has a deterministic order.
+        use_cls_token: concatenate each layer's CLS token to that layer's patch
+            tokens (channel dimension becomes ``2 * C``).  Default False.
+        return_cls_token: also return the layer-mean CLS token ``[B, C]``.
+
+    Returns:
+        patches: ``[B, P, L, C]`` (or ``[B, P, L, 2*C]`` when use_cls_token).
+            The L axis follows the sorted candidate layer order.
+        cls_token: ``[B, C]`` layer-mean CLS token, only when
+            ``return_cls_token=True``.
+    """
+    if isinstance(candidate_layers, dict):
+        raise TypeError(
+            "extract_dinov3_multilayer_feature_batch expects a single shared "
+            "candidate layer list, not a per-class dict."
+        )
+
+    requested = list(candidate_layers)
+    if len(requested) == 0:
+        raise ValueError("candidate_layers must contain at least one layer index.")
+
+    selected_blocks = resolve_dino_block_indices(feature_extractor, requested)
+
+    with torch.no_grad():
+        feature_extractor.eval()
+        selected = feature_extractor.get_intermediate_layers(
+            input_tensor,
+            n=selected_blocks,
+            return_class_token=True,
+        )
+
+    # DINOv3 returns tuple(zip(patch_tokens, class_tokens)); patch tokens already
+    # exclude the CLS / storage tokens.  Stacking order matches selected_blocks.
+    patch_layers = torch.stack([patch for patch, _ in selected], dim=2)  # [B, P, L, C]
+    cls_layers = torch.stack([cls for _, cls in selected], dim=1)  # [B, L, C]
+
+    if use_cls_token:
+        cls_per_layer = cls_layers.unsqueeze(2).expand(
+            -1, -1, patch_layers.shape[1], -1
+        )  # [B, L, P, C]
+        patch_layers = torch.cat(
+            [cls_per_layer, patch_layers.permute(0, 2, 1, 3)], dim=-1
+        ).permute(0, 2, 1, 3).contiguous()  # [B, P, L, 2C]
+
+    if return_cls_token:
+        return patch_layers, cls_layers.mean(dim=1)
+    return patch_layers
+
+
+def infer_dinov3_multilayer_num_patches(
+    train_loader, feature_extractor, candidate_layers, use_cls_token, device,
+):
+    """Infer the patch count (P) produced by the multi-layer API."""
+    for batch in train_loader:
+        images = batch[0]
+        images = images.to(device, non_blocking=True)
+        features = extract_dinov3_multilayer_feature_batch(
+            images, feature_extractor, candidate_layers, use_cls_token=use_cls_token,
+        )
+        return int(features.shape[1])
+    raise RuntimeError("训练集为空，无法推断 patch 数。")
+
+
+def infer_dinov3_multilayer_feature_dim(
+    feature_extractor, train_loader, candidate_layers, use_cls_token, device,
+):
+    """Infer the fused (single-layer) feature dimension C of the multi-layer API."""
+    for batch in train_loader:
+        images = batch[0]
+        images = images.to(device, non_blocking=True)
+        features = extract_dinov3_multilayer_feature_batch(
+            images, feature_extractor, candidate_layers, use_cls_token=use_cls_token,
+        )
+        return int(features.shape[-1])
+    raise RuntimeError("训练集为空，无法推断特征维度。")
+
+
 def infer_dinov3_feature_dim(feature_extractor, train_loader, dino_layer_indices, use_cls_token, device):
     for batch in train_loader:
         images = batch[0]
