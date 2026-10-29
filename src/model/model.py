@@ -540,12 +540,28 @@ class localnet(nn.Module):
         moe_hard_class_gate=False,
         num_classes=None,
         class_conditioned_adapter=True,
+        feature_adapter_mode="legacy",
     ):
         super(localnet, self).__init__()
+        if feature_adapter_mode not in ("legacy", "class_residual"):
+            raise ValueError(
+                "feature_adapter_mode must be 'legacy' or 'class_residual', "
+                f"got {feature_adapter_mode!r}."
+            )
+        self.feature_adapter_mode = str(feature_adapter_mode)
+        # Non-owning pointer to the single ClassPatchFusionAdapter instance.
+        # Stored in __dict__ so it is NOT registered as a submodule: the
+        # fusion parameters must be owned/optimized exactly once (by the
+        # training runtime), not through both localnet and fusion.
+        self.__dict__["_feature_transform_adapter"] = None
 
         # 论文中的 phi_adaptor(·):
         # 将预训练特征映射到当前异常检测任务的可学习特征空间。
-        if class_conditioned_adapter and num_classes is not None and num_classes > 1:
+        # V2-C: adaptation is owned by the external fusion module, so no legacy
+        # adaptor parameters are created at all (avoids dead optimizer slots).
+        if feature_adapter_mode == "class_residual":
+            self.adaptor = nn.Identity()
+        elif class_conditioned_adapter and num_classes is not None and num_classes > 1:
             self.adaptor = ClassCrossAttentionAdapter(
                 d_model=len_feature,
                 num_classes=num_classes,
@@ -583,12 +599,34 @@ class localnet(nn.Module):
         if feat_select:
             self.conv1x1_layer = Conv1x1(in_channels=512, out_channels=1536).cuda()
 
+    def set_feature_transform_adapter(self, module):
+        """Attach the external ClassPatchFusionAdapter without registering it."""
+        self.__dict__["_feature_transform_adapter"] = module
+
+    def get_feature_transform_adapter(self):
+        return self.__dict__.get("_feature_transform_adapter", None)
+
     def forward(self, x, synthetic_feat=None, cls_token=None, patch_class_idx=None, class_idx=None):
         # 输入 x: [B, P, C]，常见 P=784, C=1536。
         # 返回:
         # - adapted_features: 适配后 patch 特征 (用于 memory bank / 距离度量)
         # - local_score: patch 异常分数 (用于伪标签监督与推理)
-        if isinstance(self.adaptor, ClassCrossAttentionAdapter):
+        if self.feature_adapter_mode == "class_residual":
+            # V2-C: exactly one adaptation, performed by the shared class
+            # embedding / beta FiLM residual MLP.  The legacy adaptor is
+            # deliberately skipped (it must never run in addition to this).
+            feature_transform = self.get_feature_transform_adapter()
+            if feature_transform is None:
+                raise RuntimeError(
+                    "feature_adapter_mode='class_residual' requires "
+                    "set_feature_transform_adapter(fusion)."
+                )
+            if class_idx is None:
+                raise ValueError(
+                    "class_idx is required when feature_adapter_mode='class_residual'."
+                )
+            adapted_features = feature_transform.adapt_residual(x, class_idx=class_idx)
+        elif isinstance(self.adaptor, ClassCrossAttentionAdapter):
             if class_idx is None:
                 raise ValueError("class_idx is required when using ClassCrossAttentionAdapter")
             adapted_features = self.adaptor(x, class_idx=class_idx)

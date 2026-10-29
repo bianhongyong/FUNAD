@@ -37,6 +37,7 @@ from dataset.multiclass_feature_dataset import (
     normalize_candidate_layers,
 )
 from src.model import model
+from src.model.class_patch_fusion_adapter import ClassPatchFusionAdapter
 from src.model.layer_fusion import ClassConditionedLayerFusion
 from src.train.epoch_precompute import precompute_pseudo_labels_multiclass_residual
 from utils import evaluate as eval_utils
@@ -105,7 +106,7 @@ def _fusion_preprocess_metadata(args):
 
 
 def _build_fusion_config(args, class_names, candidate_layers, feature_dim):
-    return {
+    config = {
         "schema_version": 1,
         "fusion_mode": str(args.fusion_mode),
         "num_classes": int(len(class_names)),
@@ -130,6 +131,25 @@ def _build_fusion_config(args, class_names, candidate_layers, feature_dim):
         "strict_clean_reference": bool(args.strict_clean_reference),
         "reference_seed": int(args.seed),
     }
+    if args.fusion_mode == "class_patch":
+        config.update(
+            {
+                "schema_version": 2,
+                "feature_adapter_mode": str(args.feature_adapter_mode),
+                "fusion_topk": int(args.fusion_topk),
+                "fusion_query_chunk": int(args.fusion_query_chunk),
+                "fusion_candidate_chunk": int(args.fusion_candidate_chunk),
+                "gate_embedding_dim": int(args.gate_embedding_dim),
+                "gate_hidden_dim": int(args.gate_hidden_dim),
+                "gate_norm": str(args.gate_norm),
+                "gate_lambda_init": float(args.gate_lambda_init),
+                "gate_use_context": bool(args.gate_use_context),
+                "gate_demean_delta": bool(args.gate_demean_delta),
+                "adapter_hidden_dim": int(args.adapter_hidden_dim),
+                "adapter_beta_init": float(args.adapter_beta_init),
+            }
+        )
+    return config
 
 
 def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers):
@@ -170,6 +190,32 @@ def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers
         "strict_clean_reference": bool(args.strict_clean_reference),
         "reference_seed": int(args.seed),
     }
+    if str(args.fusion_mode) == "class_patch":
+        v2_checks = [
+            ("feature_adapter_mode", str(ckpt_cfg.get("feature_adapter_mode"))),
+            ("fusion_topk", int(ckpt_cfg.get("fusion_topk", -1))),
+            ("gate_embedding_dim", int(ckpt_cfg.get("gate_embedding_dim", -1))),
+            ("gate_hidden_dim", int(ckpt_cfg.get("gate_hidden_dim", -1))),
+            ("gate_norm", str(ckpt_cfg.get("gate_norm"))),
+            ("gate_use_context", bool(ckpt_cfg.get("gate_use_context"))),
+            ("gate_demean_delta", bool(ckpt_cfg.get("gate_demean_delta"))),
+            ("adapter_hidden_dim", int(ckpt_cfg.get("adapter_hidden_dim", -1))),
+        ]
+        current_v2 = {
+            "feature_adapter_mode": str(args.feature_adapter_mode),
+            "fusion_topk": int(args.fusion_topk),
+            "gate_embedding_dim": int(args.gate_embedding_dim),
+            "gate_hidden_dim": int(args.gate_hidden_dim),
+            "gate_norm": str(args.gate_norm),
+            "gate_use_context": bool(args.gate_use_context),
+            "gate_demean_delta": bool(args.gate_demean_delta),
+            "adapter_hidden_dim": int(args.adapter_hidden_dim),
+        }
+        for key, expected in v2_checks:
+            if current_v2[key] != expected:
+                errors.append(
+                    f"{key}: checkpoint={expected!r}, current={current_v2[key]!r}"
+                )
     for key, expected in checks:
         if current[key] != expected:
             errors.append(f"{key}: checkpoint={expected!r}, current={current[key]!r}")
@@ -391,6 +437,198 @@ class LayerFusionRuntime:
         }
 
 
+class ClassPatchFusionRuntime(LayerFusionRuntime):
+    """V2 runtime: query-conditioned Top-K matching + patch-alpha diagnostics."""
+
+    def __init__(self, fusion, cache, candidate_layers, args):
+        super().__init__(fusion, cache, candidate_layers, args)
+        self.topk = int(args.fusion_topk)
+        if self.topk < 1:
+            raise ValueError("--fusion_topk must be >= 1.")
+        self._last_match_meta = None
+
+    def residual(self, raw_features, class_idx, reference_memory_by_class=None,
+                 reference_index_by_class=None):
+        (
+            residual,
+            neighbor_ids,
+            diagnostics,
+        ) = common_utils.compute_class_patch_fused_residual_batch(
+            raw_features,
+            class_idx,
+            self.cache,
+            self.fusion,
+            topk=self.topk,
+            query_chunk_size=int(self.args.fusion_query_chunk),
+            candidate_chunk_size=int(self.args.fusion_candidate_chunk),
+            return_neighbor_ids=True,
+            return_diagnostics=True,
+        )
+        self._last_neighbor_ids = neighbor_ids
+        self._last_match_meta = diagnostics
+        self._accumulate_patch_stats(diagnostics)
+        return residual
+
+    # -- diagnostics -------------------------------------------------------
+    def begin_epoch(self, step, epoch):
+        if getattr(self.fusion, "enable_adapter", False):
+            self.fusion.reset_adapter_stats()
+        super().begin_epoch(step, epoch)
+
+    def begin_epoch_stats(self):
+        super().begin_epoch_stats()
+        num_classes = int(self.fusion.num_classes)
+        num_layers = int(self.fusion.num_layers)
+        self._patch_alpha_sum = np.zeros((num_classes, num_layers), dtype=np.float64)
+        self._patch_alpha_sq_sum = np.zeros((num_classes, num_layers), dtype=np.float64)
+        self._patch_alpha_count = np.zeros(num_classes, dtype=np.int64)
+        self._patch_l1_dev_sum = np.zeros(num_classes, dtype=np.float64)
+        self._patch_entropy_sum = np.zeros(num_classes, dtype=np.float64)
+        self._patch_nn_switch_sum = 0.0
+        self._patch_nn_switch_count = 0
+        self.epoch_topk_recall = []
+
+    def _accumulate_patch_stats(self, diagnostics):
+        if diagnostics is None:
+            return
+        alpha = diagnostics["alpha"].detach().float().cpu().numpy()
+        class_np = diagnostics["class_idx"].detach().cpu().numpy().astype(np.int64)
+        best_np = diagnostics["best_ids"].detach().cpu().numpy()
+        coarse_first = diagnostics["coarse_ids"][..., 0].detach().cpu().numpy()
+        self._patch_nn_switch_sum += float((best_np != coarse_first).mean())
+        self._patch_nn_switch_count += 1
+
+        num_layers = alpha.shape[-1]
+        for cls in np.unique(class_np).tolist():
+            cls = int(cls)
+            mask = class_np == cls
+            if not np.any(mask):
+                continue
+            patch_alpha = alpha[mask].reshape(-1, num_layers).astype(np.float64)
+            prior = (
+                self.fusion.get_layer_weights(cls)[0].detach().float().cpu().numpy()
+            )
+            self._patch_alpha_sum[cls] += patch_alpha.sum(axis=0)
+            self._patch_alpha_sq_sum[cls] += (patch_alpha ** 2).sum(axis=0)
+            self._patch_alpha_count[cls] += patch_alpha.shape[0]
+            self._patch_l1_dev_sum[cls] += float(
+                np.abs(patch_alpha - prior).sum(axis=-1).sum()
+            )
+            self._patch_entropy_sum[cls] += float(
+                (-(patch_alpha * np.log(np.clip(patch_alpha, 1e-12, None)))
+                 .sum(axis=-1)).sum()
+            )
+
+    def maybe_probe_topk_recall(self, raw_features, class_idx, step):
+        interval = int(getattr(self.args, "fusion_topk_recall_probe_interval", 0))
+        if interval <= 0 or step % interval != 0:
+            return
+        with torch.no_grad():
+            result = common_utils.topk_recall_vs_exact(
+                raw_features,
+                class_idx,
+                self.cache,
+                self.fusion,
+                topk=self.topk,
+                sample_size=int(getattr(self.args, "fusion_topk_recall_sample_size", 32)),
+            )
+        self.epoch_topk_recall.append(result)
+        print(
+            f"[Fusion topk] recall@{result['topk']} @step {step}: "
+            f"{result['recall']:.4f} (n={result['num_samples']})"
+        )
+
+    def log_epoch(self, epoch, class_names, save_dir=None):
+        base = super().log_epoch(epoch, class_names, save_dir=save_dir)
+        counts = self._patch_alpha_count
+        mean = np.zeros_like(self._patch_alpha_sum)
+        var = np.zeros_like(self._patch_alpha_sum)
+        valid = counts > 0
+        mean[valid] = self._patch_alpha_sum[valid] / counts[valid, None]
+        var[valid] = (
+            self._patch_alpha_sq_sum[valid] / counts[valid, None] - mean[valid] ** 2
+        )
+        std = np.sqrt(np.clip(var, 0.0, None))
+        l1_dev = np.zeros(self.fusion.num_classes, dtype=np.float64)
+        entropy = np.zeros(self.fusion.num_classes, dtype=np.float64)
+        l1_dev[valid] = self._patch_l1_dev_sum[valid] / counts[valid]
+        entropy[valid] = self._patch_entropy_sum[valid] / counts[valid]
+        lam = self.fusion.get_patch_lambda().detach().float().cpu().numpy()
+
+        print(
+            f"[Fusion patch] epoch {epoch + 1} | "
+            f"nn_switch_rate="
+            f"{self._patch_nn_switch_sum / max(1, self._patch_nn_switch_count):.4f}"
+        )
+        for row in range(self.fusion.num_classes):
+            name = class_names[row] if row < len(class_names) else f"cls_{row}"
+            weights = " ".join(f"{v:.4f}" for v in mean[row])
+            stds = " ".join(f"{v:.4f}" for v in std[row])
+            print(
+                f"[Fusion patch alpha] {name}: mean=[{weights}] "
+                f"std=[{stds}] | l1_to_prior={l1_dev[row]:.4f} "
+                f"entropy={entropy[row]:.4f} | lambda={lam[row]:.4f}"
+            )
+
+        beta = None
+        rho = None
+        rho_count = None
+        if getattr(self.fusion, "enable_adapter", False):
+            beta = self.fusion.get_beta().detach().float().cpu().numpy()
+            rho, rho_count = self.fusion.adapter_rho()
+            print(
+                "[Fusion adapter] beta=["
+                + " ".join(f"{v:.4f}" for v in beta)
+                + "] rho=["
+                + " ".join(f"{v:.4f}" for v in rho.numpy())
+                + "]"
+            )
+
+        if save_dir and self._patch_alpha_count.sum() > 0:
+            os.makedirs(save_dir, exist_ok=True)
+            csv_path = os.path.join(
+                save_dir, f"fusion_patch_alpha_epoch_{epoch + 1:04d}.csv"
+            )
+            header = (
+                "class,"
+                + ",".join(f"mean_layer_{l}" for l in self.candidate_layers)
+                + ","
+                + ",".join(f"std_layer_{l}" for l in self.candidate_layers)
+                + ",l1_to_prior,entropy,lambda,beta,rho\n"
+            )
+            with open(csv_path, "w") as handle:
+                handle.write(header)
+                for row in range(self.fusion.num_classes):
+                    name = class_names[row] if row < len(class_names) else f"cls_{row}"
+                    values = ",".join(f"{v:.8f}" for v in mean[row])
+                    stds = ",".join(f"{v:.8f}" for v in std[row])
+                    beta_v = float(beta[row]) if beta is not None else float("nan")
+                    rho_v = float(rho[row]) if rho is not None else float("nan")
+                    handle.write(
+                        f"{name},{values},{stds},{l1_dev[row]:.8f},"
+                        f"{entropy[row]:.8f},{lam[row]:.8f},{beta_v:.8f},{rho_v:.8f}\n"
+                    )
+
+        base.update(
+            {
+                "patch_alpha_mean": mean,
+                "patch_alpha_std": std,
+                "patch_alpha_l1_to_prior": l1_dev,
+                "patch_alpha_entropy": entropy,
+                "patch_lambda": lam,
+                "patch_beta": beta,
+                "patch_rho": None if rho is None else rho.numpy(),
+                "patch_rho_count": None if rho_count is None else rho_count.numpy(),
+                "nn_switch_rate": (
+                    self._patch_nn_switch_sum
+                    / max(1, self._patch_nn_switch_count)
+                ),
+                "topk_recall": list(self.epoch_topk_recall),
+            }
+        )
+        return base
+
+
 def str2bool(value):
     return common_utils.str2bool(value)
 
@@ -609,14 +847,14 @@ def parse_args():
         default="threshold",
         help="How to select 'normal' images in Phase 2 of pseudo-label pipeline. "
         "'threshold' (default): select images with norm_score < 0.5. "
-        "'quantile': select images with norm_score below the top-N quantile (e.g. top 30%).",
+        "'quantile': select images with norm_score below the top-N quantile (e.g. top 30%%).",
     )
     parser.add_argument(
         "--normal_sample_quantile",
         type=float,
         default=0.3,
         help="Quantile threshold for 'quantile' selection mode. "
-        "E.g., 0.3 means top 30% lowest-scoring images are considered normal candidates. "
+        "E.g., 0.3 means top 30%% lowest-scoring images are considered normal candidates. "
         "Only used when --normal_sample_selection=quantile.",
     )
     parser.add_argument(
@@ -634,11 +872,12 @@ def parse_args():
     parser.add_argument(
         "--fusion_mode",
         type=str,
-        choices=["fixed_mean", "learned_class", "learned_shared"],
+        choices=["fixed_mean", "learned_class", "learned_shared", "class_patch"],
         default="fixed_mean",
         help="fixed_mean: legacy per-class layer table + mean (default, reproducible). "
         "learned_class: class-conditioned softmax layer weights. "
-        "learned_shared: one softmax weight vector shared by all classes (E1 ablation).",
+        "learned_shared: one softmax weight vector shared by all classes (E1 ablation). "
+        "class_patch: V2 class prior + per-patch gate + query-conditioned Top-K rerank.",
     )
     parser.add_argument(
         "--fusion_layers",
@@ -689,6 +928,58 @@ def parse_args():
         help="Every N optimizer steps, compare cached NN ids with current-theta "
         "exact NN and log the mismatch rate. 0 disables (expensive).",
     )
+
+    # ------------------------------------------------------------------
+    # V2 class-patch adaptive fusion (/class_patch mode)
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--fusion_topk",
+        type=int,
+        default=32,
+        help="Coarse class-prior candidate count K for query-conditioned rerank.",
+    )
+    parser.add_argument("--fusion_query_chunk", type=int, default=256,
+                        help="Query patches per rerank chunk (memory bound).")
+    parser.add_argument("--fusion_candidate_chunk", type=int, default=8,
+                        help="Candidates per rerank chunk (memory bound).")
+    parser.add_argument("--gate_embedding_dim", type=int, default=32,
+                        help="Shared class embedding dimension e_c.")
+    parser.add_argument("--gate_hidden_dim", type=int, default=64,
+                        help="Patch-gate hidden/projection dimension d.")
+    parser.add_argument("--gate_norm", type=str, choices=["layer_norm", "none"],
+                        default="layer_norm",
+                        help="Internal Gate input norm (independent of --fusion_norm).")
+    parser.add_argument("--gate_lambda_init", type=float, default=0.1,
+                        help="Initial softplus gate amplitude lambda_c (small positive).")
+    parser.add_argument("--gate_use_context", type=str2bool, default="False",
+                        help="Add a 3x3 depthwise spatial context branch to the gate.")
+    parser.add_argument("--gate_demean_delta", type=str2bool, default="True",
+                        help="Remove the per-patch mean of delta (softmax-invariant, "
+                        "only improves log interpretability).")
+    parser.add_argument(
+        "--feature_adapter_mode",
+        type=str,
+        choices=["legacy", "class_residual"],
+        default="legacy",
+        help="V2-A: legacy ClassCrossAttentionAdapter. "
+        "V2-C: beta/FiLM class-strength residual adapter (class_patch only).",
+    )
+    parser.add_argument("--adapter_hidden_dim", type=int, default=128,
+                        help="Hidden width of the V2-C residual MLP.")
+    parser.add_argument("--adapter_beta_init", type=float, default=0.15,
+                        help="Initial beta_c value for the V2-C adapter.")
+    parser.add_argument("--fusion_lr", type=float, default=None,
+                        help="Optional separate optimizer LR for all fusion params "
+                        "(default: same as --lr).")
+    parser.add_argument(
+        "--fusion_topk_recall_probe_interval",
+        type=int,
+        default=0,
+        help="Every N optimizer steps, estimate Top-K recall vs exact dynamic NN "
+        "on a small sample. 0 disables (very expensive).",
+    )
+    parser.add_argument("--fusion_topk_recall_sample_size", type=int, default=32,
+                        help="Queries per class sampled for the Top-K recall probe.")
 
     return parser.parse_args()
 
@@ -938,6 +1229,9 @@ def train_one_epoch(
         )
         if fusion_runtime is not None:
             fusion_runtime.maybe_probe_stale(raw_features, class_idx, iteration)
+            maybe_topk_probe = getattr(fusion_runtime, "maybe_probe_topk_recall", None)
+            if callable(maybe_topk_probe):
+                maybe_topk_probe(raw_features, class_idx, iteration)
         # Largest per-step buffer (~B*P*L*C, e.g. ~400 MB for 16x784x8x1024).
         # It is no longer needed once the residual is built; release it before
         # the adapter/MoE forwards to lower peak memory.  When residual mode
@@ -1300,6 +1594,24 @@ def main():
     ))
 
     fusion_enabled = args.fusion_mode != "fixed_mean"
+    if args.feature_adapter_mode == "class_residual" and args.fusion_mode != "class_patch":
+        raise ValueError(
+            "--feature_adapter_mode class_residual requires --fusion_mode class_patch "
+            "(V2-C)."
+        )
+    if args.fusion_mode == "class_patch":
+        if int(args.fusion_topk) < 1:
+            raise ValueError("--fusion_topk must be >= 1.")
+        if int(args.fusion_query_chunk) < 1 or int(args.fusion_candidate_chunk) < 1:
+            raise ValueError("fusion rerank chunk sizes must be >= 1.")
+        if int(args.gate_embedding_dim) < 1 or int(args.gate_hidden_dim) < 1:
+            raise ValueError("gate embedding/hidden dims must be >= 1.")
+        if float(args.gate_lambda_init) < 0:
+            raise ValueError("--gate_lambda_init must be >= 0.")
+        if int(args.adapter_hidden_dim) < 1:
+            raise ValueError("--adapter_hidden_dim must be >= 1.")
+        if not 0.0 < float(args.adapter_beta_init) < 1.0:
+            raise ValueError("--adapter_beta_init must be in (0, 1).")
     resume_path = (args.resume or "").strip()
     resume_meta = None
     if resume_path:
@@ -1345,6 +1657,14 @@ def main():
             f"refresh={args.reference_refresh_unit}/{args.reference_refresh_interval} | "
             f"raw storage={args.reference_storage_dtype}"
         )
+        if args.fusion_mode == "class_patch":
+            print(
+                f"[Fusion V2] adapter={args.feature_adapter_mode} | "
+                f"topk={args.fusion_topk} | chunks={args.fusion_query_chunk}x"
+                f"{args.fusion_candidate_chunk} | gate d={args.gate_hidden_dim} "
+                f"e={args.gate_embedding_dim} lambda0={args.gate_lambda_init} "
+                f"norm={args.gate_norm} context={args.gate_use_context}"
+            )
     else:
         if args.fusion_layers is not None:
             warnings.warn("--fusion_layers is ignored when --fusion_mode fixed_mean.")
@@ -1522,15 +1842,34 @@ def main():
                     "candidate layers were requested."
                 )
 
-            fusion = ClassConditionedLayerFusion(
-                num_classes=len(class_names),
-                num_layers=num_layers,
-                feature_dim=feature_dim,
-                temperature=args.fusion_temperature,
-                norm_type=args.fusion_norm,
-                norm_affine=args.fusion_norm_affine,
-                shared_weights=bool(args.fusion_mode == "learned_shared"),
-            ).to(device)
+            if args.fusion_mode == "class_patch":
+                fusion = ClassPatchFusionAdapter(
+                    num_classes=len(class_names),
+                    num_layers=num_layers,
+                    feature_dim=feature_dim,
+                    temperature=args.fusion_temperature,
+                    norm_type=args.fusion_norm,
+                    norm_affine=args.fusion_norm_affine,
+                    class_embedding_dim=args.gate_embedding_dim,
+                    gate_hidden_dim=args.gate_hidden_dim,
+                    gate_norm=args.gate_norm,
+                    gate_lambda_init=args.gate_lambda_init,
+                    gate_use_context=args.gate_use_context,
+                    gate_demean_delta=args.gate_demean_delta,
+                    enable_adapter=(args.feature_adapter_mode == "class_residual"),
+                    adapter_hidden_dim=args.adapter_hidden_dim,
+                    adapter_beta_init=args.adapter_beta_init,
+                ).to(device)
+            else:
+                fusion = ClassConditionedLayerFusion(
+                    num_classes=len(class_names),
+                    num_layers=num_layers,
+                    feature_dim=feature_dim,
+                    temperature=args.fusion_temperature,
+                    norm_type=args.fusion_norm,
+                    norm_affine=args.fusion_norm_affine,
+                    shared_weights=bool(args.fusion_mode == "learned_shared"),
+                ).to(device)
 
             fusion_cache = common_utils.FusedReferenceCache(
                 raw_reference_memory_by_class,
@@ -1545,9 +1884,14 @@ def main():
                 fuse_chunk_size=int(args.fusion_ref_chunk),
             )
             fusion_cache.refresh(step=0, epoch=0)
-            fusion_runtime = LayerFusionRuntime(
-                fusion, fusion_cache, candidate_layers, args
-            )
+            if args.fusion_mode == "class_patch":
+                fusion_runtime = ClassPatchFusionRuntime(
+                    fusion, fusion_cache, candidate_layers, args
+                )
+            else:
+                fusion_runtime = LayerFusionRuntime(
+                    fusion, fusion_cache, candidate_layers, args
+                )
             fusion_config = _build_fusion_config(
                 args, class_names, candidate_layers, feature_dim
             )
@@ -1613,7 +1957,12 @@ def main():
         moe_hard_class_gate=args.moe_hard_class_gate,
         num_classes=len(class_names),
         class_conditioned_adapter=True,
+        feature_adapter_mode=args.feature_adapter_mode,
     ).to(device)
+    if args.feature_adapter_mode == "class_residual":
+        # Non-owning pointer: fusion params stay registered once and are
+        # optimized through the fusion parameter list below.
+        localnet.set_feature_transform_adapter(fusion)
     if args.use_moe_discriminator:
         discriminator = getattr(localnet, "discriminator", None)
         if discriminator is not None and hasattr(discriminator, "enable_gate_stats"):
@@ -1622,11 +1971,28 @@ def main():
     # optimizer parameter order (and therefore Adam/RMSprop state loading on
     # resume) stays deterministic and identical to the legacy layout when
     # fusion is disabled.
-    trainable_params = list(localnet.parameters())
-    if fusion is not None:
-        trainable_params += list(fusion.parameters())
-    localnet_optimizer = optim.RMSprop(trainable_params, lr=args.lr, momentum=0.2)
-    onetoone_optimizer = optim.Adam(trainable_params, lr=args.lr) if args.alternative else None
+    localnet_params = list(localnet.parameters())
+    fusion_params = list(fusion.parameters()) if fusion is not None else []
+    trainable_params = localnet_params + fusion_params
+    def build_param_groups():
+        # Fresh dicts per optimizer: add_param_group stores the dict object
+        # itself, so sharing one list would make RMSprop and Adam alias the
+        # same groups.
+        if args.fusion_lr is not None and fusion_params:
+            return [
+                {"params": localnet_params, "lr": float(args.lr)},
+                {"params": fusion_params, "lr": float(args.fusion_lr)},
+            ]
+        return [{"params": trainable_params, "lr": float(args.lr)}]
+
+    if args.fusion_lr is not None and float(args.fusion_lr) <= 0:
+        raise ValueError("--fusion_lr must be > 0.")
+    localnet_optimizer = optim.RMSprop(
+        build_param_groups(), lr=args.lr, momentum=0.2
+    )
+    onetoone_optimizer = (
+        optim.Adam(build_param_groups(), lr=args.lr) if args.alternative else None
+    )
     localnet_criterion = nn.BCELoss().to(device)
     l_loss = get_oto_loss(args)
 
@@ -1652,6 +2018,13 @@ def main():
             + "_layers_"
             + "-".join(str(v) for v in candidate_layers)
         )
+        if args.fusion_mode == "class_patch":
+            run_name += (
+                "_adapter_"
+                + str(args.feature_adapter_mode)
+                + "_topk_"
+                + str(args.fusion_topk)
+            )
     moe_expert_vis_ctx = {
         "enabled": bool(args.moe_expert_vis_enable),
         "save_interval": max(1, int(args.moe_expert_vis_interval)),

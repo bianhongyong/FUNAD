@@ -33,6 +33,7 @@ from dataset.feature_extract import (
     infer_dinov3_multilayer_num_patches,
 )
 from src.model import model
+from src.model.class_patch_fusion_adapter import ClassPatchFusionAdapter
 from src.model.layer_fusion import ClassConditionedLayerFusion
 import utils.train_utils as common_utils
 from utils.evaluate import _cv2_resize_dsize_from_mask
@@ -310,10 +311,26 @@ def validate_fusion_inference_config(fusion_cfg: dict, args, all_class_names):
             + "\n  - ".join(errors)
         )
 
-    if fusion_cfg.get("fusion_mode") not in ("learned_class", "learned_shared"):
+    if fusion_cfg.get("fusion_mode") not in (
+        "learned_class", "learned_shared", "class_patch"
+    ):
         raise RuntimeError(
             f"未知 fusion_mode: {fusion_cfg.get('fusion_mode')!r}"
         )
+    if fusion_cfg.get("fusion_mode") == "class_patch":
+        if int(fusion_cfg.get("schema_version", 0)) < 2:
+            raise RuntimeError(
+                "class_patch fusion checkpoint 的 schema_version 必须 >= 2。"
+            )
+        if int(fusion_cfg.get("fusion_topk", 0)) < 1:
+            raise RuntimeError("class_patch fusion_config 缺少有效的 fusion_topk。")
+        if str(fusion_cfg.get("feature_adapter_mode", "legacy")) not in (
+            "legacy", "class_residual"
+        ):
+            raise RuntimeError(
+                "未知 feature_adapter_mode: "
+                f"{fusion_cfg.get('feature_adapter_mode')!r}"
+            )
     return expected_layers
 
 
@@ -852,6 +869,11 @@ def main():
         print(f"[model]   moe: num_expert={moe_num_expert}, top_k={moe_top_k}, "
               f"hard_class_gate={moe_hard_class_gate}")
 
+    feature_adapter_mode = "legacy"
+    if learned_fusion and fusion_cfg.get("fusion_mode") == "class_patch":
+        feature_adapter_mode = str(
+            fusion_cfg.get("feature_adapter_mode", "legacy")
+        )
     localnet = model.localnet(
         len_feature=feature_dim,
         use_moe_discriminator=use_moe,
@@ -859,8 +881,9 @@ def main():
         moe_top_k=moe_top_k,
         moe_use_cls_token=args.moe_use_cls_token,
         moe_hard_class_gate=moe_hard_class_gate,
-        num_classes=len(all_class_names) if has_class_adapter else None,
+        num_classes=len(all_class_names) if (has_class_adapter or feature_adapter_mode == "class_residual") else None,
         class_conditioned_adapter=has_class_adapter,
+        feature_adapter_mode=feature_adapter_mode,
     ).to(device)
     localnet.load_state_dict(checkpoint["net"], strict=True)
     localnet.eval()
@@ -877,20 +900,44 @@ def main():
         )
         validate_raw_bank_metadata(raw_meta, fusion_cfg, raw_bank)
 
-        fusion = ClassConditionedLayerFusion(
-            num_classes=int(fusion_cfg["num_classes"]),
-            num_layers=int(fusion_cfg["num_layers"]),
-            feature_dim=int(fusion_cfg["feature_dim"]),
-            temperature=float(fusion_cfg.get("temperature", 1.0)),
-            norm_type=str(fusion_cfg.get("norm_type", "none")),
-            norm_affine=bool(fusion_cfg.get("norm_affine", False)),
-            shared_weights=bool(
-                fusion_cfg.get("shared_weights")
-                or fusion_cfg.get("fusion_mode") == "learned_shared"
-            ),
-        ).to(device)
+        if fusion_cfg.get("fusion_mode") == "class_patch":
+            fusion = ClassPatchFusionAdapter(
+                num_classes=int(fusion_cfg["num_classes"]),
+                num_layers=int(fusion_cfg["num_layers"]),
+                feature_dim=int(fusion_cfg["feature_dim"]),
+                temperature=float(fusion_cfg.get("temperature", 1.0)),
+                norm_type=str(fusion_cfg.get("norm_type", "none")),
+                norm_affine=bool(fusion_cfg.get("norm_affine", False)),
+                class_embedding_dim=int(fusion_cfg.get("gate_embedding_dim", 32)),
+                gate_hidden_dim=int(fusion_cfg.get("gate_hidden_dim", 64)),
+                gate_norm=str(fusion_cfg.get("gate_norm", "layer_norm")),
+                gate_lambda_init=float(fusion_cfg.get("gate_lambda_init", 0.1)),
+                gate_use_context=bool(fusion_cfg.get("gate_use_context", False)),
+                gate_demean_delta=bool(fusion_cfg.get("gate_demean_delta", True)),
+                enable_adapter=(
+                    str(fusion_cfg.get("feature_adapter_mode", "legacy"))
+                    == "class_residual"
+                ),
+                adapter_hidden_dim=int(fusion_cfg.get("adapter_hidden_dim", 128)),
+                adapter_beta_init=float(fusion_cfg.get("adapter_beta_init", 0.15)),
+            ).to(device)
+        else:
+            fusion = ClassConditionedLayerFusion(
+                num_classes=int(fusion_cfg["num_classes"]),
+                num_layers=int(fusion_cfg["num_layers"]),
+                feature_dim=int(fusion_cfg["feature_dim"]),
+                temperature=float(fusion_cfg.get("temperature", 1.0)),
+                norm_type=str(fusion_cfg.get("norm_type", "none")),
+                norm_affine=bool(fusion_cfg.get("norm_affine", False)),
+                shared_weights=bool(
+                    fusion_cfg.get("shared_weights")
+                    or fusion_cfg.get("fusion_mode") == "learned_shared"
+                ),
+            ).to(device)
         fusion.load_state_dict(checkpoint["fusion_state"], strict=True)
         fusion.eval()
+        if feature_adapter_mode == "class_residual":
+            localnet.set_feature_transform_adapter(fusion)
 
         fusion_cache = common_utils.FusedReferenceCache(
             raw_bank,
@@ -973,12 +1020,29 @@ def main():
                         use_cls_token=args.use_cls_token,
                         return_cls_token=True,
                     )
-                    model_features = common_utils.compute_fused_residual_batch(
-                        raw_multilayer,
-                        class_idx_batch,
-                        fusion_cache,
-                        fusion,
-                    )
+                    if fusion_cfg.get("fusion_mode") == "class_patch":
+                        model_features = (
+                            common_utils.compute_class_patch_fused_residual_batch(
+                                raw_multilayer,
+                                class_idx_batch,
+                                fusion_cache,
+                                fusion,
+                                topk=int(fusion_cfg.get("fusion_topk", 32)),
+                                query_chunk_size=int(
+                                    fusion_cfg.get("fusion_query_chunk", 256)
+                                ),
+                                candidate_chunk_size=int(
+                                    fusion_cfg.get("fusion_candidate_chunk", 8)
+                                ),
+                            )
+                        )
+                    else:
+                        model_features = common_utils.compute_fused_residual_batch(
+                            raw_multilayer,
+                            class_idx_batch,
+                            fusion_cache,
+                            fusion,
+                        )
                 else:
                     features, cls_token = extract_feature_batch(
                         images, feature_extractor, args, return_cls_token=True,

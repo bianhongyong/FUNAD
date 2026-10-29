@@ -950,11 +950,91 @@ class FusedReferenceCache:
         Returns:
             ``[B, P]`` long tensor on the query device.
         """
+        return self.nearest_topk_ids(fused_query, class_idx_batch, k=1).squeeze(-1)
+
+    def _chunked_topk_ids(
+        self,
+        query: torch.Tensor,
+        ref: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Exact Top-K L2 ids over ``ref`` with global cross-chunk maintenance."""
+        if ref.shape[0] == 0:
+            raise RuntimeError("Cannot search an empty reference bank.")
+        k = int(k)
+        if k < 1:
+            raise ValueError("k must be >= 1")
+        if k > ref.shape[0]:
+            raise ValueError(
+                f"k={k} exceeds the reference bank size {ref.shape[0]}."
+            )
+        query = query.detach().to(dtype=torch.float32)
+        ref = ref.detach().to(dtype=torch.float32)
+        total = query.shape[0]
+        out = torch.empty(total, k, dtype=torch.long, device=query.device)
+        ref_chunk = max(1, self.ref_chunk_size)
+        query_chunk = max(1, self.query_chunk_size)
+
+        for q_start in range(0, total, query_chunk):
+            q = query[q_start:q_start + query_chunk]
+            best_dist = torch.full(
+                (q.shape[0], k), float("inf"), device=q.device
+            )
+            best_idx = torch.zeros(
+                (q.shape[0], k), dtype=torch.long, device=q.device
+            )
+            for r_start in range(0, ref.shape[0], ref_chunk):
+                r = ref[r_start:r_start + ref_chunk]
+                dist = torch.cdist(q, r, p=2.0)
+                cand_k = min(k, r.shape[0])
+                cand_dist, cand_idx = torch.topk(
+                    dist, k=cand_k, dim=1, largest=False, sorted=False
+                )
+                cand_idx = cand_idx + r_start
+                merged_dist = torch.cat([best_dist, cand_dist], dim=1)
+                merged_idx = torch.cat([best_idx, cand_idx], dim=1)
+                # ``k`` may exceed a single ref chunk; keep the running set
+                # padded to exactly k entries until enough rows have been seen.
+                take = min(k, merged_dist.shape[1])
+                sel_dist, pick = torch.topk(
+                    merged_dist, k=take, dim=1, largest=False, sorted=True
+                )
+                best_dist = torch.full(
+                    (q.shape[0], k), float("inf"), device=q.device
+                )
+                best_idx = torch.zeros(
+                    (q.shape[0], k), dtype=torch.long, device=q.device
+                )
+                best_dist[:, :take] = sel_dist
+                best_idx[:, :take] = merged_idx.gather(1, pick)
+            out[q_start:q_start + q.shape[0]] = best_idx
+        return out
+
+    def nearest_topk_ids(
+        self,
+        fused_query: torch.Tensor,
+        class_idx_batch: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Top-K coarse ids against the cached class-prior fused bank.
+
+        Args:
+            fused_query: ``[B, P, C]`` or ``[M, C]``.
+            class_idx_batch: ``[B]`` (or ``[1]``/empty for 2D input).
+            k: number of candidates.  Clamped to the smallest class bank size
+                present in the batch so mixed-class batches keep one K axis.
+        Returns:
+            ``[B, P, K]`` long tensor (``[M, K]`` for 2D input).
+        """
         squeeze = fused_query.dim() == 2
         if squeeze:
             fused_query = fused_query.unsqueeze(0)
         if fused_query.dim() != 3:
             raise ValueError(f"Expected fused_query [B,P,C], got {tuple(fused_query.shape)}")
+
+        k = int(k)
+        if k < 1:
+            raise ValueError("k must be >= 1")
 
         batch, patches, dim = fused_query.shape
         if dim != self.feature_dim:
@@ -971,26 +1051,46 @@ class FusedReferenceCache:
                 f"class_idx has {class_idx_batch.numel()} entries for batch {batch}."
             )
 
+        classes = [int(c.item()) for c in torch.unique(class_idx_batch)]
+        for cls in classes:
+            if cls not in self.fused_by_class:
+                raise KeyError(f"class {cls} has no fused reference cache.")
+
+        effective_k = k
+        for cls in classes:
+            bank_size = int(self.fused_by_class[cls].shape[0])
+            if bank_size == 0:
+                raise RuntimeError(f"class {cls} has an empty fused reference cache.")
+            effective_k = min(effective_k, bank_size)
+        if effective_k < k:
+            warnings.warn(
+                f"Top-K clamped from {k} to {effective_k} because a class bank "
+                "in this batch is smaller."
+            )
+
         out = torch.empty(
-            (batch, patches), dtype=torch.long, device=fused_query.device
+            (batch, patches, effective_k),
+            dtype=torch.long,
+            device=fused_query.device,
         )
         for cls_tensor in torch.unique(class_idx_batch):
             cls = int(cls_tensor.item())
-            if cls not in self.fused_by_class:
-                raise KeyError(f"class {cls} has no fused reference cache.")
             mask = class_idx_batch == cls_tensor
             queries = fused_query[mask].reshape(-1, dim).detach().to(dtype=torch.float32)
 
             if self.use_faiss and cls in self.index_by_class:
                 q_np = np.ascontiguousarray(queries.cpu().numpy())
-                _, ids_np = self.index_by_class[cls].search(q_np, k=1)
+                _, ids_np = self.index_by_class[cls].search(q_np, k=effective_k)
+                ids_np = np.where(ids_np < 0, 0, ids_np)
                 ids = torch.as_tensor(
-                    ids_np.reshape(-1), dtype=torch.long, device=fused_query.device
+                    ids_np, dtype=torch.long, device=fused_query.device
                 )
             else:
-                ids = self._chunked_nearest_ids(queries, self.fused_by_class[cls])
+                ids = self._chunked_topk_ids(
+                    queries, self.fused_by_class[cls], effective_k
+                )
 
-            out[mask] = ids.reshape(-1, patches)
+            out[mask] = ids.reshape(-1, patches, effective_k)
 
         return out.squeeze(0) if squeeze else out
 
@@ -1098,6 +1198,322 @@ def compute_fused_residual_batch(
     if return_neighbor_ids:
         return residual, neighbor_ids
     return residual
+
+
+def _validate_class_patch_inputs(raw_query, class_idx_batch, fusion_cache, fusion):
+    if raw_query.dim() != 4:
+        raise ValueError(f"Expected raw_query [B,P,L,C], got {tuple(raw_query.shape)}")
+    if raw_query.shape[-2] != fusion_cache.num_layers:
+        raise ValueError(
+            f"raw_query has {raw_query.shape[-2]} layers, cache expects "
+            f"{fusion_cache.num_layers}."
+        )
+    if raw_query.shape[-1] != fusion_cache.feature_dim:
+        raise ValueError(
+            f"raw_query has feature_dim={raw_query.shape[-1]}, cache expects "
+            f"{fusion_cache.feature_dim}."
+        )
+    for name in ("patch_weights", "global_weights", "fuse_query"):
+        if not callable(getattr(fusion, name, None)):
+            raise TypeError(
+                f"class_patch fusion requires a module with {name}(); "
+                f"got {type(fusion).__name__}."
+            )
+
+    batch = raw_query.shape[0]
+    class_idx_batch = torch.as_tensor(
+        class_idx_batch, dtype=torch.long, device=raw_query.device
+    ).reshape(-1)
+    if class_idx_batch.numel() == 1 and batch > 1:
+        class_idx_batch = class_idx_batch.expand(batch)
+    if class_idx_batch.numel() != batch:
+        raise ValueError(
+            f"class_idx has {class_idx_batch.numel()} entries for batch {batch}."
+        )
+    return class_idx_batch
+
+
+def compute_class_patch_fused_residual_batch(
+    raw_query,
+    class_idx_batch,
+    fusion_cache: FusedReferenceCache,
+    fusion,
+    topk: int = 32,
+    query_chunk_size: Optional[int] = None,
+    candidate_chunk_size: Optional[int] = None,
+    return_neighbor_ids: bool = False,
+    return_diagnostics: bool = False,
+):
+    """Coarse class-prior Top-K -> query-conditioned rerank -> fused residual.
+
+    Two-stage matching (one selected reference per query patch):
+
+    1. Fuse the query with ``alpha^G_c`` and search the cached class-prior
+       fused bank for K candidate ids.  Ids are discrete and detached.
+    2. Rerank the K candidates with the **same per-patch** ``alpha_{c,p}`` for
+       both the query and each candidate reference, then re-fuse the selected
+       raw reference with that same alpha to build the residual.  Gradients
+       therefore reach ``theta``, the patch gate and the selected-reference
+       alpha path on both sides.
+
+    Args:
+        raw_query: ``[B, P, L, C]`` frozen-backbone features.
+        class_idx_batch: ``[B]``.
+        fusion_cache: ``FusedReferenceCache`` (refreshed with the current
+            class prior).
+        fusion: ``ClassPatchFusionAdapter`` instance (same as cache.fusion).
+        topk: candidate count K (clamped by the cache to each class bank size).
+        query_chunk_size: patches per rerank chunk.
+        candidate_chunk_size: K candidates per rerank chunk.
+        return_neighbor_ids: also return ``[B, P]`` selected ids.
+        return_diagnostics: also return a dict with the patch alpha, coarse ids
+            and rerank switch information (all detached).
+
+    Returns:
+        ``[B, P, C]`` residual; plus ids and/or diagnostics when requested.
+    """
+    if raw_query.dim() != 4:
+        raise ValueError(f"Expected raw_query [B,P,L,C], got {tuple(raw_query.shape)}")
+    class_idx_batch = _validate_class_patch_inputs(
+        raw_query, class_idx_batch, fusion_cache, fusion
+    )
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError("topk must be >= 1")
+
+    batch, patches, layers, dim = raw_query.shape
+    q_chunk = int(query_chunk_size or fusion_cache.query_chunk_size)
+    k_chunk = int(candidate_chunk_size or max(1, min(topk, 8)))
+    q_chunk = max(1, q_chunk)
+    k_chunk = max(1, k_chunk)
+
+    # Stage 1: coarse search with the class prior (never part of autograd).
+    with torch.no_grad():
+        global_alpha = fusion.global_weights(class_idx_batch)
+        coarse_query = fusion.fuse_query(raw_query.detach(), global_alpha)
+        coarse_ids = fusion_cache.nearest_topk_ids(
+            coarse_query, class_idx_batch, k=topk
+        )
+    effective_k = int(coarse_ids.shape[-1])
+
+    # Stage 2: one dynamic alpha per query patch (keeps grad).
+    alpha = fusion.patch_weights(raw_query, class_idx_batch)  # [B,P,L]
+    out_dtype = alpha.dtype
+    residual = torch.empty(
+        (batch, patches, dim), dtype=out_dtype, device=raw_query.device
+    )
+    best_ids = torch.empty(
+        (batch, patches), dtype=torch.long, device=raw_query.device
+    )
+
+    for cls_tensor in torch.unique(class_idx_batch):
+        cls = int(cls_tensor.item())
+        cls_mask = class_idx_batch == cls_tensor
+        q_raw = raw_query[cls_mask].reshape(-1, layers, dim)
+        q_alpha = alpha[cls_mask].reshape(-1, layers)
+        q_cand = coarse_ids[cls_mask].reshape(-1, effective_k)
+        num_queries = q_raw.shape[0]
+
+        q_fused = fusion.fuse_query(q_raw, q_alpha)  # [Q,C], keeps grad
+        cls_best_k = torch.empty(num_queries, dtype=torch.long, device=raw_query.device)
+
+        # 2a. rerank: distances use the same alpha as the residual below.
+        with torch.no_grad():
+            for q_start in range(0, num_queries, q_chunk):
+                q_end = min(q_start + q_chunk, num_queries)
+                qf = q_fused[q_start:q_end].detach()
+                a_sub = q_alpha[q_start:q_end].detach()
+                cand = q_cand[q_start:q_end]
+                best_dist = torch.full(
+                    (qf.shape[0],), float("inf"), device=raw_query.device
+                )
+                best_k_local = torch.zeros(
+                    qf.shape[0], dtype=torch.long, device=raw_query.device
+                )
+                for k_start in range(0, effective_k, k_chunk):
+                    k_end = min(k_start + k_chunk, effective_k)
+                    cand_sub = cand[:, k_start:k_end]
+                    width = cand_sub.shape[1]
+                    raw_ref = fusion_cache.raw_rows(cls, cand_sub.reshape(-1))
+                    raw_ref = raw_ref.reshape(qf.shape[0], width, layers, dim)
+                    a_rep = a_sub.unsqueeze(1).expand(-1, width, -1).reshape(
+                        -1, layers
+                    )
+                    ref_fused = fusion.fuse_query(
+                        raw_ref.reshape(-1, layers, dim), a_rep
+                    ).reshape(qf.shape[0], width, dim)
+                    dist = (qf.unsqueeze(1) - ref_fused).pow(2).sum(dim=-1)
+                    min_dist, min_pos = dist.min(dim=1)
+                    better = min_dist < best_dist
+                    best_dist = torch.where(better, min_dist, best_dist)
+                    best_k_local = torch.where(
+                        better, min_pos + k_start, best_k_local
+                    )
+                cls_best_k[q_start:q_end] = cand.gather(
+                    1, best_k_local.unsqueeze(1)
+                ).squeeze(1)
+
+        # 2b. residual with the selected raw rows re-fused under the same alpha.
+        cls_residual = torch.empty(
+            (num_queries, dim), dtype=out_dtype, device=raw_query.device
+        )
+        for q_start in range(0, num_queries, q_chunk):
+            q_end = min(q_start + q_chunk, num_queries)
+            selected = cls_best_k[q_start:q_end]
+            unique_ids, inverse = torch.unique(selected, return_inverse=True)
+            raw_selected = fusion_cache.raw_rows(cls, unique_ids)
+            raw_selected = raw_selected.index_select(0, inverse)
+            selected_fused = fusion.fuse_query(
+                raw_selected, q_alpha[q_start:q_end]
+            )
+            cls_residual[q_start:q_end] = q_fused[q_start:q_end] - selected_fused
+
+        residual[cls_mask] = cls_residual.reshape(-1, patches, dim)
+        best_ids[cls_mask] = cls_best_k.reshape(-1, patches)
+
+    if return_diagnostics or return_neighbor_ids:
+        diagnostics = {
+            "alpha": alpha.detach(),
+            "coarse_ids": coarse_ids.detach(),
+            "best_ids": best_ids.detach(),
+            "class_idx": class_idx_batch.detach(),
+            "topk": effective_k,
+        }
+        if return_neighbor_ids and return_diagnostics:
+            return residual, best_ids, diagnostics
+        if return_neighbor_ids:
+            return residual, best_ids
+        return residual, diagnostics
+    return residual
+
+
+def exact_dynamic_nearest_ids(
+    raw_query,
+    class_idx_batch,
+    fusion_cache: FusedReferenceCache,
+    fusion,
+    query_chunk_size: int = 32,
+    ref_chunk_size: int = 256,
+) -> torch.Tensor:
+    """Brute-force exact NN under each query's own alpha (diagnostics only).
+
+    This is the reference used to quantify Top-K approximation recall.  It is
+    O(Q * N_c) expensive and never used inside the training loop.
+    """
+    class_idx_batch = _validate_class_patch_inputs(
+        raw_query, class_idx_batch, fusion_cache, fusion
+    )
+    batch, patches, layers, dim = raw_query.shape
+    alpha = fusion.patch_weights(raw_query, class_idx_batch).detach()
+    best_ids = torch.empty(
+        (batch, patches), dtype=torch.long, device=raw_query.device
+    )
+    q_chunk = max(1, int(query_chunk_size))
+    r_chunk = max(1, int(ref_chunk_size))
+
+    with torch.no_grad():
+        for cls_tensor in torch.unique(class_idx_batch):
+            cls = int(cls_tensor.item())
+            if cls not in fusion_cache.raw_cpu:
+                raise KeyError(f"class {cls} has no raw reference bank.")
+            cls_mask = class_idx_batch == cls_tensor
+            q_raw = raw_query[cls_mask].reshape(-1, layers, dim)
+            q_alpha = alpha[cls_mask].reshape(-1, layers)
+            num_queries = q_raw.shape[0]
+            raw_bank = fusion_cache.raw_cpu[cls]
+            if raw_bank.shape[0] == 0:
+                raise RuntimeError(f"class {cls} has an empty raw reference bank.")
+            cls_best = torch.empty(
+                num_queries, dtype=torch.long, device=raw_query.device
+            )
+            for q_start in range(0, num_queries, q_chunk):
+                q_end = min(q_start + q_chunk, num_queries)
+                qf = fusion.fuse_query(
+                    q_raw[q_start:q_end], q_alpha[q_start:q_end]
+                )
+                best_dist = torch.full(
+                    (qf.shape[0],), float("inf"), device=raw_query.device
+                )
+                best_idx = torch.zeros(
+                    qf.shape[0], dtype=torch.long, device=raw_query.device
+                )
+                for r_start in range(0, raw_bank.shape[0], r_chunk):
+                    raw_ref = raw_bank[r_start:r_start + r_chunk].to(
+                        device=raw_query.device, dtype=torch.float32
+                    )
+                    ref_norm = fusion.norm(raw_ref)
+                    ref_fused = torch.einsum(
+                        "ql,rlc->qrc",
+                        q_alpha[q_start:q_end].to(ref_norm.dtype),
+                        ref_norm,
+                    )
+                    dist = (qf.unsqueeze(1) - ref_fused).pow(2).sum(dim=-1)
+                    min_dist, min_pos = dist.min(dim=1)
+                    better = min_dist < best_dist
+                    best_dist = torch.where(better, min_dist, best_dist)
+                    best_idx = torch.where(better, min_pos + r_start, best_idx)
+                cls_best[q_start:q_end] = best_idx
+            best_ids[cls_mask] = cls_best.reshape(-1, patches)
+    return best_ids
+
+
+def topk_recall_vs_exact(
+    raw_query,
+    class_idx_batch,
+    fusion_cache: FusedReferenceCache,
+    fusion,
+    topk: int,
+    sample_size: int = 64,
+    query_chunk_size: int = 32,
+    ref_chunk_size: int = 256,
+) -> dict:
+    """Measure ``recall@K = mean[j_exact in N_K(c,p)]`` on sampled queries."""
+    topk = int(topk)
+    if topk < 1:
+        raise ValueError("topk must be >= 1")
+    sample_size = max(1, int(sample_size))
+    class_idx_batch = _validate_class_patch_inputs(
+        raw_query, class_idx_batch, fusion_cache, fusion
+    )
+    batch, patches, layers, dim = raw_query.shape
+
+    with torch.no_grad():
+        global_alpha = fusion.global_weights(class_idx_batch)
+        coarse_query = fusion.fuse_query(raw_query.detach(), global_alpha)
+        coarse_ids = fusion_cache.nearest_topk_ids(
+            coarse_query, class_idx_batch, k=topk
+        )
+        exact_ids = exact_dynamic_nearest_ids(
+            raw_query,
+            class_idx_batch,
+            fusion_cache,
+            fusion,
+            query_chunk_size=query_chunk_size,
+            ref_chunk_size=ref_chunk_size,
+        )
+
+        total = 0
+        hits = 0
+        for cls_tensor in torch.unique(class_idx_batch):
+            mask = class_idx_batch == cls_tensor
+            cls_coarse = coarse_ids[mask].reshape(-1, coarse_ids.shape[-1])
+            cls_exact = exact_ids[mask].reshape(-1)
+            count = cls_exact.numel()
+            if count == 0:
+                continue
+            if count > sample_size:
+                positions = torch.linspace(
+                    0, count - 1, steps=sample_size, device=cls_exact.device
+                ).round().long()
+            else:
+                positions = torch.arange(count, device=cls_exact.device)
+            sampled_exact = cls_exact.index_select(0, positions)
+            sampled_coarse = cls_coarse.index_select(0, positions)
+            hits += int((sampled_coarse == sampled_exact.unsqueeze(1)).any(dim=1).sum())
+            total += int(sampled_exact.numel())
+
+    recall = float(hits) / float(total) if total else 0.0
+    return {"recall": recall, "num_samples": total, "topk": int(coarse_ids.shape[-1])}
 
 
 # ---------------------------------------------------------------------------
