@@ -54,7 +54,7 @@
 
    - 新文件建议：src/model/layer_fusion.py。
    - 接口 forward(x: [B,P,L,C], class_idx: [B]) -> [B,P,C]，亦支持参考库 [N,L,C] 与单一类别 c。
-   - 参数 theta[num_classes,L]，softmax(theta/tau)，可选无仿射 LayerNorm；确保优化器更新。
+   - 参数 theta[num_classes,L]，softmax(theta/tau)，默认 no_norm（无仿射 LayerNorm 仅作可选消融）；确保优化器更新。
    - Test：theta 全 0 且关闭新归一化时，输出与 candidate layers mean 相同；不同类别权重可不同；梯度有限非零。
 3. **构建原始多层参考库**
 

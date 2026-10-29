@@ -882,7 +882,7 @@ def main():
             num_layers=int(fusion_cfg["num_layers"]),
             feature_dim=int(fusion_cfg["feature_dim"]),
             temperature=float(fusion_cfg.get("temperature", 1.0)),
-            norm_type=str(fusion_cfg.get("norm_type", "layer_norm")),
+            norm_type=str(fusion_cfg.get("norm_type", "none")),
             norm_affine=bool(fusion_cfg.get("norm_affine", False)),
             shared_weights=bool(
                 fusion_cfg.get("shared_weights")

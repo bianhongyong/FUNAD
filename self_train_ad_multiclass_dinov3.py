@@ -428,7 +428,7 @@ def parse_args():
                         help="Default k multiplier for MAD threshold. "
                         "Larger k means stricter normal definition. "
                         "Can be overridden per-class via --mad_k_per_class.")
-    parser.add_argument("--mad_k_per_class", type=str, default="screw:10.0",
+    parser.add_argument("--mad_k_per_class", type=str, default="",
                         help="Per-class k overrides, e.g. 'bottle:4.0,cable:6.0'. "
                         "Classes not listed fall back to --mad_k.")
     parser.add_argument(
@@ -654,8 +654,8 @@ def parse_args():
         "--fusion_norm",
         type=str,
         choices=["layer_norm", "none"],
-        default="layer_norm",
-        help="Per-layer normalization before weighting.",
+        default="none",
+        help="Per-layer normalization before weighting (default: none).",
     )
     parser.add_argument("--fusion_norm_affine", type=str2bool, default="False",
                         help="Use affine parameters in the per-layer LayerNorm.")

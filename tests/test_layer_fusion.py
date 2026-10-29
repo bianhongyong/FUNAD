@@ -106,8 +106,9 @@ class FusionModuleTest(unittest.TestCase):
         torch.manual_seed(0)
         x = torch.randn(2, 5, 4, 7)
         fusion = ClassConditionedLayerFusion(
-            num_classes=2, num_layers=4, feature_dim=7, norm_type="none"
+            num_classes=2, num_layers=4, feature_dim=7
         )
+        self.assertEqual(fusion.norm_type, "none")
         class_idx = torch.tensor([0, 1])
         out = fusion(x, class_idx)
         self.assertEqual(tuple(out.shape), (2, 5, 7))

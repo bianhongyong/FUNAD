@@ -20,7 +20,7 @@ class ClassConditionedLayerFusion(nn.Module):
         feature_dim: C, per-layer feature dimension (used only by the optional
             LayerNorm).
         temperature: softmax temperature tau; must be > 0.
-        norm_type: ``"layer_norm"`` (default) or ``"none"``.
+        norm_type: ``"none"`` (default) or ``"layer_norm"``.
         norm_affine: affine flag for LayerNorm.  Default False so the norm adds
             no per-layer trainable transform that could mask the weights.
         shared_weights: if True, all classes share one weight vector (E1
@@ -33,7 +33,7 @@ class ClassConditionedLayerFusion(nn.Module):
         num_layers: int,
         feature_dim: int,
         temperature: float = 1.0,
-        norm_type: str = "layer_norm",
+        norm_type: str = "none",
         norm_affine: bool = False,
         shared_weights: bool = False,
     ):

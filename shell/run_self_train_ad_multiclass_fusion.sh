@@ -17,7 +17,7 @@ export MPLBACKEND=Agg
 # ===== User-configurable =====
 NOISE="${NOISE:-10%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
 DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10}"
-SAVE_PATH="${SAVE_PATH:-/media/honeywell/E/bhy/FUNAD/save_results/codex_fusion}"
+SAVE_PATH="${SAVE_PATH:-/media/honeywell/E/bhy/FUNAD/save_results/codex_fusion_screw_mad_4}"
 DATASET="${DATASET:-mvtec}"   # mvtec | visa
 EPOCH="${EPOCH:-20}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
@@ -44,7 +44,7 @@ REFERENCE_STORAGE_DTYPE="${REFERENCE_STORAGE_DTYPE:-float16}"
 FUSION_ARGS=(
   --fusion_mode "$FUSION_MODE"
   --fusion_temperature "${FUSION_TEMPERATURE:-1.0}"
-  --fusion_norm "${FUSION_NORM:-layer_norm}"
+  --fusion_norm "${FUSION_NORM:-none}"
   --reference_refresh_unit "$REFRESH_UNIT"
   --reference_refresh_interval "$REFRESH_INTERVAL"
   --reference_storage_dtype "$REFERENCE_STORAGE_DTYPE"
