@@ -825,7 +825,16 @@ def parse_args():
     )
     parser.add_argument("--kl", action="store_true")
     parser.add_argument("--beta", action="store_true")
-    parser.add_argument("--gaussian", action="store_false")
+    parser.add_argument(
+        "--gaussian",
+        action="store_false",
+        help=(
+            "Pass this flag to DISABLE the Gaussian feature-noise branch "
+            "(it is on by default). When disabled, patches inside the uncertain "
+            "band (threshold < distance < noise_threshold) are discarded from "
+            "BCE/OTO supervision instead of being labelled anomaly."
+        ),
+    )
     parser.add_argument("--synthetic", action="store_true")
     parser.add_argument("--hist", action="store_true")
     parser.add_argument(
@@ -1379,6 +1388,7 @@ def train_one_epoch(
     pseudo_normal_total = 0
     pseudo_anomaly_correct = 0
     pseudo_anomaly_total = 0
+    pseudo_ignored_total = 0
 
     distance_map = None
     confident_feature_bank = None
@@ -1483,6 +1493,18 @@ def train_one_epoch(
                     default_threshold=threshold,
                     quantile=args.adaptive_threshold_quantile,
                 )
+        # With Gaussian augmentation disabled, the uncertain band has no
+        # usable pseudo label: those patches are excluded from training
+        # instead of being hard-labelled as anomalies.
+        keep_patch_np = None
+        if use_pseudo_label and not args.gaussian:
+            keep_patch_np = np.logical_not(
+                common_utils.build_uncertain_patch_mask(
+                    distance=distance,
+                    threshold_map=threshold_map,
+                    noise_threshold=args.noise_threshold,
+                )
+            )
         x_perturbed = None
         if use_pseudo_label and args.gaussian:
             # Keep x on the autograd graph: only the sampled noise is detached.
@@ -1532,6 +1554,20 @@ def train_one_epoch(
                     distance > threshold_map, dtype=torch.bool
                 )
                 local_label[distance_mask] = 1
+        loss_mask = None
+        if keep_patch_np is not None:
+            # Beta mode appends a synthetic-anomaly row, which is always kept.
+            extra_rows = int(local_label.shape[0]) - int(keep_patch_np.shape[0])
+            if extra_rows > 0:
+                keep_patch_np = np.concatenate(
+                    [
+                        keep_patch_np,
+                        np.ones((extra_rows, keep_patch_np.shape[1]), dtype=bool),
+                    ],
+                    axis=0,
+                )
+            loss_mask = torch.as_tensor(keep_patch_np, dtype=torch.bool)
+            pseudo_ignored_total += int((~loss_mask).sum().item())
         pseudo_label_time += time.perf_counter() - pseudo_label_assign_start
 
         localnet.train()
@@ -1541,6 +1577,8 @@ def train_one_epoch(
 
         x = x.to(device, non_blocking=True)
         local_label = local_label.to(device, non_blocking=True)
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(device, non_blocking=True)
 
         gate_cls_token = cls_token if cls_token.shape[0] == x.shape[0] else None
         patch_class_idx = None
@@ -1611,18 +1649,32 @@ def train_one_epoch(
             )
             pred_for_loss = gaussian_pred
             
-        if args.balancing:
+        if loss_mask is not None:
+            pred_bce = pred_for_loss[loss_mask]
+            target_bce = local_label[loss_mask]
+        else:
+            pred_bce = pred_for_loss
+            target_bce = local_label
+        if pred_bce.numel() == 0:
+            # Degenerate batch (everything fell inside the discarded band):
+            # keep a zero-valued, graph-connected loss so backward is a no-op.
+            _loss = pred_for_loss.sum() * 0.0
+        elif args.balancing:
             _loss = compute_balanced_bce_loss(
                 localnet_criterion=localnet_criterion,
-                pred=pred_for_loss,
-                target=local_label,
+                pred=pred_bce,
+                target=target_bce,
             )
         else:
-            _loss = localnet_criterion(pred_for_loss, local_label)
+            _loss = localnet_criterion(pred_bce, target_bce)
 
         with torch.no_grad():
             pred_bin = pred_for_loss.detach() >= 0.5
             target_bin = local_label >= 0.5
+            if loss_mask is not None:
+                # Report accuracy over the patches actually used for training.
+                pred_bin = pred_bin[loss_mask]
+                target_bin = target_bin[loss_mask]
             normal_mask = ~target_bin
             anomaly_mask = target_bin
             if normal_mask.any().item():
@@ -1642,6 +1694,7 @@ def train_one_epoch(
                 l_loss=l_loss,
                 compute_distance_fn=compute_distance,
                 find_matching_fn=find_matching,
+                keep_patch_mask=loss_mask,
             )
             kl_loss_time += time.perf_counter() - kl_start
         else:
@@ -1775,6 +1828,7 @@ def train_one_epoch(
         pseudo_anomaly_acc,
         pseudo_anomaly_correct,
         pseudo_anomaly_total,
+        pseudo_ignored_total,
     )
 
 
@@ -2462,6 +2516,7 @@ def main():
             pseudo_anomaly_acc,
             pseudo_anomaly_correct,
             pseudo_anomaly_total,
+            pseudo_ignored_total,
         ) = train_one_epoch(
             args=args,
             epoch=epoch,
@@ -2502,6 +2557,11 @@ def main():
             f"epoch {epoch + 1} | pseudo anomaly->anomaly acc@0.5: {pseudo_anomaly_acc:.4f} "
             f"({pseudo_anomaly_correct}/{pseudo_anomaly_total})"
         )
+        if pseudo_ignored_total > 0:
+            print(
+                f"epoch {epoch + 1} | pseudo labels discarded (uncertain band): "
+                f"{pseudo_ignored_total}"
+            )
         if fusion_runtime is not None:
             fusion_runtime.log_epoch(epoch, class_names, save_dir=saved_dir)
 

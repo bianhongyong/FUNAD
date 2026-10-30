@@ -28,6 +28,7 @@ def compute_oto_loss_multiclass(
     l_loss,
     compute_distance_fn,
     find_matching_fn,
+    keep_patch_mask=None,
 ):
     if args.oto_loss == "kl":
         transform_fn = lambda a, b: 0.5 * (
@@ -48,6 +49,13 @@ def compute_oto_loss_multiclass(
 
         cls_feature = batch_feature[cls_mask]
         cls_score = local_pred[cls_mask]
+        if keep_patch_mask is not None:
+            # Drop patches whose pseudo label was discarded (uncertain band).
+            cls_keep = keep_patch_mask[cls_mask]
+            cls_feature = cls_feature[cls_keep]
+            cls_score = cls_score[cls_keep]
+            if cls_score.numel() < 2:
+                continue
         feature_np = cls_feature.detach().cpu().numpy().reshape(-1, cls_feature.shape[-1])
         _, id_array = compute_distance_fn(feature_np)
         matched = find_matching_fn(id_array)

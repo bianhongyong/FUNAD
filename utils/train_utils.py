@@ -480,6 +480,24 @@ def _storage_dtype_name(dtype):
     return "float16" if dtype == torch.float16 else "float32"
 
 
+def build_uncertain_patch_mask(distance, threshold_map, noise_threshold):
+    """Return the FUNAD uncertain-band mask ``threshold < distance < noise``.
+
+    Patches in this band sit above the pseudo-label threshold but below
+    ``noise_threshold``, so their pseudo label is unreliable.  Original FUNAD
+    perturbs them with Gaussian feature noise; when that branch is disabled
+    (``--gaussian``) they should be dropped from training entirely.
+    """
+    dist = np.asarray(distance)
+    thr = np.asarray(threshold_map)
+    if dist.shape != thr.shape:
+        raise ValueError(
+            "distance and threshold_map must have the same shape; "
+            f"got {dist.shape} vs {thr.shape}."
+        )
+    return np.logical_and(dist > thr, dist < float(noise_threshold))
+
+
 def apply_gaussian_feature_noise(
     x,
     distance,
