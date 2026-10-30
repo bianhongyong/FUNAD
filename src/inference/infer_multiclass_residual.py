@@ -257,6 +257,27 @@ def detect_learned_fusion(checkpoint: dict) -> bool:
     )
 
 
+def resolve_fusion_match_mode(fusion_cfg: dict) -> str:
+    """Return ``prior_top1`` / ``dynamic_topk`` for a class_patch checkpoint.
+
+    Historical ``schema_version=2`` checkpoints have no ``match_mode`` and
+    must keep their original dynamic Top-K semantics.  Schema 3 writes the
+    mode explicitly; a missing value defaults to ``prior_top1``.
+    """
+    if fusion_cfg.get("fusion_mode") != "class_patch":
+        return "none"
+    schema_version = int(fusion_cfg.get("schema_version", 0))
+    if schema_version < 3:
+        return "dynamic_topk"
+    match_mode = str(fusion_cfg.get("match_mode") or "prior_top1")
+    if match_mode not in ("prior_top1", "dynamic_topk"):
+        raise RuntimeError(
+            f"未知 class_patch match_mode: {match_mode!r} "
+            "(expected prior_top1 or dynamic_topk)."
+        )
+    return match_mode
+
+
 def validate_fusion_inference_config(fusion_cfg: dict, args, all_class_names):
     """Strictly validate the checkpoint schema against CLI inference settings.
 
@@ -322,14 +343,34 @@ def validate_fusion_inference_config(fusion_cfg: dict, args, all_class_names):
             raise RuntimeError(
                 "class_patch fusion checkpoint 的 schema_version 必须 >= 2。"
             )
-        if int(fusion_cfg.get("fusion_topk", 0)) < 1:
-            raise RuntimeError("class_patch fusion_config 缺少有效的 fusion_topk。")
+        match_mode = resolve_fusion_match_mode(fusion_cfg)
+        if int(fusion_cfg.get("fusion_query_chunk", 512)) < 1:
+            raise RuntimeError("fusion_config.fusion_query_chunk 必须 >= 1。")
+        if match_mode == "dynamic_topk":
+            if int(fusion_cfg.get("fusion_topk", 0)) < 1:
+                raise RuntimeError(
+                    "dynamic_topk fusion_config 缺少有效的 fusion_topk。"
+                )
         if str(fusion_cfg.get("feature_adapter_mode", "legacy")) not in (
             "legacy", "class_residual"
         ):
             raise RuntimeError(
                 "未知 feature_adapter_mode: "
                 f"{fusion_cfg.get('feature_adapter_mode')!r}"
+            )
+        no_layer_names = [
+            str(name)
+            for name in (fusion_cfg.get("no_layer_fusion_classes") or [])
+        ]
+        unknown = sorted(set(no_layer_names) - set(all_class_names))
+        if unknown:
+            raise RuntimeError(
+                "fusion_config.no_layer_fusion_classes 含未知类别: "
+                f"{unknown}; checkpoint classes={list(all_class_names)}"
+            )
+        if float(fusion_cfg.get("last_layer_prior_logit", 8.0)) < 0.0:
+            raise RuntimeError(
+                "fusion_config.last_layer_prior_logit 必须 >= 0。"
             )
     return expected_layers
 
@@ -824,13 +865,21 @@ def main():
     feature_extractor = build_feature_extractor(args, device)
 
     if learned_fusion:
+        fusion_match_mode = resolve_fusion_match_mode(fusion_cfg)
         print(
             f"[fusion] mode={fusion_cfg.get('fusion_mode')} | "
+            f"match={fusion_match_mode} | "
             f"layers={candidate_layers} | tau={fusion_cfg.get('temperature')} | "
             f"norm={fusion_cfg.get('norm_type')} "
             f"(affine={fusion_cfg.get('norm_affine')}) | "
             f"feature_dim={fusion_cfg.get('feature_dim')}"
         )
+        if fusion_cfg.get("fusion_mode") == "class_patch":
+            print(
+                "[fusion] last-layer-only class prior: "
+                f"{fusion_cfg.get('no_layer_fusion_classes') or 'none'} "
+                f"(prior_logit={fusion_cfg.get('last_layer_prior_logit', 8.0)})"
+            )
         feature_dim = int(fusion_cfg["feature_dim"])
         num_patches = find_fusion_num_patches(
             args, feature_extractor, device, target_class_names, candidate_layers
@@ -901,6 +950,10 @@ def main():
         validate_raw_bank_metadata(raw_meta, fusion_cfg, raw_bank)
 
         if fusion_cfg.get("fusion_mode") == "class_patch":
+            no_layer_names = [
+                str(name)
+                for name in (fusion_cfg.get("no_layer_fusion_classes") or [])
+            ]
             fusion = ClassPatchFusionAdapter(
                 num_classes=int(fusion_cfg["num_classes"]),
                 num_layers=int(fusion_cfg["num_layers"]),
@@ -920,6 +973,12 @@ def main():
                 ),
                 adapter_hidden_dim=int(fusion_cfg.get("adapter_hidden_dim", 128)),
                 adapter_beta_init=float(fusion_cfg.get("adapter_beta_init", 0.15)),
+                no_layer_fusion_classes=[
+                    all_class_names.index(name) for name in no_layer_names
+                ],
+                last_layer_prior_logit=float(
+                    fusion_cfg.get("last_layer_prior_logit", 8.0)
+                ),
             ).to(device)
         else:
             fusion = ClassConditionedLayerFusion(
@@ -1021,21 +1080,34 @@ def main():
                         return_cls_token=True,
                     )
                     if fusion_cfg.get("fusion_mode") == "class_patch":
-                        model_features = (
-                            common_utils.compute_class_patch_fused_residual_batch(
-                                raw_multilayer,
-                                class_idx_batch,
-                                fusion_cache,
-                                fusion,
-                                topk=int(fusion_cfg.get("fusion_topk", 32)),
-                                query_chunk_size=int(
-                                    fusion_cfg.get("fusion_query_chunk", 256)
-                                ),
-                                candidate_chunk_size=int(
-                                    fusion_cfg.get("fusion_candidate_chunk", 8)
-                                ),
+                        if fusion_match_mode == "prior_top1":
+                            model_features = (
+                                common_utils.compute_class_patch_prior_top1_residual_batch(
+                                    raw_multilayer,
+                                    class_idx_batch,
+                                    fusion_cache,
+                                    fusion,
+                                    query_chunk_size=int(
+                                        fusion_cfg.get("fusion_query_chunk", 512)
+                                    ),
+                                )
                             )
-                        )
+                        else:
+                            model_features = (
+                                common_utils.compute_class_patch_fused_residual_batch(
+                                    raw_multilayer,
+                                    class_idx_batch,
+                                    fusion_cache,
+                                    fusion,
+                                    topk=int(fusion_cfg.get("fusion_topk", 32)),
+                                    query_chunk_size=int(
+                                        fusion_cfg.get("fusion_query_chunk", 256)
+                                    ),
+                                    candidate_chunk_size=int(
+                                        fusion_cfg.get("fusion_candidate_chunk", 8)
+                                    ),
+                                )
+                            )
                     else:
                         model_features = common_utils.compute_fused_residual_batch(
                             raw_multilayer,

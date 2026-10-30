@@ -1,5 +1,11 @@
 # FUNAD V2：类别—Patch 层次化动态融合 + 类别强度 Adapter（HCPAF）代码修改方案
 
+> **当前推荐路径（2026-10-29 更新）：** class_patch 新训练默认使用 `--fusion_match_mode prior_top1`：
+> 类别先验只负责选择一个参考 Patch `j*`，Patch Gate 只参与最终残差的双侧融合。
+> 见 [prior_top1_patch_residual.md](prior_top1_patch_residual.md)。
+> 本文描述的“类别先验粗检索 Top-K + Query 条件精排”保留为
+> `--fusion_match_mode dynamic_topk` 的历史/研究消融路径，不应无记录地删除。
+
 > **状态：Implementation Proposal / 仅设计，尚未实现、训练或验证。**
 >
 > **目标分支：** feature/learnable-dinov3-layer-fusion-design

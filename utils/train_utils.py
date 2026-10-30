@@ -285,6 +285,39 @@ def load_train_checkpoint(
     return base + (metadata,)
 
 
+def load_weights_only_checkpoint(path: str, localnet: nn.Module, fusion=None):
+    """Load only network/fusion parameters from a training checkpoint.
+
+    This is an explicit *weights-only initialization* for starting a new
+    experiment from an old model.  It does **not** restore the optimizer,
+    RNG state, epoch counters, memory-bank snapshots or pseudo-label state,
+    and it is not a resume.  Callers must still validate the checkpoint's
+    ``fusion_config`` architecture against the current run.
+    """
+    ckpt = _torch_load_train_checkpoint(path)
+    if "net" not in ckpt:
+        raise KeyError("checkpoint 缺少 'net' 键，无法进行 weights-only 初始化。")
+    localnet.load_state_dict(ckpt["net"], strict=True)
+
+    fusion_sd = ckpt.get("fusion_state")
+    if fusion_sd is not None and fusion is None:
+        raise RuntimeError(
+            "checkpoint 含 fusion_state，但当前运行未启用 learned fusion。"
+        )
+    if fusion is not None and fusion_sd is None:
+        raise RuntimeError(
+            "当前运行启用 learned fusion，但 checkpoint 没有 fusion_state。"
+        )
+    if fusion is not None:
+        fusion.load_state_dict(fusion_sd, strict=True)
+    return {
+        "epoch": int(ckpt.get("epoch", -1)),
+        "iteration": int(ckpt.get("iteration", -1)),
+        "fusion_config": ckpt.get("fusion_config"),
+        "raw_reference_manifest": ckpt.get("raw_reference_manifest"),
+    }
+
+
 def inspect_train_checkpoint(path: str) -> dict:
     """Load only learned-fusion-related metadata from a training checkpoint."""
     ckpt = _torch_load_train_checkpoint(path)
@@ -760,9 +793,14 @@ class FusedReferenceCache:
     Lifecycle:
       * raw bank is fixed (CPU, usually float16);
       * ``refresh()`` re-fuses the whole raw bank with the current theta and
-        atomically swaps the fused tensors / indices;
-      * queries are fused with the current theta every step, so between
-        refreshes NN search is a controlled approximation.
+        atomically swaps the fused tensors / indices, together with the
+        class-prior (and optional affine-norm) snapshot used for that build;
+      * :meth:`fuse_query_with_cached_prior` projects queries with that same
+        snapshot, so prior_top1 matching is exact against the cached bank even
+        when theta moves between refreshes (the *prior* itself is stale by
+        design until the next refresh);
+      * the V1 path may instead fuse queries with the current theta every
+        step, making NN search a controlled approximation between refreshes.
 
     Search uses chunked exact L2 by default.  ``use_faiss=True`` builds a FAISS
     index per class (used by independent inference).
@@ -834,7 +872,140 @@ class FusedReferenceCache:
         self.total_refresh_time = 0.0
         self.last_drift_rate_by_class: Dict[int, float] = {}
 
+        # Matching-time snapshots.  ``fused_by_class`` is built with the class
+        # prior (and, when affine, the LayerNorm parameters) that were current
+        # at refresh time.  Prior-Top1 queries must be projected with exactly
+        # the same snapshot, otherwise the two sides of the L2 distance use
+        # different metrics while the cache is stale.
+        self.prior_alpha_at_refresh: Dict[int, torch.Tensor] = {}
+        self.prior_alpha_snapshot_version = -1
+        self._norm_affine_snapshot = None
+
     # -- lifecycle ---------------------------------------------------------
+    def _snapshot_class_prior_alpha(self, class_idx: int) -> torch.Tensor:
+        """Detached ``[L]`` class-prior alpha used by the current cache build."""
+        getter = getattr(self.fusion, "get_layer_weights", None)
+        if callable(getter):
+            alpha = getter(int(class_idx))
+        else:
+            getter = getattr(self.fusion, "global_weights", None)
+            if not callable(getter):
+                raise TypeError(
+                    "FusedReferenceCache requires fusion.get_layer_weights() or "
+                    f"fusion.global_weights(); got {type(self.fusion).__name__}."
+                )
+            alpha = getter(int(class_idx))
+        alpha = alpha.detach()
+        if alpha.dim() == 2:
+            if alpha.shape[0] != 1:
+                raise ValueError(
+                    "Expected a single class-prior row, got "
+                    f"{tuple(alpha.shape)} for class {class_idx}."
+                )
+            alpha = alpha[0]
+        if alpha.dim() != 1 or alpha.numel() != self.num_layers:
+            raise ValueError(
+                f"class-prior alpha must be [L={self.num_layers}], got {tuple(alpha.shape)}."
+            )
+        return alpha.to(device=self.device, dtype=torch.float32).clone()
+
+    def _snapshot_norm_affine(self):
+        """Clone affine LayerNorm params, or None when the norm is param-free."""
+        norm = getattr(self.fusion, "norm", None)
+        if isinstance(norm, nn.LayerNorm) and norm.elementwise_affine:
+            return {
+                "normalized_shape": tuple(norm.normalized_shape),
+                "weight": norm.weight.detach().clone(),
+                "bias": norm.bias.detach().clone(),
+                "eps": float(norm.eps),
+            }
+        return None
+
+    def _apply_cached_norm(self, raw: torch.Tensor) -> torch.Tensor:
+        snapshot = self._norm_affine_snapshot
+        if snapshot is None:
+            return self.fusion.norm(raw)
+        return torch.nn.functional.layer_norm(
+            raw,
+            snapshot["normalized_shape"],
+            snapshot["weight"].to(device=raw.device, dtype=raw.dtype),
+            snapshot["bias"].to(device=raw.device, dtype=raw.dtype),
+            snapshot["eps"],
+        )
+
+    @torch.no_grad()
+    def fuse_query_with_cached_prior(
+        self,
+        raw_query: torch.Tensor,
+        class_idx_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project queries with the **snapshot** used to build the fused index.
+
+        Prior-Top1 matching uses class-prior weights only.  Using a live
+        ``fusion.global_weights()`` here while ``fused_by_class`` lags one
+        refresh would compare vectors under two different metrics.  This
+        method reproduces the refresh-time projection on both sides.
+
+        Args:
+            raw_query: ``[B, P, L, C]`` frozen-backbone features.
+            class_idx_batch: ``[B]`` (scalar broadcasts over the batch).
+        Returns:
+            ``[B, P, C]`` float32 matching vectors (never requires grad).
+        """
+        if raw_query.dim() != 4:
+            raise ValueError(
+                f"Expected raw_query [B,P,L,C], got {tuple(raw_query.shape)}"
+            )
+        if raw_query.shape[-2] != self.num_layers:
+            raise ValueError(
+                f"raw_query has {raw_query.shape[-2]} layers, cache expects "
+                f"{self.num_layers}."
+            )
+        if raw_query.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"raw_query has feature_dim={raw_query.shape[-1]}, cache expects "
+                f"{self.feature_dim}."
+            )
+        if not self.prior_alpha_at_refresh:
+            raise RuntimeError(
+                "No class-prior snapshot; call FusedReferenceCache.refresh() first."
+            )
+
+        batch, patches, _, _ = raw_query.shape
+        class_idx_batch = torch.as_tensor(
+            class_idx_batch, dtype=torch.long, device=raw_query.device
+        ).reshape(-1)
+        if class_idx_batch.numel() == 1 and batch > 1:
+            class_idx_batch = class_idx_batch.expand(batch)
+        if class_idx_batch.numel() != batch:
+            raise ValueError(
+                f"class_idx has {class_idx_batch.numel()} entries for batch {batch}."
+            )
+
+        out = torch.empty(
+            (batch, patches, self.feature_dim),
+            dtype=torch.float32,
+            device=raw_query.device,
+        )
+        for cls_tensor in torch.unique(class_idx_batch):
+            cls = int(cls_tensor.item())
+            if cls not in self.prior_alpha_at_refresh:
+                raise KeyError(f"class {cls} has no class-prior snapshot.")
+            mask = class_idx_batch == cls_tensor
+            rows = raw_query[mask].reshape(
+                -1, self.num_layers, self.feature_dim
+            )
+            # ``_fuse_raw`` casts to float32 before applying the fusion norm;
+            # mirror that order so query/reference projections match exactly.
+            x = self._apply_cached_norm(rows.to(dtype=torch.float32))
+            alpha = self.prior_alpha_at_refresh[cls].to(
+                device=x.device, dtype=x.dtype
+            )
+            out[mask] = torch.einsum("nlc,l->nc", x, alpha).reshape(
+                -1, patches, self.feature_dim
+            )
+        return out
+
     def _fuse_raw(self, raw_cpu: torch.Tensor, class_idx: int) -> torch.Tensor:
         chunks = []
         for start in range(0, raw_cpu.shape[0], self.fuse_chunk_size):
@@ -864,10 +1035,18 @@ class FusedReferenceCache:
         start = time.perf_counter()
         new_fused: Dict[int, torch.Tensor] = {}
         new_index: Dict[int, object] = {}
+        new_prior: Dict[int, torch.Tensor] = {}
         drift: Dict[int, float] = {}
 
         with torch.no_grad():
+            # Snapshot the matching metric before fusing.  ``theta`` and the
+            # optional affine norm must not change between these snapshots
+            # and ``_fuse_raw``; both happen synchronously under no_grad.
+            norm_snapshot = self._snapshot_norm_affine()
             for class_idx, raw in self.raw_cpu.items():
+                new_prior[int(class_idx)] = self._snapshot_class_prior_alpha(
+                    int(class_idx)
+                )
                 fused = self._fuse_raw(raw, class_idx)
                 old = self.fused_by_class.get(class_idx)
                 if old is not None and old.shape == fused.shape:
@@ -884,7 +1063,10 @@ class FusedReferenceCache:
         # Atomic switch: both the fused tensors and indices change together.
         self.fused_by_class = new_fused
         self.index_by_class = new_index
+        self.prior_alpha_at_refresh = new_prior
+        self._norm_affine_snapshot = norm_snapshot
         self.version += 1
+        self.prior_alpha_snapshot_version = self.version
         self.refresh_count += 1
         self.refresh_step = -1 if step is None else int(step)
         self.refresh_epoch = -1 if epoch is None else int(epoch)
@@ -915,6 +1097,8 @@ class FusedReferenceCache:
             "last_drift_rate_by_class": dict(self.last_drift_rate_by_class),
             "last_refresh_time": self.last_refresh_time,
             "total_refresh_time": self.total_refresh_time,
+            "prior_alpha_snapshot_version": self.prior_alpha_snapshot_version,
+            "norm_affine_snapshot": self._norm_affine_snapshot is not None,
         }
 
     # -- search ------------------------------------------------------------
@@ -942,15 +1126,69 @@ class FusedReferenceCache:
         return out
 
     def nearest_ids(self, fused_query: torch.Tensor, class_idx_batch: torch.Tensor) -> torch.Tensor:
-        """Exact NN against the **cached** fused reference version.
+        """Exact Top-1 NN against the **cached** fused reference version.
+
+        Dedicated Top-1 path: unlike the historical ``nearest_topk_ids(k=1)``
+        wrapper it does not run ``topk -> cat -> topk`` per reference chunk.
 
         Args:
             fused_query: ``[B, P, C]`` or ``[M, C]``.
-            class_idx_batch: ``[B]`` (or ``[1]``/empty for 2D input).
+            class_idx_batch: ``[B]`` (or ``[1]`` for 2D input).
         Returns:
             ``[B, P]`` long tensor on the query device.
         """
-        return self.nearest_topk_ids(fused_query, class_idx_batch, k=1).squeeze(-1)
+        squeeze = fused_query.dim() == 2
+        query = fused_query.unsqueeze(0) if squeeze else fused_query
+        if query.dim() != 3:
+            raise ValueError(
+                f"Expected fused_query [B,P,C] or [M,C], got {tuple(fused_query.shape)}"
+            )
+
+        batch, patches, dim = query.shape
+        if dim != self.feature_dim:
+            raise ValueError(
+                f"fused_query feature_dim={dim}, cache expects {self.feature_dim}."
+            )
+        class_idx_batch = torch.as_tensor(
+            class_idx_batch, dtype=torch.long, device=query.device
+        ).reshape(-1)
+        if class_idx_batch.numel() == 1 and batch > 1:
+            class_idx_batch = class_idx_batch.expand(batch)
+        if class_idx_batch.numel() != batch:
+            raise ValueError(
+                f"class_idx has {class_idx_batch.numel()} entries for batch {batch}."
+            )
+
+        classes = [int(c.item()) for c in torch.unique(class_idx_batch)]
+        for cls in classes:
+            if cls not in self.fused_by_class:
+                raise KeyError(f"class {cls} has no fused reference cache.")
+            if int(self.fused_by_class[cls].shape[0]) == 0:
+                raise RuntimeError(f"class {cls} has an empty fused reference cache.")
+
+        out = torch.empty(
+            (batch, patches), dtype=torch.long, device=query.device
+        )
+        for cls_tensor in torch.unique(class_idx_batch):
+            cls = int(cls_tensor.item())
+            mask = class_idx_batch == cls_tensor
+            queries = query[mask].reshape(-1, dim).detach().to(dtype=torch.float32)
+
+            if self.use_faiss and cls in self.index_by_class:
+                q_np = np.ascontiguousarray(queries.cpu().numpy())
+                _, ids_np = self.index_by_class[cls].search(q_np, k=1)
+                ids = torch.as_tensor(
+                    np.where(ids_np[:, 0] < 0, 0, ids_np[:, 0]),
+                    dtype=torch.long,
+                    device=query.device,
+                )
+            else:
+                ids = self._chunked_nearest_ids(
+                    queries, self.fused_by_class[cls]
+                )
+            out[mask] = ids.reshape(-1, patches)
+
+        return out.squeeze(0) if squeeze else out
 
     def _chunked_topk_ids(
         self,
@@ -1383,6 +1621,154 @@ def compute_class_patch_fused_residual_batch(
             return residual, best_ids, diagnostics
         if return_neighbor_ids:
             return residual, best_ids
+        return residual, diagnostics
+    return residual
+
+
+def compute_class_patch_prior_top1_residual_batch(
+    raw_query,
+    class_idx_batch,
+    fusion_cache: FusedReferenceCache,
+    fusion,
+    query_chunk_size: Optional[int] = None,
+    return_neighbor_ids: bool = False,
+    return_diagnostics: bool = False,
+    timing: Optional[dict] = None,
+):
+    """Class-prior Top-1 reference matching + patch-weighted residual.
+
+    The patch gate does **not** take part in reference selection:
+
+    1. Match with the refresh-time class-prior snapshot only.  Queries and
+       the cached fused bank are projected with the same ``alpha^G_c``, and
+       the unique nearest reference ``j*(c, p)`` is returned by
+       :meth:`FusedReferenceCache.nearest_ids` (no Top-K, no rerank).
+    2. Build one dynamic ``alpha_{c,p,:}`` per query patch.
+    3. Fuse the query **and** its selected raw reference row with that same
+       ``alpha`` and subtract.  When ``fusion.norm`` is affine, the norm is
+       applied to each side separately before the weighted sum.
+
+    Matching ids are discrete/no-grad; the final residual keeps gradients on
+    ``theta``, the patch gate, ``lambda``, the class embedding and the fusion
+    norm on both query and reference sides.
+
+    Args:
+        raw_query: ``[B, P, L, C]`` frozen-backbone features.
+        class_idx_batch: ``[B]``.
+        fusion_cache: ``FusedReferenceCache`` refreshed at least once.
+        fusion: ``ClassPatchFusionAdapter`` instance.
+        query_chunk_size: query patches per reference-gather chunk.
+        return_neighbor_ids: also return ``[B, P]`` selected ids.
+        return_diagnostics: also return detached patch alpha / ids.
+        timing: optional dict filled with perf-counter milliseconds
+            (``coarse_projection_ms``, ``nn_search_ms``, ``patch_gate_ms``,
+            ``ref_gather_ms``, ``residual_fusion_ms``, ``total_ms``).
+            CUDA timings synchronize explicitly; leave None in hot loops.
+
+    Returns:
+        ``[B, P, C]`` residual; plus ids and/or diagnostics when requested.
+    """
+    class_idx_batch = _validate_class_patch_inputs(
+        raw_query, class_idx_batch, fusion_cache, fusion
+    )
+    batch, patches, layers, dim = raw_query.shape
+    q_chunk = int(query_chunk_size or fusion_cache.query_chunk_size)
+    q_chunk = max(1, q_chunk)
+    profile = timing is not None
+
+    def _sync():
+        if raw_query.is_cuda:
+            torch.cuda.synchronize(raw_query.device)
+
+    if profile:
+        _sync()
+        t_start = time.perf_counter()
+
+    # A. Matching is class-prior only and uses the cache's refresh snapshot.
+    with torch.no_grad():
+        coarse_query = fusion_cache.fuse_query_with_cached_prior(
+            raw_query, class_idx_batch
+        )
+        if profile:
+            _sync()
+            t_after_projection = time.perf_counter()
+        nn_ids = fusion_cache.nearest_ids(coarse_query, class_idx_batch)
+        if profile:
+            _sync()
+            t_after_search = time.perf_counter()
+
+    # B. Patch-conditioned weights only shape the final residual.
+    alpha = fusion.patch_weights(raw_query, class_idx_batch)  # [B,P,L], grad
+    if profile:
+        _sync()
+        t_after_gate = time.perf_counter()
+
+    # C. Per-class chunks: one unique reference row set per chunk, but each
+    # query re-fuses its reference with its own alpha (no vector reuse).
+    residual = torch.empty(
+        (batch, patches, dim), dtype=alpha.dtype, device=raw_query.device
+    )
+    ref_gather_s = 0.0
+    fusion_s = 0.0
+
+    for cls_tensor in torch.unique(class_idx_batch):
+        cls = int(cls_tensor.item())
+        cls_mask = class_idx_batch == cls_tensor
+        cls_raw = raw_query[cls_mask].reshape(-1, layers, dim)
+        cls_alpha = alpha[cls_mask].reshape(-1, layers)
+        cls_ids = nn_ids[cls_mask].reshape(-1)
+        num_queries = int(cls_raw.shape[0])
+        chunks = []
+
+        for q_start in range(0, num_queries, q_chunk):
+            q_end = min(q_start + q_chunk, num_queries)
+            ids = cls_ids[q_start:q_end]
+            unique_ids, inverse = torch.unique(ids, return_inverse=True)
+
+            if profile:
+                _sync()
+                t_ref = time.perf_counter()
+            raw_unique = fusion_cache.raw_rows(cls, unique_ids)
+            if profile:
+                _sync()
+                ref_gather_s += time.perf_counter() - t_ref
+                t_fuse = time.perf_counter()
+
+            raw_ref = raw_unique.index_select(0, inverse)
+            q = cls_raw[q_start:q_end]
+            a = cls_alpha[q_start:q_end]
+            z_q = fusion.fuse_query(q, a)
+            z_m = fusion.fuse_query(raw_ref, a)
+            chunks.append(z_q - z_m)
+
+            if profile:
+                _sync()
+                fusion_s += time.perf_counter() - t_fuse
+
+        cls_residual = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        residual[cls_mask] = cls_residual.reshape(-1, patches, dim)
+
+    if profile:
+        _sync()
+        t_end = time.perf_counter()
+        timing["coarse_projection_ms"] = (t_after_projection - t_start) * 1000.0
+        timing["nn_search_ms"] = (t_after_search - t_after_projection) * 1000.0
+        timing["patch_gate_ms"] = (t_after_gate - t_after_search) * 1000.0
+        timing["ref_gather_ms"] = ref_gather_s * 1000.0
+        timing["residual_fusion_ms"] = fusion_s * 1000.0
+        timing["total_ms"] = (t_end - t_start) * 1000.0
+
+    if return_diagnostics or return_neighbor_ids:
+        diagnostics = {
+            "alpha": alpha.detach(),
+            "nn_ids": nn_ids.detach(),
+            "class_idx": class_idx_batch.detach(),
+            "match_mode": "prior_top1",
+        }
+        if return_neighbor_ids and return_diagnostics:
+            return residual, nn_ids, diagnostics
+        if return_neighbor_ids:
+            return residual, nn_ids
         return residual, diagnostics
     return residual
 

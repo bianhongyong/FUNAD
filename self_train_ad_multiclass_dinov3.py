@@ -105,6 +105,31 @@ def _fusion_preprocess_metadata(args):
     }
 
 
+def _parse_no_layer_fusion_classes(value, class_names):
+    """Parse ``screw,foo`` into a class-ordered list of valid class names."""
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    requested = {item.strip() for item in raw.split(",") if item.strip()}
+    unknown = sorted(requested - set(class_names))
+    if unknown:
+        # The CLI default is "screw" (MVTec-specific).  Do not fail a VisA run
+        # just because that default class does not exist; an explicit typo for
+        # any other name still raises.
+        if raw == "screw":
+            print(
+                "[Fusion] --fusion_no_layer_fusion_classes='screw' ignored: "
+                f"this dataset has no 'screw' class ({list(class_names)})."
+            )
+            return []
+        raise ValueError(
+            "--fusion_no_layer_fusion_classes has unknown class name(s): "
+            f"{unknown}; known classes are {list(class_names)}."
+        )
+    # Keep the dataset class order so indices and logging are deterministic.
+    return [name for name in class_names if name in requested]
+
+
 def _build_fusion_config(args, class_names, candidate_layers, feature_dim):
     config = {
         "schema_version": 1,
@@ -134,11 +159,12 @@ def _build_fusion_config(args, class_names, candidate_layers, feature_dim):
     if args.fusion_mode == "class_patch":
         config.update(
             {
-                "schema_version": 2,
+                # schema 3: explicit reference-match mode.  schema 2
+                # checkpoints predate ``match_mode`` and mean dynamic_topk.
+                "schema_version": 3,
+                "match_mode": str(args.fusion_match_mode),
                 "feature_adapter_mode": str(args.feature_adapter_mode),
-                "fusion_topk": int(args.fusion_topk),
                 "fusion_query_chunk": int(args.fusion_query_chunk),
-                "fusion_candidate_chunk": int(args.fusion_candidate_chunk),
                 "gate_embedding_dim": int(args.gate_embedding_dim),
                 "gate_hidden_dim": int(args.gate_hidden_dim),
                 "gate_norm": str(args.gate_norm),
@@ -147,13 +173,31 @@ def _build_fusion_config(args, class_names, candidate_layers, feature_dim):
                 "gate_demean_delta": bool(args.gate_demean_delta),
                 "adapter_hidden_dim": int(args.adapter_hidden_dim),
                 "adapter_beta_init": float(args.adapter_beta_init),
+                # Per-class pinned last-layer prior (e.g. screw): no learned
+                # inter-layer weights, patch gate may still deviate.
+                "no_layer_fusion_classes": list(
+                    getattr(args, "fusion_no_layer_fusion_class_names", []) or []
+                ),
+                "last_layer_prior_logit": float(
+                    getattr(args, "fusion_last_layer_prior_logit", 8.0)
+                ),
             }
         )
+        if args.fusion_match_mode == "dynamic_topk":
+            config["fusion_topk"] = int(args.fusion_topk)
+            config["fusion_candidate_chunk"] = int(args.fusion_candidate_chunk)
     return config
 
 
-def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers):
-    """Refuse silent train/resume metadata mismatches."""
+def _validate_resume_fusion_config(
+    ckpt_cfg, args, class_names, candidate_layers, ignore_match_mode=False
+):
+    """Refuse silent train/resume metadata mismatches.
+
+    ``ignore_match_mode`` is only for explicit weights-only initialization:
+    the network/fusion parameters are reusable across prior_top1 and
+    dynamic_topk, but every architecture/preprocessing field must still match.
+    """
     if not ckpt_cfg:
         raise RuntimeError(
             "resume checkpoint has no fusion_config; cannot resume a learned-fusion run."
@@ -191,9 +235,13 @@ def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers
         "reference_seed": int(args.seed),
     }
     if str(args.fusion_mode) == "class_patch":
+        schema_version = int(ckpt_cfg.get("schema_version", 0))
+        ckpt_match_mode = str(
+            ckpt_cfg.get("match_mode")
+            or ("prior_top1" if schema_version >= 3 else "dynamic_topk")
+        )
         v2_checks = [
             ("feature_adapter_mode", str(ckpt_cfg.get("feature_adapter_mode"))),
-            ("fusion_topk", int(ckpt_cfg.get("fusion_topk", -1))),
             ("gate_embedding_dim", int(ckpt_cfg.get("gate_embedding_dim", -1))),
             ("gate_hidden_dim", int(ckpt_cfg.get("gate_hidden_dim", -1))),
             ("gate_norm", str(ckpt_cfg.get("gate_norm"))),
@@ -202,8 +250,8 @@ def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers
             ("adapter_hidden_dim", int(ckpt_cfg.get("adapter_hidden_dim", -1))),
         ]
         current_v2 = {
+            "match_mode": str(args.fusion_match_mode),
             "feature_adapter_mode": str(args.feature_adapter_mode),
-            "fusion_topk": int(args.fusion_topk),
             "gate_embedding_dim": int(args.gate_embedding_dim),
             "gate_hidden_dim": int(args.gate_hidden_dim),
             "gate_norm": str(args.gate_norm),
@@ -211,6 +259,54 @@ def _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers
             "gate_demean_delta": bool(args.gate_demean_delta),
             "adapter_hidden_dim": int(args.adapter_hidden_dim),
         }
+        # Missing in pre-existing schema-3 checkpoints == no pinned classes.
+        ckpt_no_layer = sorted(
+            str(name) for name in (ckpt_cfg.get("no_layer_fusion_classes") or [])
+        )
+        current_no_layer = sorted(
+            getattr(args, "fusion_no_layer_fusion_class_names", []) or []
+        )
+        v2_checks.append(("no_layer_fusion_classes", ckpt_no_layer))
+        current_v2["no_layer_fusion_classes"] = current_no_layer
+        if ckpt_no_layer or current_no_layer:
+            v2_checks.append(
+                (
+                    "last_layer_prior_logit",
+                    float(ckpt_cfg.get("last_layer_prior_logit", -1.0)),
+                )
+            )
+            current_v2["last_layer_prior_logit"] = float(
+                getattr(args, "fusion_last_layer_prior_logit", 8.0)
+            )
+        if ignore_match_mode:
+            # Weights-only init may switch match modes; reference search is
+            # rebuilt from the current prior and holds no learned parameters.
+            pass
+        else:
+            v2_checks.append(("match_mode", ckpt_match_mode))
+            if args.fusion_match_mode == "dynamic_topk":
+                v2_checks.extend(
+                    [
+                        ("fusion_topk", int(ckpt_cfg.get("fusion_topk", -1))),
+                        (
+                            "fusion_candidate_chunk",
+                            int(ckpt_cfg.get("fusion_candidate_chunk", -1)),
+                        ),
+                    ]
+                )
+                current_v2["fusion_topk"] = int(args.fusion_topk)
+                current_v2["fusion_candidate_chunk"] = int(
+                    args.fusion_candidate_chunk
+                )
+            if (
+                ckpt_match_mode != str(args.fusion_match_mode)
+                and schema_version < 3
+            ):
+                errors.append(
+                    "checkpoint schema_version=2 predates match_mode and is "
+                    "interpreted as dynamic_topk; pass "
+                    "--fusion_match_mode dynamic_topk to resume it."
+                )
         for key, expected in v2_checks:
             if current_v2[key] != expected:
                 errors.append(
@@ -438,35 +534,77 @@ class LayerFusionRuntime:
 
 
 class ClassPatchFusionRuntime(LayerFusionRuntime):
-    """V2 runtime: query-conditioned Top-K matching + patch-alpha diagnostics."""
+    """V2 runtime: class-prior matching + patch-alpha diagnostics.
+
+    ``fusion_match_mode`` selects how the single reference ``j*`` is chosen:
+
+    * ``prior_top1`` (default): class prior only, no patch gate in matching;
+      the patch alpha is used only for the final query/reference fusion.
+    * ``dynamic_topk``: historical V2 coarse Top-K + query-conditioned rerank.
+    """
 
     def __init__(self, fusion, cache, candidate_layers, args):
         super().__init__(fusion, cache, candidate_layers, args)
-        self.topk = int(args.fusion_topk)
-        if self.topk < 1:
-            raise ValueError("--fusion_topk must be >= 1.")
+        self.match_mode = str(
+            getattr(args, "fusion_match_mode", "prior_top1")
+        )
+        if self.match_mode not in ("prior_top1", "dynamic_topk"):
+            raise ValueError(
+                f"Unknown --fusion_match_mode {self.match_mode!r}."
+            )
+        if self.match_mode == "dynamic_topk":
+            self.topk = int(args.fusion_topk)
+            if self.topk < 1:
+                raise ValueError("--fusion_topk must be >= 1.")
+        else:
+            self.topk = None
         self._last_match_meta = None
+        self._last_op_timing = None
 
     def residual(self, raw_features, class_idx, reference_memory_by_class=None,
                  reference_index_by_class=None):
-        (
-            residual,
-            neighbor_ids,
-            diagnostics,
-        ) = common_utils.compute_class_patch_fused_residual_batch(
-            raw_features,
-            class_idx,
-            self.cache,
-            self.fusion,
-            topk=self.topk,
-            query_chunk_size=int(self.args.fusion_query_chunk),
-            candidate_chunk_size=int(self.args.fusion_candidate_chunk),
-            return_neighbor_ids=True,
-            return_diagnostics=True,
-        )
+        if self.match_mode == "prior_top1":
+            timing = (
+                {}
+                if bool(getattr(self.args, "fusion_profile", False))
+                else None
+            )
+            (
+                residual,
+                neighbor_ids,
+                diagnostics,
+            ) = common_utils.compute_class_patch_prior_top1_residual_batch(
+                raw_features,
+                class_idx,
+                self.cache,
+                self.fusion,
+                query_chunk_size=int(self.args.fusion_query_chunk),
+                return_neighbor_ids=True,
+                return_diagnostics=True,
+                timing=timing,
+            )
+            self._last_op_timing = timing
+        else:
+            (
+                residual,
+                neighbor_ids,
+                diagnostics,
+            ) = common_utils.compute_class_patch_fused_residual_batch(
+                raw_features,
+                class_idx,
+                self.cache,
+                self.fusion,
+                topk=self.topk,
+                query_chunk_size=int(self.args.fusion_query_chunk),
+                candidate_chunk_size=int(self.args.fusion_candidate_chunk),
+                return_neighbor_ids=True,
+                return_diagnostics=True,
+            )
+            self._last_op_timing = None
         self._last_neighbor_ids = neighbor_ids
         self._last_match_meta = diagnostics
         self._accumulate_patch_stats(diagnostics)
+        self._accumulate_op_timing(self._last_op_timing)
         return residual
 
     # -- diagnostics -------------------------------------------------------
@@ -487,16 +625,33 @@ class ClassPatchFusionRuntime(LayerFusionRuntime):
         self._patch_nn_switch_sum = 0.0
         self._patch_nn_switch_count = 0
         self.epoch_topk_recall = []
+        self._op_timing_sum = {}
+        self._op_timing_count = 0
+
+    def _accumulate_op_timing(self, timing):
+        if not timing:
+            return
+        for key, value in timing.items():
+            self._op_timing_sum[key] = (
+                self._op_timing_sum.get(key, 0.0) + float(value)
+            )
+        self._op_timing_count += 1
 
     def _accumulate_patch_stats(self, diagnostics):
         if diagnostics is None:
             return
         alpha = diagnostics["alpha"].detach().float().cpu().numpy()
         class_np = diagnostics["class_idx"].detach().cpu().numpy().astype(np.int64)
-        best_np = diagnostics["best_ids"].detach().cpu().numpy()
-        coarse_first = diagnostics["coarse_ids"][..., 0].detach().cpu().numpy()
-        self._patch_nn_switch_sum += float((best_np != coarse_first).mean())
-        self._patch_nn_switch_count += 1
+        # ``nn_switch_rate`` only exists for dynamic_topk (coarse Top-K vs
+        # reranked j*).  prior_top1 matches with the class prior only, so the
+        # switch rate is identically zero and is not a meaningful metric.
+        best_ids = diagnostics.get("best_ids")
+        coarse_ids = diagnostics.get("coarse_ids")
+        if best_ids is not None and coarse_ids is not None:
+            best_np = best_ids.detach().cpu().numpy()
+            coarse_first = coarse_ids[..., 0].detach().cpu().numpy()
+            self._patch_nn_switch_sum += float((best_np != coarse_first).mean())
+            self._patch_nn_switch_count += 1
 
         num_layers = alpha.shape[-1]
         for cls in np.unique(class_np).tolist():
@@ -520,6 +675,10 @@ class ClassPatchFusionRuntime(LayerFusionRuntime):
             )
 
     def maybe_probe_topk_recall(self, raw_features, class_idx, step):
+        if self.match_mode != "dynamic_topk":
+            # Top-K recall is only defined for the rerank path; prior_top1
+            # explicitly does not consult the patch gate when matching.
+            return
         interval = int(getattr(self.args, "fusion_topk_recall_probe_interval", 0))
         if interval <= 0 or step % interval != 0:
             return
@@ -555,11 +714,33 @@ class ClassPatchFusionRuntime(LayerFusionRuntime):
         entropy[valid] = self._patch_entropy_sum[valid] / counts[valid]
         lam = self.fusion.get_patch_lambda().detach().float().cpu().numpy()
 
-        print(
-            f"[Fusion patch] epoch {epoch + 1} | "
-            f"nn_switch_rate="
-            f"{self._patch_nn_switch_sum / max(1, self._patch_nn_switch_count):.4f}"
-        )
+        if self.match_mode == "dynamic_topk":
+            switch_rate = (
+                self._patch_nn_switch_sum / max(1, self._patch_nn_switch_count)
+            )
+            print(
+                f"[Fusion patch] epoch {epoch + 1} | "
+                f"match_mode={self.match_mode} | nn_switch_rate={switch_rate:.4f}"
+            )
+        else:
+            # prior_top1 pins j* to the class-prior NN; the old switch rate is
+            # structurally zero, so do not report it as an architectural signal.
+            switch_rate = None
+            print(
+                f"[Fusion patch] epoch {epoch + 1} | "
+                f"match_mode={self.match_mode} (reference fixed by class prior)"
+            )
+
+        op_timing = None
+        if self._op_timing_count > 0:
+            op_timing = {
+                key: value / self._op_timing_count
+                for key, value in self._op_timing_sum.items()
+            }
+            print(
+                "[Fusion timing] mean per batch ms: "
+                + " ".join(f"{k}={v:.2f}" for k, v in sorted(op_timing.items()))
+            )
         for row in range(self.fusion.num_classes):
             name = class_names[row] if row < len(class_names) else f"cls_{row}"
             weights = " ".join(f"{v:.4f}" for v in mean[row])
@@ -619,10 +800,9 @@ class ClassPatchFusionRuntime(LayerFusionRuntime):
                 "patch_beta": beta,
                 "patch_rho": None if rho is None else rho.numpy(),
                 "patch_rho_count": None if rho_count is None else rho_count.numpy(),
-                "nn_switch_rate": (
-                    self._patch_nn_switch_sum
-                    / max(1, self._patch_nn_switch_count)
-                ),
+                "match_mode": self.match_mode,
+                "nn_switch_rate": switch_rate,
+                "op_timing_ms": op_timing,
                 "topk_recall": list(self.epoch_topk_recall),
             }
         )
@@ -666,7 +846,7 @@ def parse_args():
                         help="Default k multiplier for MAD threshold. "
                         "Larger k means stricter normal definition. "
                         "Can be overridden per-class via --mad_k_per_class.")
-    parser.add_argument("--mad_k_per_class", type=str, default="",
+    parser.add_argument("--mad_k_per_class", type=str, default="screw:9.0",
                         help="Per-class k overrides, e.g. 'bottle:4.0,cable:6.0'. "
                         "Classes not listed fall back to --mad_k.")
     parser.add_argument(
@@ -826,6 +1006,15 @@ def parse_args():
         help="Path to a training checkpoint (.pt) saved by this script; empty means start from scratch.",
     )
     parser.add_argument(
+        "--init_weights_from",
+        type=str,
+        default="",
+        help="Explicit weights-only initialization: load net + fusion_state from a "
+        "checkpoint but start a NEW run (fresh optimizer/RNG/epoch/pseudo labels). "
+        "Match mode may differ from the checkpoint; architecture must match. "
+        "Mutually exclusive with --resume.",
+    )
+    parser.add_argument(
         "--residual",
         type=str2bool,
         default="True",
@@ -877,7 +1066,8 @@ def parse_args():
         help="fixed_mean: legacy per-class layer table + mean (default, reproducible). "
         "learned_class: class-conditioned softmax layer weights. "
         "learned_shared: one softmax weight vector shared by all classes (E1 ablation). "
-        "class_patch: V2 class prior + per-patch gate + query-conditioned Top-K rerank.",
+        "class_patch: V2 class prior + per-patch gate; reference matching is "
+        "controlled by --fusion_match_mode (default prior_top1).",
     )
     parser.add_argument(
         "--fusion_layers",
@@ -933,13 +1123,23 @@ def parse_args():
     # V2 class-patch adaptive fusion (/class_patch mode)
     # ------------------------------------------------------------------
     parser.add_argument(
+        "--fusion_match_mode",
+        type=str,
+        choices=["prior_top1", "dynamic_topk"],
+        default="prior_top1",
+        help="How the single reference j* is selected. prior_top1 (default): "
+        "class prior only; the patch gate shapes only the residual. "
+        "dynamic_topk: historical coarse Top-K + query-conditioned rerank.",
+    )
+    parser.add_argument(
         "--fusion_topk",
         type=int,
         default=32,
-        help="Coarse class-prior candidate count K for query-conditioned rerank.",
+        help="Coarse class-prior candidate count K (dynamic_topk only).",
     )
     parser.add_argument("--fusion_query_chunk", type=int, default=256,
-                        help="Query patches per rerank chunk (memory bound).")
+                        help="Query patches per reference-gather/fusion chunk "
+                        "(both match modes; memory bound).")
     parser.add_argument("--fusion_candidate_chunk", type=int, default=8,
                         help="Candidates per rerank chunk (memory bound).")
     parser.add_argument("--gate_embedding_dim", type=int, default=32,
@@ -956,6 +1156,23 @@ def parse_args():
     parser.add_argument("--gate_demean_delta", type=str2bool, default="True",
                         help="Remove the per-patch mean of delta (softmax-invariant, "
                         "only improves log interpretability).")
+    parser.add_argument(
+        "--fusion_no_layer_fusion_classes",
+        type=str,
+        default="screw",
+        help="Comma-separated class names whose class prior is pinned to the "
+        "last candidate layer (weight 1, no learned inter-layer fusion). "
+        "The patch gate may still deviate per patch. Empty string disables. "
+        "class_patch only.",
+    )
+    parser.add_argument(
+        "--fusion_last_layer_prior_logit",
+        type=float,
+        default=8.0,
+        help="Fixed last-layer logit for --fusion_no_layer_fusion_classes. "
+        "Initial patch weights are last-layer dominant; a larger value makes "
+        "the patch gate work harder to deviate.",
+    )
     parser.add_argument(
         "--feature_adapter_mode",
         type=str,
@@ -980,6 +1197,14 @@ def parse_args():
     )
     parser.add_argument("--fusion_topk_recall_sample_size", type=int, default=32,
                         help="Queries per class sampled for the Top-K recall probe.")
+    parser.add_argument(
+        "--fusion_profile",
+        type=str2bool,
+        default="False",
+        help="Prior-Top1 only: time coarse projection / NN / gate / ref gather / "
+        "residual fusion with CUDA synchronizations and log per-epoch means. "
+        "Off by default because synchronizing every batch costs throughput.",
+    )
 
     return parser.parse_args()
 
@@ -1581,6 +1806,16 @@ def main():
     class_names = get_all_class_names(args.dataset)
     args.class_names = class_names
     num_classes_runtime = len(class_names)
+    if args.fusion_mode == "class_patch":
+        args.fusion_no_layer_fusion_class_names = _parse_no_layer_fusion_classes(
+            args.fusion_no_layer_fusion_classes, class_names
+        )
+        if float(args.fusion_last_layer_prior_logit) < 0.0:
+            raise ValueError("--fusion_last_layer_prior_logit must be >= 0.")
+    else:
+        # The CLI default ("screw") targets class_patch runs only; do not
+        # affect learned_class / fixed_mean commands that do not pass it.
+        args.fusion_no_layer_fusion_class_names = []
 
     # Build per-class layer indices dict (class_idx -> list[int])
     # 层表按 backbone 分档，必须用 args.feature_model 去取对应尺寸的那张。
@@ -1600,10 +1835,19 @@ def main():
             "(V2-C)."
         )
     if args.fusion_mode == "class_patch":
-        if int(args.fusion_topk) < 1:
-            raise ValueError("--fusion_topk must be >= 1.")
-        if int(args.fusion_query_chunk) < 1 or int(args.fusion_candidate_chunk) < 1:
-            raise ValueError("fusion rerank chunk sizes must be >= 1.")
+        if str(args.fusion_match_mode) not in ("prior_top1", "dynamic_topk"):
+            raise ValueError(
+                "--fusion_match_mode must be prior_top1 or dynamic_topk."
+            )
+        if int(args.fusion_query_chunk) < 1:
+            raise ValueError("--fusion_query_chunk must be >= 1.")
+        if args.fusion_match_mode == "dynamic_topk":
+            if int(args.fusion_topk) < 1:
+                raise ValueError("--fusion_topk must be >= 1 (dynamic_topk).")
+            if int(args.fusion_candidate_chunk) < 1:
+                raise ValueError(
+                    "--fusion_candidate_chunk must be >= 1 (dynamic_topk)."
+                )
         if int(args.gate_embedding_dim) < 1 or int(args.gate_hidden_dim) < 1:
             raise ValueError("gate embedding/hidden dims must be >= 1.")
         if float(args.gate_lambda_init) < 0:
@@ -1613,6 +1857,12 @@ def main():
         if not 0.0 < float(args.adapter_beta_init) < 1.0:
             raise ValueError("--adapter_beta_init must be in (0, 1).")
     resume_path = (args.resume or "").strip()
+    init_path = (args.init_weights_from or "").strip()
+    if resume_path and init_path:
+        raise ValueError(
+            "--resume and --init_weights_from are mutually exclusive: resume "
+            "continues the same experiment, init_weights_from starts a new one."
+        )
     resume_meta = None
     if resume_path:
         if not os.path.isfile(resume_path):
@@ -1629,14 +1879,33 @@ def main():
                 "Current run enables learned fusion but the checkpoint has no "
                 "fusion_state. Start a fresh learned-fusion run instead."
             )
+    init_meta = None
+    if init_path:
+        if not os.path.isfile(init_path):
+            raise FileNotFoundError(
+                f"--init_weights_from path not found: {init_path}"
+            )
+        init_meta = common_utils.inspect_train_checkpoint(init_path)
+        if init_meta.get("has_fusion_state") and not fusion_enabled:
+            raise ValueError(
+                "init checkpoint contains fusion_state but the current run uses "
+                "fixed_mean fusion."
+            )
+        if fusion_enabled and not init_meta.get("has_fusion_state"):
+            raise RuntimeError(
+                "Current run enables learned fusion but the init checkpoint has "
+                "no fusion_state."
+            )
 
     if fusion_enabled:
         if not args.residual:
             raise ValueError("learned fusion requires --residual True.")
         ckpt_cfg = (resume_meta or {}).get("fusion_config")
+        init_cfg = (init_meta or {}).get("fusion_config")
+        layer_cfg = ckpt_cfg or init_cfg
         if args.fusion_layers is None:
-            if ckpt_cfg and ckpt_cfg.get("candidate_layers"):
-                candidate_layers = ckpt_cfg["candidate_layers"]
+            if layer_cfg and layer_cfg.get("candidate_layers"):
+                candidate_layers = layer_cfg["candidate_layers"]
                 print(f"[Fusion] adopting candidate layers from checkpoint: {candidate_layers}")
             else:
                 candidate_layers = get_fusion_candidate_layers(args.feature_model)
@@ -1645,6 +1914,16 @@ def main():
         candidate_layers = normalize_candidate_layers(candidate_layers, args.feature_model)
         if ckpt_cfg:
             _validate_resume_fusion_config(ckpt_cfg, args, class_names, candidate_layers)
+        if init_cfg:
+            # Same architecture required, but the reference-match mode may
+            # differ (no learned parameters are tied to it).
+            _validate_resume_fusion_config(
+                init_cfg,
+                args,
+                class_names,
+                candidate_layers,
+                ignore_match_mode=True,
+            )
         if int(args.reference_refresh_interval) < 1:
             raise ValueError("--reference_refresh_interval must be >= 1.")
         # The extraction hook reads args.fusion_layers; keep it normalized and
@@ -1658,12 +1937,27 @@ def main():
             f"raw storage={args.reference_storage_dtype}"
         )
         if args.fusion_mode == "class_patch":
+            match_info = (
+                f"match={args.fusion_match_mode} | "
+                + (
+                    f"topk={args.fusion_topk} | chunks={args.fusion_query_chunk}x"
+                    f"{args.fusion_candidate_chunk} | "
+                    if args.fusion_match_mode == "dynamic_topk"
+                    else f"query_chunk={args.fusion_query_chunk} | "
+                )
+            )
             print(
                 f"[Fusion V2] adapter={args.feature_adapter_mode} | "
-                f"topk={args.fusion_topk} | chunks={args.fusion_query_chunk}x"
-                f"{args.fusion_candidate_chunk} | gate d={args.gate_hidden_dim} "
+                f"{match_info}"
+                f"gate d={args.gate_hidden_dim} "
                 f"e={args.gate_embedding_dim} lambda0={args.gate_lambda_init} "
                 f"norm={args.gate_norm} context={args.gate_use_context}"
+            )
+            print(
+                "[Fusion V2] last-layer-only class prior: "
+                f"{args.fusion_no_layer_fusion_class_names or 'none'} "
+                f"(prior_logit={args.fusion_last_layer_prior_logit}); "
+                "patch gate may still deviate per patch."
             )
     else:
         if args.fusion_layers is not None:
@@ -1859,6 +2153,11 @@ def main():
                     enable_adapter=(args.feature_adapter_mode == "class_residual"),
                     adapter_hidden_dim=args.adapter_hidden_dim,
                     adapter_beta_init=args.adapter_beta_init,
+                    no_layer_fusion_classes=[
+                        class_names.index(name)
+                        for name in args.fusion_no_layer_fusion_class_names
+                    ],
+                    last_layer_prior_logit=args.fusion_last_layer_prior_logit,
                 ).to(device)
             else:
                 fusion = ClassConditionedLayerFusion(
@@ -2019,12 +2318,12 @@ def main():
             + "-".join(str(v) for v in candidate_layers)
         )
         if args.fusion_mode == "class_patch":
-            run_name += (
-                "_adapter_"
-                + str(args.feature_adapter_mode)
-                + "_topk_"
-                + str(args.fusion_topk)
-            )
+            run_name += "_adapter_" + str(args.feature_adapter_mode)
+            if args.fusion_match_mode == "dynamic_topk":
+                # Keep the historical run name for reproducible old runs.
+                run_name += "_topk_" + str(args.fusion_topk)
+            else:
+                run_name += "_match_" + str(args.fusion_match_mode)
     moe_expert_vis_ctx = {
         "enabled": bool(args.moe_expert_vis_enable),
         "save_interval": max(1, int(args.moe_expert_vis_interval)),
@@ -2040,6 +2339,24 @@ def main():
     best_mean = -1.0
     best_result_by_class = {}
     memory_bank_snapshot: dict = {}
+
+    if init_path:
+        print(
+            f"[init] weights-only initialization from: {init_path}\n"
+            "[init] net + fusion_state only; optimizer, RNG, epoch, memory-bank "
+            "and pseudo-label state start fresh (new experiment, not a resume)."
+        )
+        init_info = common_utils.load_weights_only_checkpoint(
+            init_path, localnet, fusion=fusion
+        )
+        if fusion_enabled:
+            # The cache was refreshed at the fresh-init theta above; rebuild it
+            # for the loaded prior before any matching happens.
+            fusion_cache.refresh(step=0, epoch=0)
+        print(
+            "[init] loaded checkpoint epoch="
+            f"{init_info['epoch']} iteration={init_info['iteration']}"
+        )
 
     if resume_path:
         print(f"[resume] loading training checkpoint: {resume_path}")

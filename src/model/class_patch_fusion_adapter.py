@@ -20,7 +20,7 @@ given weights; the Top-K reranking lives in ``utils.train_utils``.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -180,6 +180,12 @@ class ClassPatchFusionAdapter(nn.Module):
     ``ClassConditionedLayerFusion`` (legacy adapter still applies in localnet).
     V2-C additionally calls :meth:`adapt_residual`; localnet must then skip its
     own legacy adaptor so features are adapted exactly once.
+
+    Per-class exception: ``no_layer_fusion_classes`` pins the class prior to
+    the last candidate layer (class-prior weight 1, no learned layer-mixing
+    weights).  Reference matching for such classes uses the last layer only;
+    :meth:`patch_weights` still starts from that pinned prior and lets the
+    patch gate produce per-patch deviations.
     """
 
     def __init__(
@@ -199,6 +205,8 @@ class ClassPatchFusionAdapter(nn.Module):
         enable_adapter: bool = False,
         adapter_hidden_dim: int = 128,
         adapter_beta_init: float = 0.15,
+        no_layer_fusion_classes: Optional[Sequence[int]] = None,
+        last_layer_prior_logit: float = 8.0,
     ):
         super().__init__()
         if int(num_classes) < 1:
@@ -213,6 +221,8 @@ class ClassPatchFusionAdapter(nn.Module):
             raise ValueError("gate_lambda_init must be >= 0")
         if not 0.0 < float(adapter_beta_init) < 1.0:
             raise ValueError("adapter_beta_init must be in (0, 1)")
+        if float(last_layer_prior_logit) < 0.0:
+            raise ValueError("last_layer_prior_logit must be >= 0")
 
         self.num_classes = int(num_classes)
         self.num_layers = int(num_layers)
@@ -223,6 +233,31 @@ class ClassPatchFusionAdapter(nn.Module):
         self.gate_demean_delta = bool(gate_demean_delta)
         self.enable_adapter = bool(enable_adapter)
         self.adapter_hidden_dim = int(adapter_hidden_dim)
+
+        # Classes whose class prior is pinned to the last candidate layer.
+        # Short name for the experiment setting: "no layer fusion, last-layer
+        # weight = 1".  The prior logits are not learned, so theta rows of these
+        # classes never influence the model.  The patch gate may still deviate
+        # from the pinned prior when ``patch_weights`` is called.
+        no_layer_fusion_classes = tuple(
+            sorted({int(c) for c in (no_layer_fusion_classes or ())})
+        )
+        for cls in no_layer_fusion_classes:
+            if not 0 <= cls < self.num_classes:
+                raise ValueError(
+                    f"no_layer_fusion class index {cls} is out of range "
+                    f"[0, {self.num_classes})."
+                )
+        self.no_layer_fusion_classes = no_layer_fusion_classes
+        self.last_layer_prior_logit = float(last_layer_prior_logit)
+        # Non-persistent: this is derived from fusion_config, not learned
+        # state, and keeping it out of state_dict preserves old checkpoints.
+        frozen_mask = torch.zeros(self.num_classes, dtype=torch.bool)
+        if no_layer_fusion_classes:
+            frozen_mask[list(no_layer_fusion_classes)] = True
+        self.register_buffer(
+            "no_layer_fusion_mask", frozen_mask, persistent=False
+        )
 
         # Class prior identical to V1 so alpha^G can start from a V1 run.
         self.theta = nn.Parameter(torch.zeros(self.num_classes, self.num_layers))
@@ -311,19 +346,65 @@ class ClassPatchFusionAdapter(nn.Module):
             )
         return idx
 
+    def _frozen_mask_for(self, idx: torch.Tensor) -> torch.Tensor:
+        """``[N]`` bool mask selecting classes with a pinned last-layer prior."""
+        return self.no_layer_fusion_mask.index_select(0, idx)
+
+    def _prior_logits(self, idx: torch.Tensor) -> torch.Tensor:
+        """Class-prior logits ``[N, L]`` with pinned last-layer rows.
+
+        For ``no_layer_fusion_classes`` the learnable ``theta`` row is ignored:
+        the logits are fixed to ``0`` everywhere except the last candidate
+        layer, which gets ``last_layer_prior_logit``.  The finite logit keeps
+        the softmax differentiable so the patch gate can still deviate.
+        A plain ``theta`` row is returned for every other class.
+        """
+        theta = self.theta.index_select(0, idx)
+        if not self.no_layer_fusion_classes:
+            return theta
+        fixed = torch.zeros_like(theta)
+        fixed[..., -1] = self.last_layer_prior_logit
+        frozen = self._frozen_mask_for(idx).unsqueeze(-1)
+        return torch.where(frozen, fixed, theta)
+
     def global_weights(self, class_idx, batch_size: Optional[int] = None) -> torch.Tensor:
-        """Class-prior weights ``alpha^G`` with shape ``[B, L]``."""
+        """Class-prior weights ``alpha^G`` with shape ``[B, L]``.
+
+        Pinned classes return an exact one-hot last-layer vector (weight 1).
+        This is the weight used for reference matching / the fused cache, so
+        those classes are matched on the last candidate layer only.
+        """
         idx = self._normalize_class_index(class_idx)
         if batch_size is not None:
             idx = self._expand_class_index(class_idx, int(batch_size))
-        return torch.softmax(
+        alpha = torch.softmax(
             self.theta.index_select(0, idx) / self._temperature, dim=-1
         )
+        if self.no_layer_fusion_classes:
+            frozen = self._frozen_mask_for(idx).unsqueeze(-1)
+            one_hot = F.one_hot(
+                torch.full_like(idx, self.num_layers - 1), self.num_layers
+            ).to(dtype=alpha.dtype)
+            alpha = torch.where(frozen, one_hot, alpha)
+        return alpha
 
     def get_layer_weights(self, class_idx=None) -> torch.Tensor:
         """Detached class-prior weights ``[num_classes, L]`` (V1 API)."""
         with torch.no_grad():
             alpha = torch.softmax(self.theta.detach() / self._temperature, dim=-1)
+            if self.no_layer_fusion_classes:
+                one_hot = F.one_hot(
+                    torch.full(
+                        (self.num_classes,),
+                        self.num_layers - 1,
+                        dtype=torch.long,
+                        device=alpha.device,
+                    ),
+                    self.num_layers,
+                ).to(dtype=alpha.dtype)
+                alpha = torch.where(
+                    self.no_layer_fusion_mask.unsqueeze(-1), one_hot, alpha
+                )
             if class_idx is None:
                 return alpha
             idx = self._normalize_class_index(class_idx)
@@ -388,7 +469,9 @@ class ClassPatchFusionAdapter(nn.Module):
             # logged delta comparable across layers without changing alpha.
             delta = delta - delta.mean(dim=-1, keepdim=True)
 
-        theta_rows = self.theta.index_select(0, idx)  # [B, L]
+        # Pinned classes use the fixed last-layer prior as the gate base;
+        # gradients still reach the gate/lambda but not their theta rows.
+        theta_rows = self._prior_logits(idx)  # [B, L]
         lam = F.softplus(self.lambda_raw.index_select(0, idx)).view(batch, 1, 1)
         logits = theta_rows.unsqueeze(1) + lam * delta
         return torch.softmax(logits / self._temperature, dim=-1)
@@ -563,5 +646,7 @@ class ClassPatchFusionAdapter(nn.Module):
             f"feature_dim={self.feature_dim}, temperature={self._temperature}, "
             f"norm={self.norm_type}, gate_hidden={self.gate.hidden_dim}, "
             f"gate_norm={self.gate.norm_type}, use_context={self.gate_use_context}, "
-            f"enable_adapter={self.enable_adapter}"
+            f"enable_adapter={self.enable_adapter}, "
+            f"no_layer_fusion_classes={self.no_layer_fusion_classes}, "
+            f"last_layer_prior_logit={self.last_layer_prior_logit}"
         )

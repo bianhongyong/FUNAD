@@ -1,9 +1,9 @@
 # FUNAD 代码修改方案：类别先验 Top-1 检索 + Query/Patch 动态融合残差
 
-> **性质**：基于当前 GitHub 源码的实施设计；尚未修改远程仓库，也未运行训练/单元测试。  
-> **仓库**：`bianhongyong/FUNAD`  
-> **基线分支**：`feature/learnable-dinov3-layer-fusion-design`  
-> **核验提交**：`800354e892af940bd08d09bdd3999f91830fa3f0`（以 SHA 固定避免后续分支漂移）  
+> **性质**：基于当前 GitHub 源码的实施设计；尚未修改远程仓库，也未运行训练/单元测试。
+> **仓库**：`bianhongyong/FUNAD`
+> **基线分支**：`feature/learnable-dinov3-layer-fusion-design`
+> **核验提交**：`800354e892af940bd08d09bdd3999f91830fa3f0`（以 SHA 固定避免后续分支漂移）
 > **目标**：Patch 动态权重只影响最终 DINOv3 融合残差，不影响最近邻参考 Patch 的选择；取消 Top-K Query 条件精排，保留训练梯度及旧 checkpoint 兼容。
 
 ## 1. 核心决策
@@ -50,6 +50,34 @@ r_{c,p}=\sum_l\alpha_{c,p,l}
 
 **特别注意**：不要写成逐层单独 NN；所有层对应同一个参考行 `j*`。当 `T=none` 时，先融合再相减与先对**同一个**参考 Patch 逐层相减再线性加权在代数上等价；`layer_norm` 时必须分别对 Query 与 Reference 作 `T`，不能先做差后 LayerNorm。
 
+### 1.1.1 按类固定最后一层先验（默认 screw）
+
+新增 `--fusion_no_layer_fusion_classes`（逗号分隔类名，默认 `screw`，空串关闭）。
+命中的类别不再学习层间融合权重的类别先验，而是固定在**候选层列表的最后一层**：
+
+\[
+\alpha^G_{c,l}=\mathbb{1}[l=L]\qquad(\text{精确 one-hot，权重 }1)
+\]
+
+该先验只用于 `prior_top1` 的参考匹配与 fused cache；不会产生 `theta` 梯度。
+残差阶段仍允许 Patch Gate 偏离该先验：
+
+\[
+u_{c,l}=\begin{cases}
+\text{last\_layer\_prior\_logit} & l=L\\
+0 & l<L
+\end{cases},\qquad
+\alpha_{c,p,l}=\operatorname{softmax}_l
+\left((u_{c,l}+\lambda_c\delta_{c,p,l})/\tau\right)
+\]
+
+`--fusion_last_layer_prior_logit`（默认 8.0）控制初始偏离难度：值越大，初始
+Patch 权重越接近“最后一层=1”，Gate 需要更大的 `delta` 才能混合其他层。
+匹配仍使用精确 one-hot 的 `alpha^G`；残差对 Query 与 `M[j*]` 使用同一个
+`alpha_{c,p}`。`fusion_config` 会保存 `no_layer_fusion_classes` 与
+`last_layer_prior_logit`；旧 checkpoint 缺少这两个字段时解释为“无固定类”，
+因此恢复旧实验需要显式传 `--fusion_no_layer_fusion_classes ""`。
+
 ### 1.2 与旧算法的研究关系
 
 - 旧 `dynamic_topk K=32`：Patch 权重同时影响选择参考 Patch 和最终残差。
@@ -59,16 +87,16 @@ r_{c,p}=\sum_l\alpha_{c,p,l}
 
 ## 2. 仓库现状（已实际读取 800354e 源码）
 
-| 文件 | 现状 | 改动 |
-| --- | --- | --- |
-| `src/model/class_patch_fusion_adapter.py` | `ClassPatchFusionAdapter` 有 `global_weights()`、`patch_weights()`、`fuse_query()`、可选 `adapt_residual()`；`forward()` 是类别先验融合 | 主体保留；规范 `global` 只用于参考匹配、`patch` 只用于残差；无需重写 Gate |
-| `utils/train_utils.py` | `FusedReferenceCache.nearest_topk_ids()`、`compute_class_patch_fused_residual_batch()` 包含 Top-K 粗排 + 分块 rerank + 二次加载 | 新增/替代为轻量 `compute_class_patch_prior_top1_residual_batch()`；调用 `nearest_ids()`；删除新模式 rerank 循环 |
-| `self_train_ad_multiclass_dinov3.py` | `ClassPatchFusionRuntime.residual()` 调用 `compute_class_patch_fused_residual_batch(topk=...)`；CLI、日志、schema 绑定 K | 新增/切换匹配模式 `prior_top1`，默认使用；维护老 `dynamic_topk` 作为对照 |
-| `src/train/epoch_precompute.py` | Phase 1、2、3 都通过相同 `compute_residual_feature_batch_fn` 回调处理图像 | 接口不变；实际改为统一新 callback；添加可选阶段计时 |
-| `utils/evaluate.py` | 评估经 residual callback | 不更改评分定义，只验证新路径确实生效 |
-| `src/inference/infer_multiclass_residual.py` | `class_patch` checkpoint 根据 `fusion_topk` 调用 Top-K 动态精排，重建 FAISS 缓存 | 根据 checkpoint `match_mode` 分派；prior_top1 调用新函数，FAISS `.search(k=1)` |
-| `shell/run_self_train_ad_multiclass_class_patch.sh` | 默认 `FUSION_TOPK=32`、`FUSION_CANDIDATE_CHUNK=8` | 新默认 `MATCH_MODE=prior_top1`，只设置单参考 `REF_CHUNK`；把 K 配置放在 legacy dynamic_topk 分支 |
-| `tests/test_class_patch_reference_match.py` | 测试 Top-K、全库精排、旧 K=1 与 V1 等价、两端梯度等 | 增加 prior_top1 专属测试；保留旧 Top-K 消融测试 |
+| 文件                                                  | 现状                                                                                                                                                | 改动                                                                                                                |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `src/model/class_patch_fusion_adapter.py`           | `ClassPatchFusionAdapter` 有 `global_weights()`、`patch_weights()`、`fuse_query()`、可选 `adapt_residual()`；`forward()` 是类别先验融合 | 主体保留；规范 `global` 只用于参考匹配、`patch` 只用于残差；无需重写 Gate                                       |
+| `utils/train_utils.py`                              | `FusedReferenceCache.nearest_topk_ids()`、`compute_class_patch_fused_residual_batch()` 包含 Top-K 粗排 + 分块 rerank + 二次加载                 | 新增/替代为轻量 `compute_class_patch_prior_top1_residual_batch()`；调用 `nearest_ids()`；删除新模式 rerank 循环 |
+| `self_train_ad_multiclass_dinov3.py`                | `ClassPatchFusionRuntime.residual()` 调用 `compute_class_patch_fused_residual_batch(topk=...)`；CLI、日志、schema 绑定 K                        | 新增/切换匹配模式 `prior_top1`，默认使用；维护老 `dynamic_topk` 作为对照                                        |
+| `src/train/epoch_precompute.py`                     | Phase 1、2、3 都通过相同 `compute_residual_feature_batch_fn` 回调处理图像                                                                         | 接口不变；实际改为统一新 callback；添加可选阶段计时                                                                 |
+| `utils/evaluate.py`                                 | 评估经 residual callback                                                                                                                            | 不更改评分定义，只验证新路径确实生效                                                                                |
+| `src/inference/infer_multiclass_residual.py`        | `class_patch` checkpoint 根据 `fusion_topk` 调用 Top-K 动态精排，重建 FAISS 缓存                                                                | 根据 checkpoint `match_mode` 分派；prior_top1 调用新函数，FAISS `.search(k=1)`                                  |
+| `shell/run_self_train_ad_multiclass_class_patch.sh` | 默认 `FUSION_TOPK=32`、`FUSION_CANDIDATE_CHUNK=8`                                                                                               | 新默认 `MATCH_MODE=prior_top1`，只设置单参考 `REF_CHUNK`；把 K 配置放在 legacy dynamic_topk 分支                |
+| `tests/test_class_patch_reference_match.py`         | 测试 Top-K、全库精排、旧 K=1 与 V1 等价、两端梯度等                                                                                                 | 增加 prior_top1 专属测试；保留旧 Top-K 消融测试                                                                     |
 
 精排热点：当前 `compute_class_patch_fused_residual_batch` 在 `utils/train_utils.py` 中以 `q_chunk × k_chunk` 循环，对 K 个候选不断调用 `fusion_cache.raw_rows()` 并重融合；选中最终参考后，又执行一轮 `raw_rows()` 与有梯度融合。新方案删除前一轮所有 K 候选查询与精排。
 
@@ -142,6 +170,7 @@ def compute_class_patch_prior_top1_residual_batch(
 ### PR1 / Commit 1：新增 Prior-Top1 Residual 函数
 
 修改 `utils/train_utils.py`：
+
 1. 增加 `compute_class_patch_prior_top1_residual_batch(...)`，复用 `_validate_class_patch_inputs`。
 2. 查询用类别先验查 `nearest_ids`，不调用 `nearest_topk_ids(k>1)`、`exact_dynamic_nearest_ids()` 或精排。
 3. 参考只读取 `nn_ids` 指向的原始多层特征；`unique(ids)` 减少 CPU→GPU 传输，重展开后逐 Query 动态融合。
@@ -154,6 +183,7 @@ def compute_class_patch_prior_top1_residual_batch(
 ### PR2 / Commit 2：训练运行时与参数协议
 
 修改 `self_train_ad_multiclass_dinov3.py`：
+
 1. 新增 `--fusion_match_mode {prior_top1,dynamic_topk}`。新训练的 class_patch **默认** `prior_top1`；旧 `dynamic_topk` 可显式选用。
 2. `ClassPatchFusionRuntime.residual()`：
    - prior_top1 → 新函数；
@@ -166,6 +196,7 @@ def compute_class_patch_prior_top1_residual_batch(
 ### PR3 / Commit 3：checkpoint 兼容与独立推理
 
 修改 `self_train_ad_multiclass_dinov3.py` 和 `src/inference/infer_multiclass_residual.py`：
+
 1. 新 class_patch checkpoint 设置 `schema_version=3`、`match_mode="prior_top1"`；不再要求 `fusion_topk`。
 2. 历史 `schema_version=2` 的 `class_patch` checkpoint **缺省解释为 `dynamic_topk`**；不可默默以新语义加载。
 3. 新模式训练恢复时，核对 `match_mode` 与 checkpoint；不一致直接报错，避免继续训练后可复现性混乱。
@@ -201,6 +232,7 @@ def compute_class_patch_prior_top1_residual_batch(
 python -m unittest tests.test_class_patch_fusion_adapter -v
 python -m unittest tests.test_class_patch_reference_match -v
 python -m unittest tests.test_class_patch_prior_top1 -v
+python -m unittest tests.test_class_patch_last_layer_prior -v
 python -m unittest tests.test_layer_fusion -v
 ```
 
@@ -227,18 +259,19 @@ python -m unittest tests.test_layer_fusion -v
 
 实验需统一候选 DINOv3 层、原始参考库/类别索引、网络、训练预算、随机种子、loss、伪标签、数据预处理。
 
-| 实验 | NN 选择 | 动态层权重用于残差 | 作用 |
-|---|---|---|---|
-| B0 | 类别先验 Top-1 | 否（类权重） | V1 learned_class baseline |
-| B1 | 类别先验 Top-1 | 是 | **新方案 prior_top1** |
-| B2 | 类别先验 Top-K + 动态精排，K=1 | 是 | 新方案数值回归/实现开销对照 |
-| B3 | 类别先验 Top-K + 动态精排，K=16/32 | 是 | 旧 V2 的效果/速度上限对照 |
-| B4 | B1 + GPU 参考行缓存 | 是 | 纯工程提速对照 |
-| B5 | B1 + 类别强度 Adapter | 是 | 功能模块独立消融（可选） |
+| 实验 | NN 选择                            | 动态层权重用于残差 | 作用                        |
+| ---- | ---------------------------------- | ------------------ | --------------------------- |
+| B0   | 类别先验 Top-1                     | 否（类权重）       | V1 learned_class baseline   |
+| B1   | 类别先验 Top-1                     | 是                 | **新方案 prior_top1** |
+| B2   | 类别先验 Top-K + 动态精排，K=1     | 是                 | 新方案数值回归/实现开销对照 |
+| B3   | 类别先验 Top-K + 动态精排，K=16/32 | 是                 | 旧 V2 的效果/速度上限对照   |
+| B4   | B1 + GPU 参考行缓存                | 是                 | 纯工程提速对照              |
+| B5   | B1 + 类别强度 Adapter              | 是                 | 功能模块独立消融（可选）    |
 
 至少记录：I-AUROC / P-AUROC（逐类与均值）、Phase 1/2/3 耗时、训练 Epoch 耗时、评估推理耗时、峰值显存、Patch alpha 的均值/方差/偏离先验、Gate 梯度、Reference NN 漂移。
 
 **验收门槛**：
+
 - 固定类别先验和参考缓存后，任意修改 Patch Gate（不修改 theta）都不能改变 NN id。
 - 选中唯一参考 `j*` 后，Query 和 Reference 使用同一 alpha；所有自训练/推理阶段一致。
 - `delta=0` 与类别融合基线数值对齐；训练有正确 Fusion 梯度；旧 checkpoint 继续可复现。
