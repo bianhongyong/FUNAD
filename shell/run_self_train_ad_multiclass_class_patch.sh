@@ -15,8 +15,8 @@ conda activate "$CONDA_ENV"
 export MPLBACKEND=Agg
 
 # ===== User-configurable =====
-NOISE="${NOISE:-10%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
-DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy10}"
+NOISE="${NOISE:-15%}"         # 0% | 1% | 2% | 3% | 5% | 10% | 20% | 25%
+DATA_PATH="${DATA_PATH:-/media/honeywell/D/bhy/dataset/MVTec_overlap/MVTec_noisy15}"
 SAVE_PATH="${SAVE_PATH:-/media/honeywell/E/bhy/FUNAD/save_results/class_patch}"
 DATASET="${DATASET:-mvtec}"   # mvtec | visa
 EPOCH="${EPOCH:-20}"
