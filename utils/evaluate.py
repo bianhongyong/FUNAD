@@ -1,3 +1,5 @@
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -20,6 +22,17 @@ def _cv2_resize_dsize_from_mask(mask_i):
         raise ValueError(f"mask must be at least 2D, got shape {mi.shape}")
     h, w = int(mi.shape[-2]), int(mi.shape[-1])
     return (w, h)
+
+
+def _patch_grid_side(num_patches: int) -> int:
+    """Square patch-grid side; never hard-code 28x28 (= 784 patches)."""
+    num_patches = int(num_patches)
+    side = int(round(math.sqrt(num_patches)))
+    if side * side != num_patches:
+        raise RuntimeError(
+            f"patch 数 {num_patches} 不是完全平方数，无法 reshape 成方形热力图。"
+        )
+    return side
 
 
 def _build_patch_class_idx(class_idx: torch.Tensor, patch_features: torch.Tensor):
@@ -125,7 +138,24 @@ def _safe_average_precision(y_true, y_score):
         return 0.0
 
 
-def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
+def _pr_ap_f1(y_true, y_score):
+    """Average precision and best F1 from one precision-recall sweep."""
+    y_true = np.asarray(y_true).astype(np.uint8).ravel()
+    y_score = np.asarray(y_score).astype(np.float32).ravel()
+    if y_true.size == 0 or y_true.min() == y_true.max():
+        return 0.0, 0.0
+    precisions, recalls, _ = precision_recall_curve(y_true, y_score)
+    if precisions.size <= 1:
+        return 0.0, 0.0
+    ap = float(-np.sum(np.diff(recalls) * precisions[:-1]))
+    f1s = 2.0 * precisions * recalls / (precisions + recalls + 1e-7)
+    return ap, float(np.max(f1s[:-1]))
+
+
+def _finalize_metrics_extended(
+    label_gt, img_map, mask_gt, seg_map, compute_pro_metric=False
+):
+    """Compute the chapter-1 metric set (I/P-AUROC + I/P-AP + F1-max [+ AUPRO])."""
     y_true_img = np.asarray(label_gt).astype(np.uint8)
     y_score_img = np.asarray(img_map).astype(np.float32)
 
@@ -139,10 +169,26 @@ def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
     y_true_px_flat = gt_px.ravel()
     y_score_px_flat = pr_px.ravel()
 
-    auroc_sp = _safe_roc_auc(y_true_img, y_score_img)
-    auroc_px = _safe_roc_auc(y_true_px_flat, y_score_px_flat)
+    image_ap, image_f1 = _pr_ap_f1(y_true_img, y_score_img)
+    pixel_ap, pixel_f1 = _pr_ap_f1(y_true_px_flat, y_score_px_flat)
+    pixel_aupro = (
+        float(compute_pro(gt_px, pr_px)) if compute_pro_metric else None
+    )
+    return {
+        "image_auroc": _safe_roc_auc(y_true_img, y_score_img),
+        "pixel_auroc": _safe_roc_auc(y_true_px_flat, y_score_px_flat),
+        "image_ap": image_ap,
+        "pixel_ap": pixel_ap,
+        "image_f1_max": image_f1,
+        "pixel_f1_max": pixel_f1,
+        "pixel_aupro": pixel_aupro,
+    }
 
-    return auroc_sp, auroc_px
+
+def _finalize_metrics(label_gt, img_map, mask_gt, seg_map):
+    """Backward-compatible ``(I-AUROC, P-AUROC)`` pair."""
+    metrics = _finalize_metrics_extended(label_gt, img_map, mask_gt, seg_map)
+    return metrics["image_auroc"], metrics["pixel_auroc"]
 
 
 def evaluate_multiclass_epoch(
@@ -165,7 +211,8 @@ def evaluate_multiclass_epoch(
             _, score = localnet(features)
             score = score.detach().cpu().numpy()
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
-            score = score.reshape(-1, 28, 28)
+            patch_side = _patch_grid_side(score.shape[-1])
+            score = score.reshape(-1, patch_side, patch_side)
             for i in range(score.shape[0]):
                 _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)
@@ -190,6 +237,8 @@ def evaluate_residual_multiclass_epoch(
     device,
     extract_feature_batch_fn,
     compute_residual_feature_batch_fn,
+    return_dict=False,
+    compute_pro_metric=False,
 ):
     seg_map, img_map, label_gt, mask_gt = [], [], [], []
     for images, y, mask in test_loader:
@@ -225,7 +274,8 @@ def evaluate_residual_multiclass_epoch(
                                  class_idx=class_idx_batch)
             score = score.detach().cpu().numpy()
             img_map.append(aggregate_image_scores(score, topk_ratio=args.img_score_topk_ratio))
-            score = score.reshape(-1, 28, 28)
+            patch_side = _patch_grid_side(score.shape[-1])
+            score = score.reshape(-1, patch_side, patch_side)
             for i in range(score.shape[0]):
                 _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)
@@ -236,7 +286,12 @@ def evaluate_residual_multiclass_epoch(
     label_gt = np.array(label_gt)
     seg_map = np.stack(seg_map, axis=0)
     mask_gt = np.stack(mask_gt, axis=0)
-    return _finalize_metrics(label_gt, img_map, mask_gt, seg_map)
+    metrics = _finalize_metrics_extended(
+        label_gt, img_map, mask_gt, seg_map, compute_pro_metric=compute_pro_metric
+    )
+    if return_dict:
+        return metrics
+    return metrics["image_auroc"], metrics["pixel_auroc"]
 
 
 def evaluate_feature_epoch(localnet, test_loader, device):
@@ -250,7 +305,8 @@ def evaluate_feature_epoch(localnet, test_loader, device):
             _, score = localnet(x)
             score = score.detach().cpu().numpy()
             img_map.append(score.max(axis=1))
-            score = score.reshape(-1, 28, 28)
+            patch_side = _patch_grid_side(score.shape[-1])
+            score = score.reshape(-1, patch_side, patch_side)
             for i in range(score.shape[0]):
                 _map = cv2.resize(score[i], _cv2_resize_dsize_from_mask(mask[i]))
                 _map = gaussian_filter(_map, sigma=4)

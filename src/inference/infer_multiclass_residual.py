@@ -28,12 +28,20 @@ from dataset.feature_extract import (
     DINOV3_FEATURE_MODEL_REGISTRY,
     build_dinov3_feature_extractor,
     extract_dinov3_feature_batch,
+    extract_dinov3_multilayer_feature_batch,
     infer_dinov3_feature_dim,
+    infer_dinov3_multilayer_num_patches,
 )
 from src.model import model
+from src.model.class_patch_fusion_adapter import ClassPatchFusionAdapter
+from src.model.layer_fusion import ClassConditionedLayerFusion
 import utils.train_utils as common_utils
 from utils.evaluate import _cv2_resize_dsize_from_mask
-from dataset.multiclass_feature_dataset import get_all_class_names, get_class_layer_indices
+from dataset.multiclass_feature_dataset import (
+    get_all_class_names,
+    get_class_layer_indices,
+    normalize_candidate_layers,
+)
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -232,6 +240,223 @@ def infer_use_residual(checkpoint: dict, checkpoint_path: str, args) -> bool:
     if "_no_residual_" in basename or basename.endswith("_no_residual_localnet.pt"):
         return False
     return False
+
+
+FUSION_REFERENCE_FORMAT = "multilayer_raw_v1"
+_IMAGENET_PREPROCESS = {
+    "mean": list(IMAGENET_MEAN),
+    "std": list(IMAGENET_STD),
+}
+
+
+def detect_learned_fusion(checkpoint: dict) -> bool:
+    """A checkpoint is a learned-fusion run iff it carries fusion schema markers."""
+    return (
+        checkpoint.get("fusion_state") is not None
+        or checkpoint.get("reference_memory_format") == FUSION_REFERENCE_FORMAT
+    )
+
+
+def resolve_fusion_match_mode(fusion_cfg: dict) -> str:
+    """Return ``prior_top1`` / ``dynamic_topk`` for a class_patch checkpoint.
+
+    Historical ``schema_version=2`` checkpoints have no ``match_mode`` and
+    must keep their original dynamic Top-K semantics.  Schema 3 writes the
+    mode explicitly; a missing value defaults to ``prior_top1``.
+    """
+    if fusion_cfg.get("fusion_mode") != "class_patch":
+        return "none"
+    schema_version = int(fusion_cfg.get("schema_version", 0))
+    if schema_version < 3:
+        return "dynamic_topk"
+    match_mode = str(fusion_cfg.get("match_mode") or "prior_top1")
+    if match_mode not in ("prior_top1", "dynamic_topk"):
+        raise RuntimeError(
+            f"未知 class_patch match_mode: {match_mode!r} "
+            "(expected prior_top1 or dynamic_topk)."
+        )
+    return match_mode
+
+
+def validate_fusion_inference_config(fusion_cfg: dict, args, all_class_names):
+    """Strictly validate the checkpoint schema against CLI inference settings.
+
+    Returns the normalized candidate layer list.  Silent mismatches (wrong
+    backbone / layer order / class order / preprocess) would make the residual
+    bank meaningless, so they are hard errors.
+    """
+    if not fusion_cfg:
+        raise RuntimeError("learned-fusion checkpoint 缺少 fusion_config。")
+
+    errors = []
+    expected_layers = normalize_candidate_layers(
+        fusion_cfg.get("candidate_layers") or [], str(fusion_cfg.get("feature_model"))
+    )
+
+    checks = [
+        ("feature_model", str(args.feature_model), str(fusion_cfg.get("feature_model"))),
+        ("dataset", str(args.dataset), str(fusion_cfg.get("dataset"))),
+        ("image_size", int(args.image_size), int(fusion_cfg.get("image_size", -1))),
+        ("crop_size", int(args.crop_size), int(fusion_cfg.get("crop_size", -1))),
+        ("use_cls_token", bool(args.use_cls_token), bool(fusion_cfg.get("use_cls_token"))),
+        ("num_classes", int(len(all_class_names)), int(fusion_cfg.get("num_classes", -1))),
+        ("num_layers", int(len(expected_layers)), int(fusion_cfg.get("num_layers", -1))),
+    ]
+    for name, current, stored in checks:
+        if current != stored:
+            errors.append(f"{name}: checkpoint={stored!r}, inference={current!r}")
+
+    if list(fusion_cfg.get("class_names") or []) != list(all_class_names):
+        errors.append(
+            "class order mismatch: checkpoint="
+            f"{fusion_cfg.get('class_names')}, inference={list(all_class_names)}"
+        )
+
+    preprocess = fusion_cfg.get("preprocess") or {}
+    expected_preprocess = {
+        "resize": [int(args.image_size), int(args.image_size)],
+        "center_crop": [int(args.crop_size), int(args.crop_size)],
+        **_IMAGENET_PREPROCESS,
+    }
+    for key, value in expected_preprocess.items():
+        if preprocess.get(key) != value:
+            errors.append(
+                f"preprocess[{key}]: checkpoint={preprocess.get(key)!r}, "
+                f"inference={value!r}"
+            )
+
+    if errors:
+        raise RuntimeError(
+            "checkpoint 与推理配置不匹配（请检查 --feature_model / --dataset / "
+            "--image_size / --crop_size / --use_cls_token）:\n  - "
+            + "\n  - ".join(errors)
+        )
+
+    if fusion_cfg.get("fusion_mode") not in (
+        "learned_class", "learned_shared", "class_patch"
+    ):
+        raise RuntimeError(
+            f"未知 fusion_mode: {fusion_cfg.get('fusion_mode')!r}"
+        )
+    if fusion_cfg.get("fusion_mode") == "class_patch":
+        if int(fusion_cfg.get("schema_version", 0)) < 2:
+            raise RuntimeError(
+                "class_patch fusion checkpoint 的 schema_version 必须 >= 2。"
+            )
+        match_mode = resolve_fusion_match_mode(fusion_cfg)
+        if int(fusion_cfg.get("fusion_query_chunk", 512)) < 1:
+            raise RuntimeError("fusion_config.fusion_query_chunk 必须 >= 1。")
+        if match_mode == "dynamic_topk":
+            if int(fusion_cfg.get("fusion_topk", 0)) < 1:
+                raise RuntimeError(
+                    "dynamic_topk fusion_config 缺少有效的 fusion_topk。"
+                )
+        if str(fusion_cfg.get("feature_adapter_mode", "legacy")) not in (
+            "legacy", "class_residual"
+        ):
+            raise RuntimeError(
+                "未知 feature_adapter_mode: "
+                f"{fusion_cfg.get('feature_adapter_mode')!r}"
+            )
+        no_layer_names = [
+            str(name)
+            for name in (fusion_cfg.get("no_layer_fusion_classes") or [])
+        ]
+        unknown = sorted(set(no_layer_names) - set(all_class_names))
+        if unknown:
+            raise RuntimeError(
+                "fusion_config.no_layer_fusion_classes 含未知类别: "
+                f"{unknown}; checkpoint classes={list(all_class_names)}"
+            )
+        if float(fusion_cfg.get("last_layer_prior_logit", 8.0)) < 0.0:
+            raise RuntimeError(
+                "fusion_config.last_layer_prior_logit 必须 >= 0。"
+            )
+    return expected_layers
+
+
+def validate_raw_bank_metadata(raw_meta: dict, fusion_cfg: dict, raw_bank: dict):
+    """Validate the raw sidecar against the checkpoint schema and class order."""
+    if not isinstance(raw_bank, dict) or len(raw_bank) == 0:
+        raise RuntimeError("raw reference bank 为空。")
+    expected_classes = set(range(int(fusion_cfg["num_classes"])))
+    if set(int(k) for k in raw_bank.keys()) != expected_classes:
+        raise RuntimeError(
+            "raw reference bank 的类别键与 fusion_config.num_classes 不一致: "
+            f"bank={sorted(int(k) for k in raw_bank.keys())}, "
+            f"expected={sorted(expected_classes)}"
+        )
+
+    errors = []
+    checks = [
+        ("candidate_layers", "candidate_layers"),
+        ("feature_model", "feature_model"),
+        ("class_names", "class_names"),
+        ("use_cls_token", "use_cls_token"),
+        ("image_size", "image_size"),
+        ("crop_size", "crop_size"),
+        ("dataset", "dataset"),
+        ("preprocess", "preprocess"),
+    ]
+    for raw_key, cfg_key in checks:
+        if raw_key in raw_meta and raw_meta.get(raw_key) != fusion_cfg.get(cfg_key):
+            errors.append(
+                f"{raw_key}: sidecar={raw_meta.get(raw_key)!r}, "
+                f"checkpoint={fusion_cfg.get(cfg_key)!r}"
+            )
+    if (
+        "storage_dtype" in raw_meta
+        and raw_meta.get("storage_dtype")
+        != fusion_cfg.get("reference_storage_dtype")
+    ):
+        errors.append(
+            "storage_dtype: sidecar="
+            f"{raw_meta.get('storage_dtype')!r}, "
+            f"checkpoint={fusion_cfg.get('reference_storage_dtype')!r}"
+        )
+    if int(raw_meta.get("num_layers", -1)) != int(fusion_cfg["num_layers"]):
+        errors.append(
+            f"num_layers: sidecar={raw_meta.get('num_layers')!r}, "
+            f"checkpoint={fusion_cfg['num_layers']!r}"
+        )
+    if int(raw_meta.get("feature_dim", -1)) != int(fusion_cfg["feature_dim"]):
+        errors.append(
+            f"feature_dim: sidecar={raw_meta.get('feature_dim')!r}, "
+            f"checkpoint={fusion_cfg['feature_dim']!r}"
+        )
+
+    first = np.asarray(next(iter(raw_bank.values())))
+    if first.ndim != 3 or int(first.shape[1]) != int(fusion_cfg["num_layers"]):
+        errors.append(f"raw bank shape {first.shape} is not [N, L, C] with L={fusion_cfg['num_layers']}")
+    if int(first.shape[2]) != int(fusion_cfg["feature_dim"]):
+        errors.append(f"raw bank C={first.shape[2]} != feature_dim={fusion_cfg['feature_dim']}")
+
+    if errors:
+        raise RuntimeError(
+            "raw reference bank metadata 与 checkpoint 不一致:\n  - "
+            + "\n  - ".join(errors)
+        )
+
+
+def find_fusion_num_patches(args, feature_extractor, device, target_class_names, candidate_layers):
+    """Infer DINOv3 patch count for the learned-fusion schema."""
+    for class_name in target_class_names:
+        test_set = dataset_extract.MyDataset(
+            dataset_path=args.data_path,
+            dataset=args.dataset,
+            class_name=class_name,
+            is_train=False,
+            resize=args.image_size,
+            cropsize=args.crop_size,
+        )
+        if len(test_set) == 0:
+            continue
+        dummy_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=0)
+        return infer_dinov3_multilayer_num_patches(
+            dummy_loader, feature_extractor, candidate_layers,
+            args.use_cls_token, device,
+        )
+    raise RuntimeError("测试集为空，无法推断 patch 数。")
 
 
 def _set_dinov3_hub_env(hub_path: str):
@@ -603,26 +828,74 @@ def main():
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
     if "net" not in checkpoint:
         raise KeyError("checkpoint 缺少 'net' 键。")
-    if "reference_memory_by_class" not in checkpoint:
+
+    learned_fusion = detect_learned_fusion(checkpoint)
+    fusion_cfg = None
+    candidate_layers = None
+    if learned_fusion:
+        if checkpoint.get("reference_memory_format") != FUSION_REFERENCE_FORMAT:
+            raise RuntimeError(
+                "learned-fusion checkpoint 的 reference_memory_format 不正确: "
+                f"{checkpoint.get('reference_memory_format')!r}"
+            )
+        if checkpoint.get("fusion_state") is None:
+            raise KeyError("learned-fusion checkpoint 缺少 'fusion_state'。")
+        if checkpoint.get("raw_reference_manifest") is None:
+            raise KeyError("learned-fusion checkpoint 缺少 'raw_reference_manifest'。")
+        fusion_cfg = checkpoint.get("fusion_config")
+        candidate_layers = validate_fusion_inference_config(
+            fusion_cfg, args, all_class_names
+        )
+    elif "reference_memory_by_class" not in checkpoint:
         raise KeyError("checkpoint 缺少 'reference_memory_by_class' 键。")
 
     use_residual = infer_use_residual(checkpoint, args.checkpoint_path, args)
-    print(f"[model] use_residual={use_residual}")
+    if learned_fusion:
+        if args.residual is False:
+            raise ValueError(
+                "learned-fusion checkpoint 必须使用 residual 特征，"
+                "--residual False 不兼容。"
+            )
+        use_residual = True
+    print(
+        f"[model] use_residual={use_residual} | "
+        f"learned_fusion={learned_fusion}"
+    )
 
     feature_extractor = build_feature_extractor(args, device)
 
-    # Build per-class layer indices (matches training's per-backbone table).
-    # Must happen before find_feature_dim_and_patches which needs class_layer_indices.
-    class_layer_table = get_class_layer_indices(args.feature_model)
-    args.class_layer_indices = {
-        i: class_layer_table.get(name, [-1])
-        for i, name in enumerate(all_class_names)
-    }
-
-    feature_dim, num_patches = find_feature_dim_and_patches(
-        args, feature_extractor, device, target_class_names, class_to_idx,
-        class_layer_indices=args.class_layer_indices,
-    )
+    if learned_fusion:
+        fusion_match_mode = resolve_fusion_match_mode(fusion_cfg)
+        print(
+            f"[fusion] mode={fusion_cfg.get('fusion_mode')} | "
+            f"match={fusion_match_mode} | "
+            f"layers={candidate_layers} | tau={fusion_cfg.get('temperature')} | "
+            f"norm={fusion_cfg.get('norm_type')} "
+            f"(affine={fusion_cfg.get('norm_affine')}) | "
+            f"feature_dim={fusion_cfg.get('feature_dim')}"
+        )
+        if fusion_cfg.get("fusion_mode") == "class_patch":
+            print(
+                "[fusion] last-layer-only class prior: "
+                f"{fusion_cfg.get('no_layer_fusion_classes') or 'none'} "
+                f"(prior_logit={fusion_cfg.get('last_layer_prior_logit', 8.0)})"
+            )
+        feature_dim = int(fusion_cfg["feature_dim"])
+        num_patches = find_fusion_num_patches(
+            args, feature_extractor, device, target_class_names, candidate_layers
+        )
+    else:
+        # Build per-class layer indices (matches training's per-backbone table).
+        # Must happen before find_feature_dim_and_patches which needs class_layer_indices.
+        class_layer_table = get_class_layer_indices(args.feature_model)
+        args.class_layer_indices = {
+            i: class_layer_table.get(name, [-1])
+            for i, name in enumerate(all_class_names)
+        }
+        feature_dim, num_patches = find_feature_dim_and_patches(
+            args, feature_extractor, device, target_class_names, class_to_idx,
+            class_layer_indices=args.class_layer_indices,
+        )
     patch_side = int(np.sqrt(num_patches))
     if patch_side * patch_side != num_patches:
         raise RuntimeError(
@@ -645,6 +918,11 @@ def main():
         print(f"[model]   moe: num_expert={moe_num_expert}, top_k={moe_top_k}, "
               f"hard_class_gate={moe_hard_class_gate}")
 
+    feature_adapter_mode = "legacy"
+    if learned_fusion and fusion_cfg.get("fusion_mode") == "class_patch":
+        feature_adapter_mode = str(
+            fusion_cfg.get("feature_adapter_mode", "legacy")
+        )
     localnet = model.localnet(
         len_feature=feature_dim,
         use_moe_discriminator=use_moe,
@@ -652,24 +930,106 @@ def main():
         moe_top_k=moe_top_k,
         moe_use_cls_token=args.moe_use_cls_token,
         moe_hard_class_gate=moe_hard_class_gate,
-        num_classes=len(all_class_names) if has_class_adapter else None,
+        num_classes=len(all_class_names) if (has_class_adapter or feature_adapter_mode == "class_residual") else None,
         class_conditioned_adapter=has_class_adapter,
+        feature_adapter_mode=feature_adapter_mode,
     ).to(device)
     localnet.load_state_dict(checkpoint["net"], strict=True)
     localnet.eval()
     feature_extractor.eval()
 
-    reference_memory_by_class, reference_index_by_class = build_reference_index(
-        reference_memory_by_class_raw=checkpoint["reference_memory_by_class"],
-        use_cuda=use_cuda,
-        use_cpu_index=bool(args.faiss_cpu_index),
-        gpu_temp_mem_mb=int(args.faiss_gpu_temp_mem_mb),
-        allow_empty=not use_residual,
-    )
-    if use_residual and len(reference_index_by_class) == 0:
-        raise RuntimeError(
-            "use_residual=True 但 checkpoint 中 reference_memory_by_class 为空。"
+    fusion = None
+    fusion_cache = None
+    reference_memory_by_class: Dict[int, np.ndarray] = {}
+    reference_index_by_class: Dict[int, object] = {}
+    if learned_fusion:
+        base_dir = os.path.dirname(os.path.abspath(args.checkpoint_path))
+        raw_bank, raw_meta = common_utils.load_raw_reference_bank(
+            checkpoint["raw_reference_manifest"], base_dir=base_dir
         )
+        validate_raw_bank_metadata(raw_meta, fusion_cfg, raw_bank)
+
+        if fusion_cfg.get("fusion_mode") == "class_patch":
+            no_layer_names = [
+                str(name)
+                for name in (fusion_cfg.get("no_layer_fusion_classes") or [])
+            ]
+            fusion = ClassPatchFusionAdapter(
+                num_classes=int(fusion_cfg["num_classes"]),
+                num_layers=int(fusion_cfg["num_layers"]),
+                feature_dim=int(fusion_cfg["feature_dim"]),
+                temperature=float(fusion_cfg.get("temperature", 1.0)),
+                norm_type=str(fusion_cfg.get("norm_type", "none")),
+                norm_affine=bool(fusion_cfg.get("norm_affine", False)),
+                class_embedding_dim=int(fusion_cfg.get("gate_embedding_dim", 32)),
+                gate_hidden_dim=int(fusion_cfg.get("gate_hidden_dim", 64)),
+                gate_norm=str(fusion_cfg.get("gate_norm", "layer_norm")),
+                gate_lambda_init=float(fusion_cfg.get("gate_lambda_init", 0.1)),
+                gate_use_context=bool(fusion_cfg.get("gate_use_context", False)),
+                gate_demean_delta=bool(fusion_cfg.get("gate_demean_delta", True)),
+                enable_adapter=(
+                    str(fusion_cfg.get("feature_adapter_mode", "legacy"))
+                    == "class_residual"
+                ),
+                adapter_hidden_dim=int(fusion_cfg.get("adapter_hidden_dim", 128)),
+                adapter_beta_init=float(fusion_cfg.get("adapter_beta_init", 0.15)),
+                no_layer_fusion_classes=[
+                    all_class_names.index(name) for name in no_layer_names
+                ],
+                last_layer_prior_logit=float(
+                    fusion_cfg.get("last_layer_prior_logit", 8.0)
+                ),
+            ).to(device)
+        else:
+            fusion = ClassConditionedLayerFusion(
+                num_classes=int(fusion_cfg["num_classes"]),
+                num_layers=int(fusion_cfg["num_layers"]),
+                feature_dim=int(fusion_cfg["feature_dim"]),
+                temperature=float(fusion_cfg.get("temperature", 1.0)),
+                norm_type=str(fusion_cfg.get("norm_type", "none")),
+                norm_affine=bool(fusion_cfg.get("norm_affine", False)),
+                shared_weights=bool(
+                    fusion_cfg.get("shared_weights")
+                    or fusion_cfg.get("fusion_mode") == "learned_shared"
+                ),
+            ).to(device)
+        fusion.load_state_dict(checkpoint["fusion_state"], strict=True)
+        fusion.eval()
+        if feature_adapter_mode == "class_residual":
+            localnet.set_feature_transform_adapter(fusion)
+
+        fusion_cache = common_utils.FusedReferenceCache(
+            raw_bank,
+            fusion,
+            device,
+            expected_num_layers=int(fusion_cfg["num_layers"]),
+            expected_feature_dim=int(fusion_cfg["feature_dim"]),
+            storage_dtype=str(fusion_cfg.get("reference_storage_dtype", "float16")),
+            use_faiss=True,
+            faiss_use_cuda=use_cuda,
+            faiss_cpu_index=bool(args.faiss_cpu_index),
+            faiss_gpu_temp_mem_mb=int(args.faiss_gpu_temp_mem_mb),
+        )
+        # Independent inference always rebuilds the full fused cache from the
+        # raw sidecar with the checkpoint's theta (no stale cached tensors).
+        fusion_cache.refresh(step=0, epoch=0)
+        print(
+            f"[fusion] rebuilt fused reference cache v{fusion_cache.version} "
+            f"from raw sidecar "
+            f"({sum(int(v.shape[0]) for v in raw_bank.values())} rows)"
+        )
+    else:
+        reference_memory_by_class, reference_index_by_class = build_reference_index(
+            reference_memory_by_class_raw=checkpoint["reference_memory_by_class"],
+            use_cuda=use_cuda,
+            use_cpu_index=bool(args.faiss_cpu_index),
+            gpu_temp_mem_mb=int(args.faiss_gpu_temp_mem_mb),
+            allow_empty=not use_residual,
+        )
+        if use_residual and len(reference_index_by_class) == 0:
+            raise RuntimeError(
+                "use_residual=True 但 checkpoint 中 reference_memory_by_class 为空。"
+            )
 
     total_saved = 0
     metrics_rows = []
@@ -711,21 +1071,66 @@ def main():
                     dtype=torch.long,
                     device=device,
                 )
-                features, cls_token = extract_feature_batch(
-                    images, feature_extractor, args, return_cls_token=True,
-                    class_indices=class_idx_batch,
-                    class_layer_indices=args.class_layer_indices,
-                )
-                if use_residual:
-                    model_features = compute_residual_feature_batch(
-                        features,
-                        class_idx_batch,
-                        reference_memory_by_class,
-                        reference_index_by_class,
-                        num_patches=num_patches,
+                if learned_fusion:
+                    raw_multilayer, cls_token = extract_dinov3_multilayer_feature_batch(
+                        images,
+                        feature_extractor,
+                        candidate_layers,
+                        use_cls_token=args.use_cls_token,
+                        return_cls_token=True,
                     )
+                    if fusion_cfg.get("fusion_mode") == "class_patch":
+                        if fusion_match_mode == "prior_top1":
+                            model_features = (
+                                common_utils.compute_class_patch_prior_top1_residual_batch(
+                                    raw_multilayer,
+                                    class_idx_batch,
+                                    fusion_cache,
+                                    fusion,
+                                    query_chunk_size=int(
+                                        fusion_cfg.get("fusion_query_chunk", 512)
+                                    ),
+                                )
+                            )
+                        else:
+                            model_features = (
+                                common_utils.compute_class_patch_fused_residual_batch(
+                                    raw_multilayer,
+                                    class_idx_batch,
+                                    fusion_cache,
+                                    fusion,
+                                    topk=int(fusion_cfg.get("fusion_topk", 32)),
+                                    query_chunk_size=int(
+                                        fusion_cfg.get("fusion_query_chunk", 256)
+                                    ),
+                                    candidate_chunk_size=int(
+                                        fusion_cfg.get("fusion_candidate_chunk", 8)
+                                    ),
+                                )
+                            )
+                    else:
+                        model_features = common_utils.compute_fused_residual_batch(
+                            raw_multilayer,
+                            class_idx_batch,
+                            fusion_cache,
+                            fusion,
+                        )
                 else:
-                    model_features = features
+                    features, cls_token = extract_feature_batch(
+                        images, feature_extractor, args, return_cls_token=True,
+                        class_indices=class_idx_batch,
+                        class_layer_indices=args.class_layer_indices,
+                    )
+                    if use_residual:
+                        model_features = compute_residual_feature_batch(
+                            features,
+                            class_idx_batch,
+                            reference_memory_by_class,
+                            reference_index_by_class,
+                            num_patches=num_patches,
+                        )
+                    else:
+                        model_features = features
                 patch_class_idx = None
                 if use_moe and moe_hard_class_gate:
                     token_per_image = (

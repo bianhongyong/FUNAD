@@ -183,6 +183,68 @@ def get_dino_layer_fusion_indices(feature_model: str):
     return list(cfg["mid"]), list(cfg["tail"])
 
 
+# Shared candidate layer sets for learned multi-layer fusion (1-based, -1 = last).
+# These are intentionally independent of DINO_CLASS_LAYER_INDICES: the learned
+# mode must not inherit the hand-tuned per-class layer choices it is meant to
+# replace.  The default spreads layers across shallow/mid/deep blocks; it is an
+# experimental starting point, not a validated optimum.
+DINO_FUSION_CANDIDATE_LAYERS = {
+    "dinov3_vits16": [2, 4, 6, 8, 10, 12],
+    "dinov3_vits16plus": [2, 4, 6, 8, 10, 12],
+    "dinov3_vitb16": [2, 4, 6, 8, 10, 12],
+    "dinov3_vitl16": [3, 6, 9, 12, 15, 18, 21, 24],
+    "dinov3_vitl16plus": [3, 6, 9, 12, 15, 18, 21, 24],
+    "dinov3_vith16plus": [4, 8, 12, 16, 20, 24, 28, 32],
+    "dinov3_vit7b16": [5, 10, 15, 20, 25, 30, 35, 40],
+}
+
+
+def get_fusion_candidate_layers(feature_model: str):
+    """Return the default shared candidate layers for learned fusion."""
+    if feature_model not in DINO_FUSION_CANDIDATE_LAYERS:
+        supported = ", ".join(sorted(DINO_FUSION_CANDIDATE_LAYERS))
+        raise ValueError(
+            f"feature_model={feature_model!r} 没有对应的 DINO_FUSION_CANDIDATE_LAYERS 条目。"
+            f"已支持: {supported}"
+        )
+    return list(DINO_FUSION_CANDIDATE_LAYERS[feature_model])
+
+
+def normalize_candidate_layers(candidate_layers, feature_model: str):
+    """Validate/deduplicate/sort 1-based candidate layers for a backbone.
+
+    Returns a sorted list with ``-1`` translated to the backbone depth so the
+    value stored in checkpoints is unambiguous.
+    """
+    depth = DINO_BACKBONE_DEPTHS.get(feature_model)
+    if depth is None:
+        raise ValueError(
+            f"{feature_model} 在 DINO_BACKBONE_DEPTHS 里没有登记 block 数。"
+        )
+    normalized = []
+    for layer in candidate_layers:
+        layer = int(layer)
+        layer = depth if layer == -1 else layer
+        if not 1 <= layer <= depth:
+            raise ValueError(
+                f"候选层下标 {layer} 越界：{feature_model} 只有 {depth} 个 block "
+                f"(1-based: 1..{depth})。"
+            )
+        normalized.append(layer)
+    normalized = sorted(set(normalized))
+    if len(normalized) == 0:
+        raise ValueError("候选层集合不能为空。")
+    return normalized
+
+
+def _validate_fusion_layer_tables():
+    for model, layers in DINO_FUSION_CANDIDATE_LAYERS.items():
+        normalize_candidate_layers(layers, model)
+
+
+_validate_fusion_layer_tables()
+
+
 def get_all_class_names(dataset_name: str):
     if dataset_name == "mvtec":
         return MVTEC_CLASS_NAMES

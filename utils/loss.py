@@ -3,7 +3,13 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_balanced_bce_loss(localnet_criterion, pred, target):
+def compute_balanced_bce_components(localnet_criterion, pred, target):
+    """Return ``(pos_loss, neg_loss)``, each separately mean-reduced.
+
+    An empty group is skipped safely and contributes a detached zero tensor.
+    The chapter-1 clean trainer logs both groups and sums them into the total
+    Balanced BCE.
+    """
     pos_mask = target == 1
     neg_mask = target == 0
 
@@ -17,6 +23,13 @@ def compute_balanced_bce_loss(localnet_criterion, pred, target):
     else:
         neg_loss = torch.tensor(0.0, device=target.device)
 
+    return pos_loss, neg_loss
+
+
+def compute_balanced_bce_loss(localnet_criterion, pred, target):
+    pos_loss, neg_loss = compute_balanced_bce_components(
+        localnet_criterion, pred, target
+    )
     return pos_loss + neg_loss
 
 
@@ -28,6 +41,7 @@ def compute_oto_loss_multiclass(
     l_loss,
     compute_distance_fn,
     find_matching_fn,
+    keep_patch_mask=None,
 ):
     if args.oto_loss == "kl":
         transform_fn = lambda a, b: 0.5 * (
@@ -48,6 +62,13 @@ def compute_oto_loss_multiclass(
 
         cls_feature = batch_feature[cls_mask]
         cls_score = local_pred[cls_mask]
+        if keep_patch_mask is not None:
+            # Drop patches whose pseudo label was discarded (uncertain band).
+            cls_keep = keep_patch_mask[cls_mask]
+            cls_feature = cls_feature[cls_keep]
+            cls_score = cls_score[cls_keep]
+            if cls_score.numel() < 2:
+                continue
         feature_np = cls_feature.detach().cpu().numpy().reshape(-1, cls_feature.shape[-1])
         _, id_array = compute_distance_fn(feature_np)
         matched = find_matching_fn(id_array)
