@@ -279,6 +279,8 @@ def load_train_checkpoint(
         "fusion_config": ckpt.get("fusion_config"),
         "raw_reference_manifest": ckpt.get("raw_reference_manifest"),
         "fusion_cache_metadata": ckpt.get("fusion_cache_metadata"),
+        "class_sigmas": ckpt.get("class_sigmas"),
+        "synthesis_config": ckpt.get("synthesis_config"),
         "has_fusion_state": fusion_sd is not None,
         "reference_memory_format": ckpt.get("reference_memory_format"),
     }
@@ -325,6 +327,8 @@ def inspect_train_checkpoint(path: str) -> dict:
         "fusion_config": ckpt.get("fusion_config"),
         "raw_reference_manifest": ckpt.get("raw_reference_manifest"),
         "fusion_cache_metadata": ckpt.get("fusion_cache_metadata"),
+        "class_sigmas": ckpt.get("class_sigmas"),
+        "synthesis_config": ckpt.get("synthesis_config"),
         "has_fusion_state": "fusion_state" in ckpt,
         "reference_memory_format": ckpt.get("reference_memory_format"),
     }
@@ -583,15 +587,29 @@ def build_multilayer_reference_memory_bank(
     device,
     storage_dtype="float16",
     require_all_classes=True,
+    return_image_ids=False,
+    extract_batch_size=None,
 ):
     """Extract and store raw per-layer reference patches ``[N_c, L, C]``.
 
     The L axis is preserved (no mean).  All layers of a row come from the same
     reference patch because DINOv3 layers are stacked before flattening.
 
+    Args:
+        return_image_ids: also return ``{cls: [N_c]}`` dataset indices mapping
+            every patch row back to its source reference image.  Chapter-1
+            LOIO scale calibration needs this to exclude a whole held-out
+            image, not just the matching patch.
+        extract_batch_size: images per backbone forward.  Defaults to
+            ``min(batch_size, 8)``.  The cap keeps the host-side float32
+            feature batch small; the bank itself is stored in
+            ``storage_dtype`` immediately, so per-batch arrays are not kept
+            alive by views.
+
     Returns:
         memory_np_by_class: dict[int, np.ndarray] with dtype float16/float32.
         info: dict with num_layers, feature_dim, shapes, storage_dtype.
+        image_ids_by_class: only when ``return_image_ids=True``.
     """
     all_indices = []
     for class_idx in sorted(reference_indices_by_class.keys()):
@@ -601,9 +619,14 @@ def build_multilayer_reference_memory_bank(
 
     reference_subset = Subset(train_dataset, all_indices)
     loader_kwargs = build_loader_kwargs(num_workers, pin_memory=True, prefetch_factor=2)
+    extract_batch = (
+        int(extract_batch_size)
+        if extract_batch_size is not None
+        else min(int(batch_size), 8)
+    )
     reference_loader = DataLoader(
         reference_subset,
-        batch_size=max(1, min(batch_size, 16)),
+        batch_size=max(1, extract_batch),
         shuffle=False,
         drop_last=False,
         **loader_kwargs,
@@ -612,12 +635,23 @@ def build_multilayer_reference_memory_bank(
     storage_dtype = _normalize_storage_dtype(storage_dtype)
     np_storage_dtype = np.float16 if storage_dtype == torch.float16 else np.float32
     buffers = {int(class_idx): [] for class_idx in reference_indices_by_class.keys()}
+    image_id_buffers = {
+        int(class_idx): [] for class_idx in reference_indices_by_class.keys()
+    }
     num_layers = None
     feature_dim = None
 
     with torch.no_grad():
         for batch in reference_loader:
             images, class_idx = batch[0], batch[1]
+            sample_idx = None
+            if return_image_ids:
+                if len(batch) < 3:
+                    raise RuntimeError(
+                        "return_image_ids=True requires the dataset to return "
+                        "(image, class_idx, sample_idx, ...) batches."
+                    )
+                sample_idx = batch[2].detach().cpu().numpy().astype(np.int64)
             images = images.to(device, non_blocking=True)
             features = extract_multilayer_fn(images, class_indices=class_idx)
             if features.dim() != 4:
@@ -635,14 +669,34 @@ def build_multilayer_reference_memory_bank(
                     f"{(layers, dim)} vs {(num_layers, feature_dim)}."
                 )
 
-            feat_np = features.detach().cpu().numpy()
+            # Convert straight to the storage dtype on the GPU before copying
+            # to host.  Retaining slices of a float32 host batch via views
+            # would keep every batch's full [B,P,L,C] array alive until the
+            # final concatenate (multiple GB for 8 refs/class x 15 classes).
+            feat_np = (
+                features.detach().to(dtype=storage_dtype).cpu().numpy()
+            )
             class_np = class_idx.detach().cpu().numpy().astype(np.int64)
             for cls in np.unique(class_np).tolist():
                 cls = int(cls)
                 cls_mask = class_np == cls
-                # [N_images, P, L, C] -> [N_images*P, L, C]
+                # [N_images, P, L, C] -> [N_images*P, L, C].
+                # copy=True detaches the compact per-class chunk from the
+                # per-batch host array so that array can be released.
                 cls_feat = feat_np[cls_mask].reshape(-1, num_layers, feature_dim)
-                buffers.setdefault(cls, []).append(cls_feat)
+                buffers.setdefault(cls, []).append(
+                    np.array(cls_feat, dtype=np_storage_dtype, copy=True)
+                )
+                if sample_idx is not None:
+                    # Each image contributes P consecutive patch rows.
+                    image_id_buffers.setdefault(cls, []).append(
+                        np.repeat(sample_idx[cls_mask], int(num_patches))
+                    )
+            del feat_np, features
+
+    # Stop the reference DataLoader workers before the large concatenate /
+    # sidecar write so their pinned prefetch buffers are not held concurrently.
+    del reference_loader
 
     memory_np_by_class = {}
     for class_idx, feat_list in buffers.items():
@@ -652,8 +706,13 @@ def build_multilayer_reference_memory_bank(
                     f"class {class_idx} 没有可用的多层参考特征；learned fusion 要求所有类别都有参考图。"
                 )
             continue
-        cls_memory = np.concatenate(feat_list, axis=0).astype(np_storage_dtype, copy=False)
-        memory_np_by_class[int(class_idx)] = cls_memory
+        # Chunks are already in storage dtype; concatenate directly and drop
+        # the per-batch chunks so the bank is the only large allocation.
+        cls_memory = np.concatenate(feat_list, axis=0)
+        buffers[class_idx] = None
+        memory_np_by_class[int(class_idx)] = cls_memory.astype(
+            np_storage_dtype, copy=False
+        )
 
     if len(memory_np_by_class) == 0:
         raise RuntimeError("参考图多层特征提取失败，无法构建原始参考库。")
@@ -668,6 +727,20 @@ def build_multilayer_reference_memory_bank(
             for c, arr in memory_np_by_class.items()
         },
     }
+    if return_image_ids:
+        image_ids_by_class = {
+            int(cls): np.concatenate(ids, axis=0).astype(np.int64, copy=False)
+            for cls, ids in image_id_buffers.items()
+            if len(ids) > 0 and int(cls) in memory_np_by_class
+        }
+        for cls, arr in memory_np_by_class.items():
+            if cls not in image_ids_by_class or (
+                image_ids_by_class[cls].shape[0] != arr.shape[0]
+            ):
+                raise RuntimeError(
+                    f"class {cls}: image-id metadata is missing or misaligned."
+                )
+        return memory_np_by_class, info, image_ids_by_class
     return memory_np_by_class, info
 
 
@@ -696,13 +769,21 @@ def save_raw_reference_bank(
     os.makedirs(save_dir, exist_ok=True)
     arrays = {}
     shapes = {}
+    # Keep the numpy owners alive: ``torch.from_numpy`` is zero-copy and the
+    # tensor must not outlive its backing array.
+    numpy_owners = []
     for class_idx, arr in raw_memory_by_class.items():
-        arr_np = np.asarray(arr)
+        arr_np = np.ascontiguousarray(np.asarray(arr))
         if arr_np.ndim != 3:
             raise ValueError(
                 f"raw bank for class {class_idx} must be [N,L,C]; got {arr_np.shape}"
             )
-        arrays[int(class_idx)] = arr_np
+        numpy_owners.append(arr_np)
+        # Store tensors, not numpy arrays.  torch.save pickles numpy arrays
+        # inline into one BytesIO (raw pickle buffer + getvalue copy), which
+        # peaks at several times the bank size.  Tensor storages are written
+        # to the zip payload in a streaming fashion instead.
+        arrays[int(class_idx)] = torch.from_numpy(arr_np)
         shapes[int(class_idx)] = [int(v) for v in arr_np.shape]
 
     payload_metadata = dict(metadata)

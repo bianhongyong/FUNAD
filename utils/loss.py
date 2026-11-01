@@ -3,7 +3,13 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_balanced_bce_loss(localnet_criterion, pred, target):
+def compute_balanced_bce_components(localnet_criterion, pred, target):
+    """Return ``(pos_loss, neg_loss)``, each separately mean-reduced.
+
+    An empty group is skipped safely and contributes a detached zero tensor.
+    The chapter-1 clean trainer logs both groups and sums them into the total
+    Balanced BCE.
+    """
     pos_mask = target == 1
     neg_mask = target == 0
 
@@ -17,6 +23,13 @@ def compute_balanced_bce_loss(localnet_criterion, pred, target):
     else:
         neg_loss = torch.tensor(0.0, device=target.device)
 
+    return pos_loss, neg_loss
+
+
+def compute_balanced_bce_loss(localnet_criterion, pred, target):
+    pos_loss, neg_loss = compute_balanced_bce_components(
+        localnet_criterion, pred, target
+    )
     return pos_loss + neg_loss
 
 
